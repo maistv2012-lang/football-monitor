@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.env
+.seen_articles.json
+.venv/
+.pytest_cache/

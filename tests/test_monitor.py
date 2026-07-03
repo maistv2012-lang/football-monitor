@@ -1,6 +1,13 @@
 import unittest
 
-from monitor import build_article_key, build_portuguese_shorts_pack, group_articles, should_send_notification
+from monitor import (
+    build_article_key,
+    build_portuguese_shorts_pack,
+    build_portuguese_telegram_message,
+    build_youtube_feed_url,
+    group_articles,
+    should_send_notification,
+)
 
 
 class MonitorTests(unittest.TestCase):
@@ -30,6 +37,69 @@ class MonitorTests(unittest.TestCase):
         }
 
         self.assertFalse(should_send_notification(grouped_article))
+
+    def test_messi_goal_articles_should_trigger_notification_even_below_threshold(self):
+        grouped_article = {
+            "title": "Messi scores a stunning goal in the final",
+            "score": 7.2,
+            "reason": "A classic Messi finish",
+        }
+
+        self.assertTrue(should_send_notification(grouped_article))
+
+    def test_build_youtube_feed_url_uses_channel_id(self):
+        self.assertEqual(
+            build_youtube_feed_url("ABC123"),
+            "https://www.youtube.com/feeds/videos.xml?channel_id=ABC123",
+        )
+
+    def test_cazetv_keyword_alerts_build_portuguese_message(self):
+        grouped_article = {
+            "title": "Messi faz golaço de falta e vira assunto",
+            "summary": "Vídeo viral do CazéTV",
+            "sources": ["CazéTV"],
+            "links": ["https://www.youtube.com/watch?v=123"],
+            "score": 6.8,
+            "reason": "Tema forte em vídeo curto",
+        }
+
+        message = build_portuguese_telegram_message(grouped_article, {})
+
+        self.assertIn("CazéTV", message)
+        self.assertIn("Messi faz golaço de falta e vira assunto", message)
+        self.assertIn("https://www.youtube.com/watch?v=123", message)
+        self.assertIn("Shorts", message)
+        self.assertIn("HeyGen", message)
+
+    def test_cazetv_keyword_titles_should_trigger_notification(self):
+        grouped_article = {
+            "title": "Neymar entra em polêmica no treino",
+            "sources": ["CazéTV"],
+            "score": 4.2,
+        }
+
+        self.assertTrue(should_send_notification(grouped_article))
+
+    def test_blocked_youtube_links_add_warning_and_search_guidance(self):
+        grouped_article = {
+            "title": "Messi faz golaço de falta",
+            "summary": "Vídeo viral do CazéTV",
+            "sources": ["CazéTV"],
+            "links": ["https://www.youtube.com/watch?v=blocked123"],
+            "video_url": "https://www.youtube.com/watch?v=blocked123",
+            "video_status": "region_blocked",
+            "video_search_link": "https://www.youtube.com/results?search_query=Messi+faz+gola%C3%A7o+de+falta+Caz%C3%A9TV",
+            "search_keywords": ["Messi golaço CazéTV", "official clip"],
+            "score": 7.1,
+            "reason": "Tema forte",
+        }
+
+        message = build_portuguese_telegram_message(grouped_article, {})
+
+        self.assertIn("⚠️ Este vídeo pode estar bloqueado na sua região.", message)
+        self.assertIn("https://www.youtube.com/results?search_query=Messi+faz+gola%C3%A7o+de+falta+Caz%C3%A9TV", message)
+        self.assertIn("Messi golaço CazéTV", message)
+        self.assertIn("official clip", message)
 
     def test_build_portuguese_shorts_pack_creates_brazilian_portuguese_content(self):
         article = {

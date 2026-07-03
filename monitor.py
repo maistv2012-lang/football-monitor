@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 
 from config import (
     CHECK_INTERVAL_SECONDS,
-    FEEDS,
     KEYWORDS,
     REQUEST_TIMEOUT_SECONDS,
     STATE_FILE,
@@ -23,6 +22,8 @@ from config import (
     TELEGRAM_CHAT_ID_ENV,
     USER_AGENT,
     VIRAL_SCORE_THRESHOLD,
+    build_youtube_feed_url,
+    get_feeds,
     load_config,
     normalize_text,
 )
@@ -37,6 +38,9 @@ def is_relevant_article(article: dict[str, str]) -> bool:
     if not title:
         return False
 
+    if article.get("source", "") == "CazéTV":
+        return any(keyword.lower() in title for keyword in KEYWORDS)
+
     if any(keyword.lower() in title for keyword in KEYWORDS):
         return True
 
@@ -44,7 +48,23 @@ def is_relevant_article(article: dict[str, str]) -> bool:
     if any(term in title for term in low_value_terms):
         return False
 
-    high_value_terms = ["goal", "injury", "transfer", "bomb", "celebration", "emotional", "controversy", "red card", "var", "penalty", "fan reaction", "fight", "funny"]
+    high_value_terms = [
+        "goal",
+        "injury",
+        "transfer",
+        "bomb",
+        "celebration",
+        "emotional",
+        "controversy",
+        "red card",
+        "var",
+        "penalty",
+        "free kick",
+        "fan reaction",
+        "fight",
+        "funny",
+        "dramatic reaction",
+    ]
     return any(term in title for term in high_value_terms)
 
 
@@ -79,7 +99,16 @@ def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
 
 
 def should_send_notification(grouped_article: dict[str, Any]) -> bool:
-    """Only notify Telegram for viral-potential stories above the threshold."""
+    """Notify for high-score stories, Messi-specific moments, or CazéTV keyword matches."""
+    title = normalize_text(grouped_article.get("title", ""))
+    sources = [str(source) for source in grouped_article.get("sources", []) if str(source)]
+
+    if any(source == "CazéTV" for source in sources) and any(keyword.lower() in title for keyword in KEYWORDS):
+        return True
+
+    if title and "messi" in title and any(term in title for term in ["goal", "free kick", "penalty"]):
+        return True
+
     score = float(grouped_article.get("score", 0) or 0)
     return score >= VIRAL_SCORE_THRESHOLD
 
@@ -190,6 +219,12 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
     ]
     video_search_links = [build_video_search_url(query) for query in video_search_queries]
 
+    existing_video_url = grouped_article.get("video_url") or grouped_article.get("link") or ""
+    if existing_video_url and ("youtube.com" in existing_video_url or "youtu.be" in existing_video_url):
+        grouped_article["video_url"] = existing_video_url
+    else:
+        grouped_article["video_url"] = find_official_video_url(grouped_article)
+
     grouped_article["shorts_title"] = title_pt
     grouped_article["thumbnail_text"] = thumbnail_text_options
     grouped_article["thumbnail_frame_idea"] = frame_idea
@@ -204,7 +239,6 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
     grouped_article["source"] = original_source
     grouped_article["score"] = float(score or 0)
     grouped_article["video_search_links"] = video_search_links
-    grouped_article["video_url"] = find_official_video_url(grouped_article)
     return grouped_article
 
 
@@ -224,7 +258,7 @@ def score_article_with_ai(grouped_article: dict[str, Any], config: dict[str, str
         score = 0
         reason = "No AI API key configured; falling back to heuristics."
         if any(keyword.lower() in normalize_text(title) for keyword in KEYWORDS):
-            score = 8 if any(token in normalize_text(title) for token in ["red card", "penalty", "controversy", "dramatic reaction", "fan reaction", "funny moment", "referee mistake", "fight"]) else 7
+            score = 8 if any(token in normalize_text(title) for token in ["red card", "penalty", "controversy", "dramatic reaction", "fan reaction", "funny moment", "referee mistake", "fight", "free kick", "goal"]) else 7
         grouped_article["score"] = float(score)
         grouped_article["reason"] = reason
         return grouped_article
@@ -312,51 +346,94 @@ def fetch_feed_entries(feed_url: str) -> list[Any]:
     return parsed_feed.entries
 
 
+def build_portuguese_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
+    """Build a Brazilian Portuguese Telegram alert for football videos, especially CazéTV Shorts."""
+    title = grouped_article.get("title", "")
+    sources = ", ".join(grouped_article.get("sources", []))
+    links = "\n".join(grouped_article.get("links", []))
+
+    original_video_url = grouped_article.get("video_url") or grouped_article.get("link") or links or ""
+    original_search_keywords = grouped_article.get("search_keywords") or []
+    video_status = str(grouped_article.get("video_status", "") or "").strip().lower()
+    video_search_link = grouped_article.get("video_search_link") or ""
+
+    shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
+    video_url = original_video_url or grouped_article.get("video_url") or shorts_pack.get("video_url", "")
+    if not video_search_link:
+        video_search_link = build_video_search_url(f"{title} CazéTV")
+    search_keywords = original_search_keywords or grouped_article.get("search_keywords") or shorts_pack.get("search_keywords", [])
+
+    warning_block = ""
+    if video_status in {"unavailable", "region_blocked", "blocked", "region-blocked"}:
+        warning_block = "\n⚠️ Este vídeo pode estar bloqueado na sua região."
+
+    message = (
+        "*⚡ Alerta de Conteúdo — CazéTV / Futeba & Juninho*\n\n"
+        f"*📺 Fonte:* {sources}\n"
+        f"*📰 Título original:* {title}\n"
+        f"*🔗 Link do vídeo:* {video_url}\n"
+        f"{warning_block}\n"
+        f"*🔎 Link de busca do YouTube:* {video_search_link}\n"
+        f"*🔍 Palavras-chave de busca:* {', '.join(search_keywords) if search_keywords else ', '.join(shorts_pack.get('search_keywords', []))}\n"
+        f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
+        f"*📝 Descrição:* {shorts_pack.get('description', '')}\n"
+        f"*🎙 30s script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
+        f"*🤖 HeyGen narration:* {shorts_pack.get('heygen_narration', '')}\n"
+        f"*🖼 Thumbnail text:* {', '.join(shorts_pack.get('thumbnail_text', []))}\n"
+        f"*🏷 Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
+        f"*🔥 Viral Score:* {shorts_pack.get('score', 0)}/10"
+    ).strip()
+    return message
+
+
 def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str, str]) -> bool:
     """Send a Telegram message for a high-score grouped article if credentials are configured."""
     token = config.get("telegram_bot_token", "")
     chat_id = config.get("telegram_chat_id", "")
+    notification_title = str(grouped_article.get("title", "") or "").strip()
 
     if not token or not chat_id:
-        logger.warning("Telegram credentials are not configured. Skipping notification for %s", grouped_article.get("title"))
+        logger.warning("Telegram credentials are not configured. Skipping notification for %s", notification_title)
         return False
 
-    title = grouped_article.get("title", "")
-    sources = ", ".join(grouped_article.get("sources", []))
-    links = "\n".join(grouped_article.get("links", []))
-    shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
-    heygen_prompt = (
-        f"Persona: apresentador brasileiro de futebol, energia alta, olhar direto, movimentos naturais. "
-        f"Contexto: {title}. "
-        "Tom: empolgação, drama, humor leve, voz firme. "
-        "Câmera: plano médio, gesto de apoio, pequenas pausas, expressão intensa."
-    )
-    veo_prompt = (
-        f"Criar cenas extras para um Shorts de futebol sobre {title}. "
-        "Estilo cinematográfico, cortes rápidos, reação de torcida, close em jogador, câmera dinâmica, iluminação forte, sensação de explosão."
-    )
-    message = (
-        "*⚡ Alerta de Conteúdo — Futeba & Juninho*\n\n"
-        f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
-        f"*📰 Notícia:* {title}\n"
-        f"*🎥 Link do vídeo oficial:* {shorts_pack.get('video_url', '')}\n"
-        f"*🖼 Melhor thumbnail:* {shorts_pack.get('thumbnail_frame_idea', '')}\n"
-        f"*🎙 Narração HeyGen:* {shorts_pack.get('heygen_narration', '')}\n"
-        f"*📜 Prompt para HeyGen:* {heygen_prompt}\n"
-        f"*🎬 Prompt para Veo 3/Kling:* {veo_prompt}\n"
-        f"*📝 Descrição YouTube:* {shorts_pack.get('description', '')}\n"
-        f"*🏷 Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
-        f"*📌 Título:* {shorts_pack.get('shorts_title', '')}\n"
-        f"*⏱ Tempo estimado:* 30s, 45s, 60s\n"
-        f"*🎙 30s:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
-        f"*🎙 45s:* {shorts_pack.get('narration_scripts', {}).get('45s', '')}\n"
-        f"*🎙 60s:* {shorts_pack.get('narration_scripts', {}).get('60s', '')}\n"
-        f"*🔍 Search keywords:* {', '.join(shorts_pack.get('search_keywords', []))}\n"
-        f"*🔥 Potencial viral:* {shorts_pack.get('score', 0)}/10\n"
-        f"*💡 Por que vale postar:* {shorts_pack.get('viral_reason', '')}\n"
-        f"*📰 Link da notícia:* {links}\n"
-        f"*Source:* {sources}"
-    ).strip()
+    if grouped_article.get("sources") and any(source == "CazéTV" for source in grouped_article.get("sources", [])):
+        message = build_portuguese_telegram_message(grouped_article, config)
+    else:
+        sources = ", ".join(grouped_article.get("sources", []))
+        links = "\n".join(grouped_article.get("links", []))
+        shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
+        heygen_prompt = (
+            f"Persona: apresentador brasileiro de futebol, energia alta, olhar direto, movimentos naturais. "
+            f"Contexto: {notification_title}. "
+            "Tom: empolgação, drama, humor leve, voz firme. "
+            "Câmera: plano médio, gesto de apoio, pequenas pausas, expressão intensa."
+        )
+        veo_prompt = (
+            f"Criar cenas extras para um Shorts de futebol sobre {notification_title}. "
+            "Estilo cinematográfico, cortes rápidos, reação de torcida, close em jogador, câmera dinâmica, iluminação forte, sensação de explosão."
+        )
+        message = (
+            "*⚡ Alerta de Conteúdo — Futeba & Juninho*\n\n"
+            f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
+            f"*📰 Notícia:* {notification_title}\n"
+            f"*🎥 Link do vídeo oficial:* {shorts_pack.get('video_url', '')}\n"
+            f"*🖼 Melhor thumbnail:* {shorts_pack.get('thumbnail_frame_idea', '')}\n"
+            f"*🎙 Narração HeyGen:* {shorts_pack.get('heygen_narration', '')}\n"
+            f"*📜 Prompt para HeyGen:* {heygen_prompt}\n"
+            f"*🎬 Prompt para Veo 3/Kling:* {veo_prompt}\n"
+            f"*📝 Descrição YouTube:* {shorts_pack.get('description', '')}\n"
+            f"*🏷 Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
+            f"*📌 Título:* {shorts_pack.get('shorts_title', '')}\n"
+            f"*⏱ Tempo estimado:* 30s, 45s, 60s\n"
+            f"*🎙 30s:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
+            f"*🎙 45s:* {shorts_pack.get('narration_scripts', {}).get('45s', '')}\n"
+            f"*🎙 60s:* {shorts_pack.get('narration_scripts', {}).get('60s', '')}\n"
+            f"*🔍 Search keywords:* {', '.join(shorts_pack.get('search_keywords', []))}\n"
+            f"*🔥 Potencial viral:* {shorts_pack.get('score', 0)}/10\n"
+            f"*💡 Por que vale postar:* {shorts_pack.get('viral_reason', '')}\n"
+            f"*📰 Link da notícia:* {links}\n"
+            f"*Source:* {sources}"
+        ).strip()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     try:
@@ -370,7 +447,7 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         logger.error("Telegram notification failed: %s", exc)
         return False
 
-    logger.info("Telegram notification sent for %s", title)
+    logger.info("Telegram notification sent for %s", notification_title)
     return True
 
 
@@ -386,7 +463,7 @@ def process_cycle(config: dict[str, str]) -> int:
 
     logger.info("Starting monitoring cycle")
 
-    for source, feed_url in FEEDS.items():
+    for source, feed_url in get_feeds().items():
         try:
             entries = fetch_feed_entries(feed_url)
         except requests.RequestException as exc:

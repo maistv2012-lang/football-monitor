@@ -1,4 +1,9 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from monitor import (
     build_article_key,
@@ -11,8 +16,11 @@ from monitor import (
     calculate_viral_score,
     group_articles,
     is_live_goal_event,
+    process_cycle,
     should_send_notification,
 )
+
+from monitor import save_seen_articles
 
 
 class MonitorTests(unittest.TestCase):
@@ -170,6 +178,184 @@ class MonitorTests(unittest.TestCase):
         entry = {"link": "https://example.com/article/1", "title": "Example"}
 
         self.assertEqual(build_article_key(entry, "FIFA"), "FIFA:https://example.com/article/1")
+
+    def test_process_cycle_emits_debug_output_for_each_source_and_item(self):
+        with TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            alerts_file = Path(temp_dir) / "alerts.json"
+            config = {
+                "state_file": state_file,
+                "alerts_file": alerts_file,
+                "debug_mode": True,
+                "telegram_bot_token": "",
+                "telegram_chat_id": "",
+            }
+            entries = [{
+                "title": "Messi scores a dramatic winner",
+                "summary": "The moment is already trending.",
+                "description": "The moment is already trending.",
+                "link": "https://example.com/news/1",
+                "id": "news-1",
+                "published": "2026-07-04T10:00:00Z",
+                "video_url": "https://www.youtube.com/watch?v=abc123",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"FIFA": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.save_seen_articles"), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.send_telegram_notification", return_value=False):
+                output = StringIO()
+                with redirect_stdout(output):
+                    process_cycle(config)
+
+            text = output.getvalue()
+            self.assertIn("==========================", text)
+            self.assertIn("SOURCE", text)
+            self.assertIn("Messi scores a dramatic winner", text)
+            self.assertIn("Videos found:", text)
+            self.assertIn("Stories merged:", text)
+            self.assertIn("Final high-potential stories:", text)
+
+    def test_process_cycle_emits_top_ten_summary_when_debug_mode_enabled(self):
+        with TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            alerts_file = Path(temp_dir) / "alerts.json"
+            config = {
+                "state_file": state_file,
+                "alerts_file": alerts_file,
+                "debug_mode": True,
+                "telegram_bot_token": "",
+                "telegram_chat_id": "",
+            }
+            entries = [{
+                "title": "Messi scores a dramatic winner",
+                "summary": "The moment is already trending.",
+                "description": "The moment is already trending.",
+                "link": "https://example.com/news/1",
+                "id": "news-1",
+                "published": "2026-07-04T10:00:00Z",
+                "video_url": "https://www.youtube.com/watch?v=abc123",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"FIFA": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.save_seen_articles"), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.send_telegram_notification", return_value=False):
+                output = StringIO()
+                with redirect_stdout(output):
+                    process_cycle(config)
+
+            text = output.getvalue()
+            self.assertIn("notícias verificadas", text)
+            self.assertIn("vídeos encontrados", text)
+            self.assertIn("Top 10 melhores oportunidades", text)
+            self.assertIn("1️⃣", text)
+
+    def test_process_cycle_treats_youtube_video_entries_as_new_videos(self):
+        with TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            alerts_file = Path(temp_dir) / "alerts.json"
+            config = {
+                "state_file": state_file,
+                "alerts_file": alerts_file,
+                "debug_mode": True,
+                "telegram_bot_token": "",
+                "telegram_chat_id": "",
+            }
+            entries = [{
+                "title": "GOL DELES! Messi reaction after the dramatic finish",
+                "summary": "The moment is already trending.",
+                "description": "The moment is already trending.",
+                "published": "2026-07-04T10:00:00Z",
+                "video_url": "https://www.youtube.com/watch?v=abc123",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"CazéTV": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value={"CazéTV:GOL DELES! Messi reaction after the dramatic finish"}), \
+                 patch("monitor.save_seen_articles"), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.send_telegram_notification", return_value=False):
+                output = StringIO()
+                with redirect_stdout(output):
+                    process_cycle(config)
+
+            text = output.getvalue()
+            self.assertIn("VIDEOS FOUND: 1", text)
+            self.assertIn("FINAL HIGH POTENTIAL STORIES: 1", text)
+            self.assertIn("ACCEPTED OR REJECTED", text)
+            self.assertIn("accepted", text.lower())
+
+    def test_debug_mode_does_not_persist_seen_articles(self):
+        with TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            alerts_file = Path(temp_dir) / "alerts.json"
+            config = {
+                "state_file": state_file,
+                "alerts_file": alerts_file,
+                "debug_mode": True,
+                "telegram_bot_token": "",
+                "telegram_chat_id": "",
+            }
+            entries = [{
+                "title": "Messi scores a dramatic winner",
+                "summary": "The moment is already trending.",
+                "description": "The moment is already trending.",
+                "link": "https://example.com/news/1",
+                "id": "news-1",
+                "published": "2026-07-04T10:00:00Z",
+                "video_url": "https://www.youtube.com/watch?v=abc123",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"FIFA": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.save_seen_articles"), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.send_telegram_notification", return_value=False):
+                process_cycle(config)
+
+            self.assertFalse(state_file.exists())
+
+    def test_normal_mode_persists_seen_articles_after_successful_notification(self):
+        with TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            alerts_file = Path(temp_dir) / "alerts.json"
+            config = {
+                "state_file": state_file,
+                "alerts_file": alerts_file,
+                "debug_mode": False,
+                "telegram_bot_token": "",
+                "telegram_chat_id": "",
+            }
+            entries = [{
+                "title": "Messi scores a dramatic winner",
+                "summary": "The moment is already trending.",
+                "description": "The moment is already trending.",
+                "link": "https://example.com/news/1",
+                "id": "news-1",
+                "published": "2026-07-04T10:00:00Z",
+                "video_url": "https://www.youtube.com/watch?v=abc123",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"FIFA": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.save_seen_articles") as save_seen_mock, \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.send_telegram_notification", return_value=True):
+                process_cycle(config)
+
+            self.assertTrue(save_seen_mock.called)
 
     def test_calculate_viral_score_rewards_multiple_official_sources_and_videos(self):
         grouped_article = {

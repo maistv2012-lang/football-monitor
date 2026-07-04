@@ -105,6 +105,34 @@
 			"command": "python -m unittest discover -s tests -v",
 			"problemMatcher": [],
 			"group": "test"
+		},
+		{
+			"label": "Run tests with debug coverage",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run regression tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Re-run tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Final test run",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
 		}
 	]
 }

@@ -103,6 +103,7 @@ def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
                     "summary": article.get("summary", "") or article.get("description", ""),
                     "description": article.get("description", ""),
                     "official_source": article.get("official_source") or article.get("source", ""),
+                    "duplicate_keys": [article.get("duplicate_key") or article.get("video_id") or article.get("link") or article.get("title") or ""],
                 }
             )
         else:
@@ -110,6 +111,9 @@ def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
                 match["sources"].append(article.get("source", ""))
             if article.get("link", "") and article.get("link", "") not in match["links"]:
                 match["links"].append(article.get("link", ""))
+            duplicate_key = article.get("duplicate_key") or article.get("video_id") or article.get("link") or article.get("title") or ""
+            if duplicate_key and duplicate_key not in match.get("duplicate_keys", []):
+                match.setdefault("duplicate_keys", []).append(duplicate_key)
             video_url = article.get("video_url", "")
             if video_url and video_url not in match.get("video_links", []):
                 match.setdefault("video_links", []).append(video_url)
@@ -125,10 +129,64 @@ def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
     return groups
 
 
+def is_youtube_link(value: str) -> bool:
+    """Return True when the provided value points to YouTube."""
+    normalized = (value or "").strip().lower()
+    return "youtube.com" in normalized or "youtu.be" in normalized
+
+
+def extract_youtube_video_id(value: str) -> str:
+    """Extract a YouTube video ID from a URL or short-link string when available."""
+    if not value:
+        return ""
+    normalized = (value or "").strip()
+    match = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", normalized)
+    if match:
+        return match.group(1)
+    match = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", normalized)
+    if match:
+        return match.group(1)
+    match = re.search(r"youtube\.com/shorts/([A-Za-z0-9_-]{11})", normalized)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def get_debug_acceptance_reason(title: str, sources: list[str] | None = None, viral_score: Any = None) -> str:
+    """Describe why a story should be accepted or rejected for Telegram alerts."""
+    title_text = normalize_text(title)
+    source_names = [normalize_text(source) for source in (sources or []) if str(source)]
+    high_trigger_terms = ["goal", "gol", "golaço", "argentina", "cabo verde", "messi", "var", "penalty", "red card", "fight", "controversy", "reaction"]
+
+    for term in high_trigger_terms:
+        if term in title_text:
+            return f"accepted because title contains trigger term '{term}'"
+
+    if any(source_name == "cazétv" or source_name == "caze" or source_name == "cazétv" for source_name in source_names):
+        matched_keywords = [keyword for keyword in KEYWORDS if keyword.lower() in title_text]
+        if matched_keywords:
+            return f"accepted because CazéTV title matched keywords: {', '.join(matched_keywords)}"
+
+    if title_text and "messi" in title_text and any(term in title_text for term in ["goal", "free kick", "penalty"]):
+        return "accepted because Messi title contains a major goal-style trigger"
+
+    if viral_score is not None:
+        try:
+            if float(viral_score) >= 75:
+                return "accepted because viral score met the alert threshold"
+        except (TypeError, ValueError):
+            pass
+
+    return "rejected because no high-impact trigger terms were found"
+
+
 def should_send_notification(grouped_article: dict[str, Any]) -> bool:
     """Notify for high-score stories, Messi-specific moments, or CazéTV keyword matches."""
     title = normalize_text(grouped_article.get("title", ""))
     sources = [str(source) for source in grouped_article.get("sources", []) if str(source)]
+
+    if any(term in title for term in ["goal", "gol", "golaço", "argentina", "cabo verde", "messi", "var", "penalty", "red card", "fight", "controversy", "reaction"]):
+        return True
 
     if any(source == "CazéTV" for source in sources) and any(keyword.lower() in title for keyword in KEYWORDS):
         return True
@@ -383,7 +441,8 @@ def score_article_with_ai(grouped_article: dict[str, Any], config: dict[str, str
 
 def build_article_key(article: dict[str, str], source: str) -> str:
     """Build a stable identifier so duplicates can be filtered consistently."""
-    link = article.get("link") or article.get("id") or article.get("title") or ""
+    video_key = article.get("video_url") or article.get("video_id")
+    link = video_key or article.get("link") or article.get("id") or article.get("title") or ""
     if not link:
         raise ValueError("Article is missing a usable identifier")
     return f"{source}:{link}"
@@ -421,13 +480,21 @@ def get_entry_value(entry: Any, field: str, default: str = "") -> str:
 
 def normalize_entry(entry: Any, source: str) -> dict[str, str]:
     """Convert a feedparser entry into a normalized article dictionary."""
+    link = get_entry_value(entry, "link", "")
+    video_url = get_entry_value(entry, "video_url", "")
+    if not video_url and is_youtube_link(link):
+        video_url = link
+    video_id = extract_youtube_video_id(video_url) or extract_youtube_video_id(link) or get_entry_value(entry, "video_id", "")
     return {
         "title": get_entry_value(entry, "title", "").strip(),
         "summary": get_entry_value(entry, "summary", "") or get_entry_value(entry, "description", ""),
         "description": get_entry_value(entry, "description", ""),
-        "link": get_entry_value(entry, "link", ""),
+        "link": link,
         "id": get_entry_value(entry, "id", ""),
         "source": source,
+        "published": get_entry_value(entry, "published", "") or get_entry_value(entry, "updated", "") or get_entry_value(entry, "pubDate", ""),
+        "video_url": video_url,
+        "video_id": video_id,
     }
 
 
@@ -705,6 +772,7 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
 
 def process_cycle(config: dict[str, str]) -> int:
     """Fetch feeds, filter relevant stories, group duplicates, score them, and notify on high viral potential."""
+    debug_mode = bool(config.get("debug_mode", False))
     state_file = Path(config.get("state_file", STATE_FILE))
     alerts_file = Path(config.get("alerts_file", STATE_FILE))
     seen_articles = load_seen_articles(state_file)
@@ -712,14 +780,32 @@ def process_cycle(config: dict[str, str]) -> int:
     seen_alert_keys = {alert.get("alert_key", "") for alert in alerts if alert.get("alert_key")}
     seen_this_cycle: set[str] = set()
     relevant_articles: list[dict[str, str]] = []
+    persisted_seen_keys: set[str] = set()
 
     logger.info("Starting monitoring cycle")
     warned_about_feeds: set[str] = set()
+    sources_checked = 0
+    videos_found = 0
+    articles_found = 0
+    stories_rejected = 0
 
     for source, feed_url in get_feeds().items():
+        sources_checked += 1
+        fetch_status = "ok"
+        items_found = 0
+
+        if debug_mode:
+            print("==========================")
+            print("SOURCE")
+            print("==========================")
+            print(f"SOURCE NAME: {source}")
+            print(f"SOURCE URL: {feed_url}")
+
         try:
             entries = fetch_feed_entries(feed_url)
+            items_found = len(entries)
         except requests.RequestException as exc:
+            fetch_status = "error"
             status_code = getattr(exc.response, "status_code", None)
             if status_code == 404 and source not in warned_about_feeds:
                 logger.warning("Feed %s returned 404 and will be skipped for this cycle: %s", source, exc)
@@ -727,10 +813,21 @@ def process_cycle(config: dict[str, str]) -> int:
             elif source not in warned_about_feeds:
                 logger.warning("Could not fetch %s feed: %s", source, exc)
                 warned_about_feeds.add(source)
+            if debug_mode:
+                print(f"FETCH STATUS: {fetch_status} ({exc})")
+                print(f"NUMBER OF ITEMS FOUND: {items_found}")
             continue
         except Exception as exc:  # pragma: no cover - defensive guard for feedparser issues
+            fetch_status = "error"
             logger.warning("Could not parse %s feed: %s", source, exc)
+            if debug_mode:
+                print(f"FETCH STATUS: {fetch_status} ({exc})")
+                print(f"NUMBER OF ITEMS FOUND: {items_found}")
             continue
+
+        if debug_mode:
+            print(f"FETCH STATUS: {fetch_status}")
+            print(f"NUMBER OF ITEMS FOUND: {items_found}")
 
         latest_titles: list[str] = []
         matching_count = 0
@@ -739,19 +836,59 @@ def process_cycle(config: dict[str, str]) -> int:
         for entry in entries:
             article = normalize_entry(entry, source)
             latest_titles.append(article.get("title", ""))
+            if article.get("video_url") and is_youtube_link(article.get("video_url")):
+                videos_found += 1
+
             if not is_relevant_article(article):
                 continue
 
-            if any(keyword.lower() in normalize_text(article.get("title", "")) for keyword in KEYWORDS):
+            matched_keywords = [keyword for keyword in KEYWORDS if keyword.lower() in normalize_text(article.get("title", ""))]
+            if matched_keywords:
                 matching_count += 1
 
             article_key = build_article_key(article, source)
-            if article_key in seen_articles or article_key in seen_this_cycle:
-                duplicate_count += 1
-                continue
-
-            seen_this_cycle.add(article_key)
+            duplicate_key = article_key
+            if article.get("video_id"):
+                duplicate_key = f"{source}:{article.get('video_id')}"
+            if not debug_mode:
+                if duplicate_key in seen_articles or duplicate_key in seen_this_cycle:
+                    duplicate_count += 1
+                    continue
+                seen_this_cycle.add(duplicate_key)
+            article["duplicate_key"] = duplicate_key
             relevant_articles.append(article)
+            articles_found += 1
+            if debug_mode:
+                evaluation_article = {
+                    "title": article.get("title", ""),
+                    "summary": article.get("summary", "") or article.get("description", ""),
+                    "sources": [source],
+                    "links": [article.get("link", "")],
+                    "video_links": [article.get("video_url", "")] if article.get("video_url") else [],
+                    "video_url": article.get("video_url", ""),
+                }
+                evaluation_article["viral_score"] = calculate_viral_score(evaluation_article)
+                accepted = should_send_notification(evaluation_article)
+                reason = get_debug_acceptance_reason(article.get("title", ""), [source], evaluation_article["viral_score"])
+                print("TITLE")
+                print(article.get("title", ""))
+                print("SOURCE")
+                print(source)
+                print("PUBLISHED TIME")
+                print(article.get("published", ""))
+                print("VIDEO URL")
+                print(article.get("video_url", ""))
+                print("ARTICLE URL")
+                print(article.get("link", ""))
+                print("MATCHED KEYWORDS")
+                print(", ".join(matched_keywords) if matched_keywords else "None")
+                print("VIRAL SCORE")
+                print(evaluation_article["viral_score"])
+                print("ACCEPTED OR REJECTED")
+                print("accepted" if accepted else "rejected")
+                print("REASON")
+                print(reason)
+
             logger.info("Detected new relevant article from %s: %s", source, article.get("title"))
 
         logger.info(
@@ -769,41 +906,106 @@ def process_cycle(config: dict[str, str]) -> int:
 
     for grouped_article in grouped_articles:
         scored_article = score_article_with_ai(grouped_article, config)
-        if should_send_notification(scored_article) or is_live_goal_event(scored_article):
+        accepted = should_send_notification(scored_article) or is_live_goal_event(scored_article)
+        if accepted:
             high_potential_articles.append(scored_article)
             logger.info("High viral potential story: %s (score=%s)", scored_article.get("title"), scored_article.get("score"))
+        else:
+            stories_rejected += 1
+        if debug_mode:
+            print("--------------------------")
+            print("STORY")
+            print("--------------------------")
+            print("TITLE")
+            print(scored_article.get("title", ""))
+            print("SOURCE")
+            print(", ".join(scored_article.get("sources", [])))
+            print("PUBLISHED TIME")
+            print(grouped_article.get("published", ""))
+            print("VIDEO URL")
+            print(scored_article.get("video_url", ""))
+            print("ARTICLE URL")
+            print(scored_article.get("links", [""])[0])
+            print("MATCHED KEYWORDS")
+            print(", ".join([keyword for keyword in KEYWORDS if keyword.lower() in normalize_text(scored_article.get('title', ''))]) if [keyword for keyword in KEYWORDS if keyword.lower() in normalize_text(scored_article.get('title', ''))] else 'None')
+            print("VIRAL SCORE")
+            print(scored_article.get("viral_score", calculate_viral_score(scored_article)))
+            print("ACCEPTED OR REJECTED")
+            print("accepted" if accepted else "rejected")
+            print("REASON")
+            print("accepted" if accepted else "rejected")
 
     for article in high_potential_articles:
         alert_key = f"{article.get('title','').strip()}::{article.get('score',0)}"
         if alert_key in seen_alert_keys:
             logger.info("Skipping duplicate alert for %s", article.get("title"))
             continue
-        send_telegram_notification(article, config)
-        alerts.append({
-            "alert_key": alert_key,
-            "title": article.get("title", ""),
-            "score": article.get("score", 0),
-            "shorts_title": article.get("shorts_title", ""),
-            "thumbnail_text": article.get("thumbnail_text", []),
-            "thumbnail_frame_idea": article.get("thumbnail_frame_idea", ""),
-            "thumbnail_expression": article.get("thumbnail_expression", ""),
-            "thumbnail_background": article.get("thumbnail_background", ""),
-            "narration_scripts": article.get("narration_scripts", {}),
-            "heygen_narration": article.get("heygen_narration", ""),
-            "description": article.get("description", ""),
-            "hashtags": article.get("hashtags", []),
-            "search_keywords": article.get("search_keywords", []),
-            "viral_reason": article.get("viral_reason", ""),
-            "video_url": article.get("video_url", ""),
-            "video_search_links": article.get("video_search_links", []),
-            "links": article.get("links", []),
-            "sources": article.get("sources", []),
-        })
-        seen_alert_keys.add(alert_key)
+        notification_sent = send_telegram_notification(article, config)
+        if notification_sent:
+            if not debug_mode:
+                for duplicate_key in article.get("duplicate_keys", []):
+                    if duplicate_key:
+                        persisted_seen_keys.add(str(duplicate_key))
+            alerts.append({
+                "alert_key": alert_key,
+                "title": article.get("title", ""),
+                "score": article.get("score", 0),
+                "shorts_title": article.get("shorts_title", ""),
+                "thumbnail_text": article.get("thumbnail_text", []),
+                "thumbnail_frame_idea": article.get("thumbnail_frame_idea", ""),
+                "thumbnail_expression": article.get("thumbnail_expression", ""),
+                "thumbnail_background": article.get("thumbnail_background", ""),
+                "narration_scripts": article.get("narration_scripts", {}),
+                "heygen_narration": article.get("heygen_narration", ""),
+                "description": article.get("description", ""),
+                "hashtags": article.get("hashtags", []),
+                "search_keywords": article.get("search_keywords", []),
+                "viral_reason": article.get("viral_reason", ""),
+                "video_url": article.get("video_url", ""),
+                "video_search_links": article.get("video_search_links", []),
+                "links": article.get("links", []),
+                "sources": article.get("sources", []),
+            })
+            seen_alert_keys.add(alert_key)
 
-    updated_seen = seen_articles | seen_this_cycle
-    save_seen_articles(state_file, updated_seen)
+    if not debug_mode:
+        updated_seen = seen_articles | persisted_seen_keys
+        save_seen_articles(state_file, updated_seen)
     save_alerts(alerts_file, alerts)
+
+    if debug_mode:
+        print("==========================")
+        print("DEBUG SUMMARY")
+        print("==========================")
+        print(f"SOURCES CHECKED: {sources_checked}")
+        print(f"VIDEOS FOUND: {videos_found}")
+        print(f"ARTICLES FOUND: {articles_found}")
+        print(f"STORIES MERGED: {len(grouped_articles)}")
+        print(f"STORIES REJECTED: {stories_rejected}")
+        print(f"FINAL HIGH POTENTIAL STORIES: {len(high_potential_articles)}")
+        print(f"Sources checked: {sources_checked}")
+        print(f"Videos found: {videos_found}")
+        print(f"Articles found: {articles_found}")
+        print(f"Stories merged: {len(grouped_articles)}")
+        print(f"Stories rejected: {stories_rejected}")
+        print(f"Final high-potential stories: {len(high_potential_articles)}")
+        print(f"notícias verificadas: {sources_checked}")
+        print(f"vídeos encontrados: {videos_found}")
+        print(f"artigos encontrados: {articles_found}")
+        print(f"histórias mescladas: {len(grouped_articles)}")
+        print(f"histórias rejeitadas: {stories_rejected}")
+        print(f"histórias finais de alto potencial: {len(high_potential_articles)}")
+
+        ranked_stories = sorted(
+            high_potential_articles + [article for article in grouped_articles if article not in high_potential_articles],
+            key=lambda article: float(article.get("viral_score", calculate_viral_score(article)) or 0),
+            reverse=True,
+        )[:10]
+        print("\nTop 10 melhores oportunidades")
+        for index, story in enumerate(ranked_stories, start=1):
+            title = str(story.get("title", "")).strip() or "Sem título"
+            score = story.get("viral_score", calculate_viral_score(story))
+            print(f"{index}️⃣ {title} — Viral Score: {score}")
 
     logger.info("Monitoring cycle finished. High-potential stories: %s", len(high_potential_articles))
     return len(high_potential_articles)
@@ -832,18 +1034,35 @@ def main() -> int:
     load_dotenv()
     config = load_config()
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--once":
+    debug_mode = False
+    args = sys.argv[1:]
+    if "--debug" in args:
+        debug_mode = True
+        config["debug_mode"] = True
+
+    if "--reset-seen" in args:
+        state_file = Path(config.get("state_file", STATE_FILE))
+        save_seen_articles(state_file, set())
+        print(f"Seen cache reset: {state_file}")
+        return 0
+
+    if "--once" in args:
         process_cycle(config)
         return 0
 
-    if len(sys.argv) > 2 and sys.argv[1] == "--manual":
-        headline = sys.argv[2].strip()
+    manual_index = args.index("--manual") + 1 if "--manual" in args else None
+    if manual_index is not None and manual_index < len(args):
+        headline = args[manual_index].strip()
         if not headline:
             logger.error("Manual headline cannot be empty")
             return 1
         grouped_article = build_manual_grouped_article(headline)
         build_portuguese_shorts_pack(grouped_article, config)
         send_telegram_notification(grouped_article, config)
+        return 0
+
+    if debug_mode:
+        process_cycle(config)
         return 0
 
     run_forever()

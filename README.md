@@ -60,3 +60,17 @@ This immediately generates a Brazilian Portuguese Shorts package and sends it vi
 ## GitHub Actions
 
 A workflow can be added to run the script on a schedule. The repository is structured to support that with a simple `python monitor.py --once` command.
+
+### Repository secrets
+
+This workflow uses GitHub Secrets to securely provide Telegram credentials during execution.
+
+1. Open your repository on GitHub.
+2. Go to `Settings` > `Secrets and variables` > `Actions`.
+3. Click `New repository secret`.
+4. Add the following secrets:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+5. Save the secrets.
+
+Do not commit your local `.env` file or secret values to the repository. The `.gitignore` file already excludes `.env`.

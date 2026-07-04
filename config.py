@@ -95,6 +95,8 @@ def normalize_text(value: Any) -> str:
 
 
 def load_config() -> dict[str, Any]:
+    raw_debug_mode = os.getenv("FOOTBALL_MONITOR_DEBUG", "0").strip().lower()
+    debug_mode = raw_debug_mode in {"1", "true", "yes", "on"}
     return {
         "telegram_bot_token": os.getenv(TELEGRAM_BOT_TOKEN_ENV, ""),
         "telegram_chat_id": os.getenv(TELEGRAM_CHAT_ID_ENV, ""),
@@ -102,4 +104,5 @@ def load_config() -> dict[str, Any]:
         "openai_model": os.getenv(OPENAI_MODEL_ENV, "gpt-4o-mini"),
         "state_file": STATE_FILE,
         "alerts_file": ALERTS_FILE,
+        "debug_mode": debug_mode,
     }

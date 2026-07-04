@@ -49,6 +49,14 @@ Run continuously:
 python monitor.py
 ```
 
+Manual breaking-news mode:
+
+```bash
+python monitor.py --manual "Cape Verde goal"
+```
+
+This immediately generates a Brazilian Portuguese Shorts package and sends it via Telegram, even if no RSS story is available yet.
+
 ## GitHub Actions
 
 A workflow can be added to run the script on a schedule. The repository is structured to support that with a simple `python monitor.py --once` command.

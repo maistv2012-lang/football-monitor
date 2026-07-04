@@ -68,6 +68,20 @@ def is_relevant_article(article: dict[str, str]) -> bool:
     return any(term in title for term in high_value_terms)
 
 
+def get_source_priority(source: str) -> int:
+    """Rank sources from most official to least reliable for discovery workflows."""
+    source_text = normalize_text(source)
+    if "fifa" in source_text:
+        return 1
+    if any(token in source_text for token in ["bbc", "sky", "espn", "fox", "tnt", "uefa", "conmebol", "official", "cazé", "caze"]):
+        return 2
+    if any(token in source_text for token in ["fc", "club", "national", "team"]):
+        return 3
+    if any(token in source_text for token in ["onefootball", "reuters", "ap sports", "ap", "sports"]):
+        return 4
+    return 5
+
+
 def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
     """Group duplicate articles from different sources by normalized title."""
     groups: list[dict[str, Any]] = []
@@ -85,8 +99,10 @@ def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
                     "title": article.get("title", "").strip(),
                     "sources": [article.get("source", "")],
                     "links": [article.get("link", "")],
+                    "video_links": [article.get("video_url", "")] if article.get("video_url") else [],
                     "summary": article.get("summary", "") or article.get("description", ""),
                     "description": article.get("description", ""),
+                    "official_source": article.get("official_source") or article.get("source", ""),
                 }
             )
         else:
@@ -94,6 +110,17 @@ def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
                 match["sources"].append(article.get("source", ""))
             if article.get("link", "") and article.get("link", "") not in match["links"]:
                 match["links"].append(article.get("link", ""))
+            video_url = article.get("video_url", "")
+            if video_url and video_url not in match.get("video_links", []):
+                match.setdefault("video_links", []).append(video_url)
+            official_source = article.get("official_source") or article.get("source", "")
+            if official_source and (not match.get("official_source") or get_source_priority(official_source) < get_source_priority(str(match.get("official_source", "")))):
+                match["official_source"] = official_source
+
+    for group in groups:
+        group["sources"] = sorted(group.get("sources", []), key=get_source_priority)
+        if not group.get("official_source"):
+            group["official_source"] = group["sources"][0] if group.get("sources") else ""
 
     return groups
 
@@ -109,7 +136,13 @@ def should_send_notification(grouped_article: dict[str, Any]) -> bool:
     if title and "messi" in title and any(term in title for term in ["goal", "free kick", "penalty"]):
         return True
 
+    viral_score = grouped_article.get("viral_score")
+    if viral_score is not None:
+        return float(viral_score) >= 75
+
     score = float(grouped_article.get("score", 0) or 0)
+    if score > 10:
+        return score >= 75
     return score >= VIRAL_SCORE_THRESHOLD
 
 
@@ -145,6 +178,56 @@ def find_official_video_url(grouped_article: dict[str, Any]) -> str:
     return build_video_search_url(query)
 
 
+def build_manual_grouped_article(headline: str) -> dict[str, Any]:
+    """Create a grouped article payload for a manually-triggered breaking-news alert."""
+    grouped_article: dict[str, Any] = {
+        "title": headline.strip(),
+        "summary": f"Manual breaking-news alert: {headline.strip()}",
+        "description": f"Manual breaking-news alert: {headline.strip()}",
+        "sources": ["Manual"],
+        "links": [],
+        "score": 10.0,
+        "reason": "Manual breaking-news trigger",
+        "is_manual_event": True,
+        "match": headline.strip(),
+        "official_source": "Manual",
+    }
+    shorts_pack = build_portuguese_shorts_pack(grouped_article, {})
+    grouped_article.update(shorts_pack)
+    return grouped_article
+
+
+def calculate_viral_score(grouped_article: dict[str, Any]) -> int:
+    """Calculate a 0-100 viral potential score for a football story."""
+    title = normalize_text(grouped_article.get("title", ""))
+    summary = normalize_text(grouped_article.get("summary", "") or grouped_article.get("description", ""))
+    sources = [str(source) for source in grouped_article.get("sources", []) if str(source)]
+    video_links = [str(link) for link in grouped_article.get("video_links", []) if str(link)]
+    if grouped_article.get("video_url") and str(grouped_article.get("video_url")) not in video_links:
+        video_links.append(str(grouped_article.get("video_url")))
+    article_links = [str(link) for link in grouped_article.get("links", []) if str(link)]
+
+    score = 0
+    if any(keyword in title for keyword in ["goal", "gol", "golaço", "penalty", "free kick", "red card", "var", "controversy", "injury", "transfer", "fan reaction", "fight", "dramatic"]):
+        score += 24
+    if any(star in title for star in ["messi", "ronaldo", "neymar", "vinicius", "mbappe", "haaland", "bellingham", "yamal"]):
+        score += 24
+    if any(marker in summary for marker in ["viral", "explod", "breaking", "official", "trending", "dramatic", "polêmica", "reação", "torcida"]):
+        score += 10
+    if any(source.lower().startswith("fifa") for source in sources):
+        score += 16
+    if len(sources) >= 2:
+        score += min(16, (len(sources) - 1) * 4)
+    if len(article_links) >= 2:
+        score += 6
+    if video_links:
+        score += min(16, len(video_links) * 8)
+    if any(source.lower().startswith("bbc") or source.lower().startswith("sky") or source.lower().startswith("espn") or source.lower().startswith("fox") or source.lower().startswith("tnt") for source in sources):
+        score += 0
+
+    return max(0, min(100, round(score)))
+
+
 def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
     """Create a complete Portuguese-BR Shorts package for a high-impact football article."""
     original_title = grouped_article.get("title", "")
@@ -152,6 +235,7 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
     summary = grouped_article.get("summary", "") or grouped_article.get("description", "")
     score = grouped_article.get("score", 0)
     reason = grouped_article.get("reason", "")
+    viral_score = calculate_viral_score(grouped_article)
 
     title = original_title
     if len(title) > 60:
@@ -238,7 +322,14 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
     grouped_article["search_keywords"] = keywords
     grouped_article["source"] = original_source
     grouped_article["score"] = float(score or 0)
+    grouped_article["viral_score"] = viral_score
     grouped_article["video_search_links"] = video_search_links
+    grouped_article["video_links"] = grouped_article.get("video_links", [])
+    grouped_article["suggested_hook"] = f"{original_title} está dominando o futebol e todo mundo está falando"
+    grouped_article["suggested_cta"] = "Comenta o que você achou e segue pra mais conteúdo de futebol"
+    grouped_article["seo_description"] = (
+        f"Resumo rápido de {original_title} com contexto, reação e o que faz essa história ser tão comentada no futebol."
+    )
     return grouped_article
 
 
@@ -280,11 +371,13 @@ def score_article_with_ai(grouped_article: dict[str, Any], config: dict[str, str
         parsed = json.loads(message)
         grouped_article["score"] = float(parsed.get("score", 0))
         grouped_article["reason"] = str(parsed.get("reason", ""))
+        grouped_article["viral_score"] = calculate_viral_score(grouped_article)
         return grouped_article
     except Exception as exc:
         logger.warning("AI scoring failed, falling back to heuristic: %s", exc)
         grouped_article["score"] = 0.0
         grouped_article["reason"] = "AI scoring unavailable; fallback used."
+        grouped_article["viral_score"] = calculate_viral_score(grouped_article)
         return grouped_article
 
 
@@ -346,6 +439,151 @@ def fetch_feed_entries(feed_url: str) -> list[Any]:
     return parsed_feed.entries
 
 
+def is_live_goal_event(article: dict[str, str]) -> bool:
+    """Detect likely live football goal events from headlines or source metadata."""
+    title = normalize_text(article.get("title", ""))
+    if not title:
+        return False
+
+    live_markers = ["goal", "golaço", "gol", "scores", "scored", "penalty", "free kick", "red card", "own goal"]
+    if not any(marker in title for marker in live_markers):
+        return False
+
+    involved_terms = [
+        "brazil",
+        "argentina",
+        "messi",
+        "cristiano ronaldo",
+        "neymar",
+        "vinicius",
+        "endrick",
+        "mbappé",
+        "mbappe",
+        "haaland",
+        "cape verde",
+    ]
+    return any(term in title for term in involved_terms)
+
+
+def build_search_links(grouped_article: dict[str, Any]) -> list[str]:
+    """Create fallback search links for official video discovery."""
+    title = grouped_article.get("title", "")
+    sources = grouped_article.get("sources", [])
+    source_hint = " ".join(str(source) for source in sources if str(source))
+    query = f"{title} {source_hint}".strip()
+    searches = [
+        f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}",
+        f"https://www.google.com/search?q={requests.utils.quote(query + ' official clip')}",
+    ]
+    if "FIFA" in source_hint:
+        searches.append(f"https://www.google.com/search?q={requests.utils.quote(query + ' FIFA official')}")
+    if "ESPN" in source_hint:
+        searches.append(f"https://www.google.com/search?q={requests.utils.quote(query + ' ESPN official')}")
+    if "BBC" in source_hint:
+        searches.append(f"https://www.google.com/search?q={requests.utils.quote(query + ' BBC Sport official')}")
+    return searches
+
+
+def build_content_discovery_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
+    """Build a discovery-first Telegram alert for football Shorts production."""
+    shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
+    article_links = [str(link) for link in grouped_article.get("links", []) if str(link)]
+    if not article_links and grouped_article.get("link"):
+        article_links = [str(grouped_article.get("link"))]
+    video_links = [str(link) for link in grouped_article.get("video_links", []) if str(link)]
+    if grouped_article.get("video_url") and str(grouped_article.get("video_url")) not in video_links:
+        video_links.append(str(grouped_article.get("video_url")))
+    official_sources = [str(source) for source in sorted(grouped_article.get("sources", []), key=get_source_priority) if str(source)]
+
+    title = grouped_article.get("title", "") or "Nova história de futebol"
+    summary = grouped_article.get("summary", "") or grouped_article.get("description", "") or "História em alta no futebol"
+    reason = grouped_article.get("reason", "") or shorts_pack.get("viral_reason", "")
+    viral_score = grouped_article.get("viral_score", shorts_pack.get("viral_score", 0)) or 0
+    content_score = grouped_article.get("score", 0) or 0
+    if isinstance(content_score, (int, float)) and 0 <= float(content_score) <= 10:
+        score_label = str(int(round(float(content_score) * 10)))
+    elif isinstance(viral_score, (int, float)):
+        score_label = str(max(0, min(100, int(viral_score))))
+    else:
+        score_label = str(viral_score)
+
+    article_links_block = "\n".join(f"- {link}" for link in article_links) if article_links else "- Não informado"
+    video_links_block = "\n".join(f"- {link}" for link in video_links) if video_links else "- Não informado"
+    official_sources_block = ", ".join(official_sources) if official_sources else "Não informado"
+    hashtags_block = " ".join(shorts_pack.get("hashtags", [])) or "#Futebol #ShortsFutebol"
+    scripts = shorts_pack.get("narration_scripts", {}) or {}
+
+    return (
+        f"🚨 {title}\n\n"
+        f"📰 Notícias\n"
+        f"✅ {official_sources_block}\n\n"
+        f"🎥 Vídeos\n"
+        f"▶ {' | '.join(video_links) if video_links else 'Não informado'}\n\n"
+        f"🔥 Viral Score: {score_label}/100\n\n"
+        f"🧠 Resumo da história: {summary}\n"
+        f"📈 Por que está explodindo: {reason}\n\n"
+        f"🔗 Links para todos os artigos:\n{article_links_block}\n\n"
+        f"🔗 Links para todos os vídeos:\n{video_links_block}\n\n"
+        f"🎙 HeyGen\n"
+        f"{shorts_pack.get('heygen_narration', '')}\n\n"
+        f"📝 Shorts\n"
+        f"{shorts_pack.get('shorts_title', '')}\n\n"
+        f"📸 Thumbnail\n"
+        f"{', '.join(shorts_pack.get('thumbnail_text', []))}\n\n"
+        f"🎙 30s: {scripts.get('30s', '')}\n"
+        f"🎙 45s: {scripts.get('45s', '')}\n"
+        f"🎙 60s: {scripts.get('60s', '')}\n\n"
+        f"👉 CTA: {shorts_pack.get('suggested_cta', '')}\n\n"
+        f"🏷 {hashtags_block}"
+    ).strip()
+
+
+def build_live_event_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
+    """Build a Brazilian Portuguese Telegram alert for an urgent live football goal event."""
+    title = grouped_article.get("title", "")
+    shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
+    match = grouped_article.get("match") or grouped_article.get("title", "")
+    minute = grouped_article.get("minute") or ""
+    scorer = grouped_article.get("goal_scorer") or grouped_article.get("scorer") or ""
+    competition = grouped_article.get("competition") or ""
+    official_source = grouped_article.get("official_source") or ", ".join(grouped_article.get("sources", []))
+
+    return (
+        "*⚡ Alerta ao Vivo — Futebol em tempo real*\n\n"
+        f"*⚽ Match:* {match}\n"
+        f"*⏱ Minute:* {minute}\n"
+        f"*🥅 Goal scorer:* {scorer or 'Não informado'}\n"
+        f"*🏆 Competition:* {competition or 'Não informado'}\n"
+        f"*📺 Official source:* {official_source}\n"
+        f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
+        f"*📝 Short description:* {shorts_pack.get('description', '')}\n"
+        f"*🎙 30-second script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
+        f"*🤖 HeyGen narration:* {shorts_pack.get('heygen_narration', '')}"
+    ).strip()
+
+
+def build_manual_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
+    """Build a Brazilian Portuguese Telegram alert for a manual breaking-news trigger."""
+    shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
+    search_links = build_search_links(grouped_article)
+    return (
+        "*⚡ Alerta Manual — Breaking News*\n\n"
+        f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
+        f"*📺 Source:* {', '.join(grouped_article.get('sources', []))}\n"
+        f"*🔗 Original URL:* {grouped_article.get('link') or grouped_article.get('links', [''])[0]}\n"
+        f"*🎥 YouTube URL:* {grouped_article.get('video_url', '')}\n"
+        f"*🔎 YouTube search link:* {search_links[0]}\n"
+        f"*🔎 FIFA/ESPN/BBC/Google search links:* {' | '.join(search_links[1:])}\n"
+        f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
+        f"*🖼 Thumbnail text:* {', '.join(shorts_pack.get('thumbnail_text', []))}\n"
+        f"*🎙 30s script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
+        f"*🤖 HeyGen narration:* {shorts_pack.get('heygen_narration', '')}\n"
+        f"*📝 YouTube description:* {shorts_pack.get('description', '')}\n"
+        f"*🏷 Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
+        f"*🔍 Search keywords:* {', '.join(shorts_pack.get('search_keywords', []))}"
+    ).strip()
+
+
 def build_portuguese_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
     """Build a Brazilian Portuguese Telegram alert for football videos, especially CazéTV Shorts."""
     title = grouped_article.get("title", "")
@@ -396,8 +634,17 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         logger.warning("Telegram credentials are not configured. Skipping notification for %s", notification_title)
         return False
 
-    if grouped_article.get("sources") and any(source == "CazéTV" for source in grouped_article.get("sources", [])):
+    if grouped_article.get("is_manual_event"):
+        message = build_manual_telegram_message(grouped_article, config)
+    elif grouped_article.get("is_live_event") or any(
+        is_live_goal_event({"title": grouped_article.get("title", ""), "source": source})
+        for source in grouped_article.get("sources", [])
+    ):
+        message = build_live_event_telegram_message(grouped_article, config)
+    elif grouped_article.get("sources") and any(source == "CazéTV" for source in grouped_article.get("sources", [])):
         message = build_portuguese_telegram_message(grouped_article, config)
+    elif float(grouped_article.get("viral_score", 0) or 0) >= 75:
+        message = build_content_discovery_telegram_message(grouped_article, config)
     else:
         sources = ", ".join(grouped_article.get("sources", []))
         links = "\n".join(grouped_article.get("links", []))
@@ -412,11 +659,16 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
             f"Criar cenas extras para um Shorts de futebol sobre {notification_title}. "
             "Estilo cinematográfico, cortes rápidos, reação de torcida, close em jogador, câmera dinâmica, iluminação forte, sensação de explosão."
         )
+        search_links = build_search_links(grouped_article)
         message = (
             "*⚡ Alerta de Conteúdo — Futeba & Juninho*\n\n"
             f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
-            f"*📰 Notícia:* {notification_title}\n"
+            f"*📺 Source:* {sources}\n"
+            f"*🔗 Original URL:* {grouped_article.get('link') or grouped_article.get('links', [''])[0]}\n"
             f"*🎥 Link do vídeo oficial:* {shorts_pack.get('video_url', '')}\n"
+            f"*🔎 YouTube search link:* {search_links[0]}\n"
+            f"*🔎 FIFA/ESPN/BBC/Google search links:* {' | '.join(search_links[1:])}\n"
+            f"*📰 Notícia:* {notification_title}\n"
             f"*🖼 Melhor thumbnail:* {shorts_pack.get('thumbnail_frame_idea', '')}\n"
             f"*🎙 Narração HeyGen:* {shorts_pack.get('heygen_narration', '')}\n"
             f"*📜 Prompt para HeyGen:* {heygen_prompt}\n"
@@ -462,36 +714,62 @@ def process_cycle(config: dict[str, str]) -> int:
     relevant_articles: list[dict[str, str]] = []
 
     logger.info("Starting monitoring cycle")
+    warned_about_feeds: set[str] = set()
 
     for source, feed_url in get_feeds().items():
         try:
             entries = fetch_feed_entries(feed_url)
         except requests.RequestException as exc:
-            logger.warning("Could not fetch %s feed: %s", source, exc)
+            status_code = getattr(exc.response, "status_code", None)
+            if status_code == 404 and source not in warned_about_feeds:
+                logger.warning("Feed %s returned 404 and will be skipped for this cycle: %s", source, exc)
+                warned_about_feeds.add(source)
+            elif source not in warned_about_feeds:
+                logger.warning("Could not fetch %s feed: %s", source, exc)
+                warned_about_feeds.add(source)
             continue
         except Exception as exc:  # pragma: no cover - defensive guard for feedparser issues
             logger.warning("Could not parse %s feed: %s", source, exc)
             continue
 
+        latest_titles: list[str] = []
+        matching_count = 0
+        duplicate_count = 0
+
         for entry in entries:
             article = normalize_entry(entry, source)
+            latest_titles.append(article.get("title", ""))
             if not is_relevant_article(article):
                 continue
 
+            if any(keyword.lower() in normalize_text(article.get("title", "")) for keyword in KEYWORDS):
+                matching_count += 1
+
             article_key = build_article_key(article, source)
             if article_key in seen_articles or article_key in seen_this_cycle:
+                duplicate_count += 1
                 continue
 
             seen_this_cycle.add(article_key)
             relevant_articles.append(article)
             logger.info("Detected new relevant article from %s: %s", source, article.get("title"))
 
+        logger.info(
+            "Source debug | source=%s | url=%s | items=%s | latest_titles=%s | matched_keywords=%s | duplicates_skipped=%s",
+            source,
+            feed_url,
+            len(entries),
+            latest_titles[:5],
+            matching_count,
+            duplicate_count,
+        )
+
     grouped_articles = group_articles(relevant_articles)
     high_potential_articles: list[dict[str, Any]] = []
 
     for grouped_article in grouped_articles:
         scored_article = score_article_with_ai(grouped_article, config)
-        if should_send_notification(scored_article):
+        if should_send_notification(scored_article) or is_live_goal_event(scored_article):
             high_potential_articles.append(scored_article)
             logger.info("High viral potential story: %s (score=%s)", scored_article.get("title"), scored_article.get("score"))
 
@@ -556,6 +834,16 @@ def main() -> int:
 
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
         process_cycle(config)
+        return 0
+
+    if len(sys.argv) > 2 and sys.argv[1] == "--manual":
+        headline = sys.argv[2].strip()
+        if not headline:
+            logger.error("Manual headline cannot be empty")
+            return 1
+        grouped_article = build_manual_grouped_article(headline)
+        build_portuguese_shorts_pack(grouped_article, config)
+        send_telegram_notification(grouped_article, config)
         return 0
 
     run_forever()

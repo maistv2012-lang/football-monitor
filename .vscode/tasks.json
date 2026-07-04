@@ -35,6 +35,76 @@
 			"command": "python -m unittest discover -s tests -v",
 			"problemMatcher": [],
 			"group": "test"
+		},
+		{
+			"label": "Run unit tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run unit tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run unit tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run unit tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run unit tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run discovery tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run unit tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Verify tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run tests again",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Run final tests",
+			"type": "shell",
+			"command": "python -m unittest discover -s tests -v",
+			"problemMatcher": [],
+			"group": "test"
 		}
 	]
 }

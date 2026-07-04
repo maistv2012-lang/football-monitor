@@ -2,10 +2,15 @@ import unittest
 
 from monitor import (
     build_article_key,
+    build_content_discovery_telegram_message,
+    build_live_event_telegram_message,
+    build_manual_grouped_article,
     build_portuguese_shorts_pack,
     build_portuguese_telegram_message,
     build_youtube_feed_url,
+    calculate_viral_score,
     group_articles,
+    is_live_goal_event,
     should_send_notification,
 )
 
@@ -101,6 +106,47 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Messi golaço CazéTV", message)
         self.assertIn("official clip", message)
 
+    def test_live_goal_event_detection_and_message(self):
+        article = {"title": "Brazil 1-0 Argentina: Messi scores in 45'", "source": "BBC Sport Football"}
+        self.assertTrue(is_live_goal_event(article))
+
+        grouped_article = {
+            "title": "Brazil 1-0 Argentina: Messi scores in 45'",
+            "summary": "Live goal from a high-profile match",
+            "sources": ["BBC Sport Football"],
+            "links": ["https://example.com/live"],
+            "score": 9.4,
+            "reason": "Live goal moment",
+            "is_live_event": True,
+            "match": "Brazil x Argentina",
+            "minute": "45'",
+            "goal_scorer": "Messi",
+            "competition": "Amistoso",
+            "official_source": "BBC Sport Football",
+        }
+
+        message = build_live_event_telegram_message(grouped_article, {})
+
+        self.assertIn("Match", message)
+        self.assertIn("Brazil x Argentina", message)
+        self.assertIn("45'", message)
+        self.assertIn("Messi", message)
+        self.assertIn("Amistoso", message)
+        self.assertIn("BBC Sport Football", message)
+
+    def test_manual_grouped_article_builds_portuguese_shorts_package(self):
+        article = build_manual_grouped_article("Cape Verde goal")
+
+        self.assertTrue(article["is_manual_event"])
+        self.assertEqual(article["title"], "Cape Verde goal")
+        self.assertIn("shorts_title", article)
+        self.assertIn("thumbnail_text", article)
+        self.assertIn("narration_scripts", article)
+        self.assertIn("description", article)
+        self.assertIn("hashtags", article)
+        self.assertIn("search_keywords", article)
+        self.assertTrue(article["video_search_links"])
+
     def test_build_portuguese_shorts_pack_creates_brazilian_portuguese_content(self):
         article = {
             "title": "Messi drama in a wild finish",
@@ -124,6 +170,72 @@ class MonitorTests(unittest.TestCase):
         entry = {"link": "https://example.com/article/1", "title": "Example"}
 
         self.assertEqual(build_article_key(entry, "FIFA"), "FIFA:https://example.com/article/1")
+
+    def test_calculate_viral_score_rewards_multiple_official_sources_and_videos(self):
+        grouped_article = {
+            "title": "Messi scores a dramatic late winner in a FIFA World Cup qualifier",
+            "summary": "The moment is trending across official and broadcaster channels.",
+            "sources": ["FIFA", "BBC Sport Football", "ESPN FC", "OneFootball"],
+            "links": [
+                "https://www.fifa.com/article-1",
+                "https://www.bbc.com/sport/article-2",
+                "https://www.espn.com/article-3",
+            ],
+            "video_links": [
+                "https://www.youtube.com/watch?v=abc123",
+                "https://www.youtube.com/watch?v=def456",
+            ],
+            "official_source": "FIFA",
+        }
+
+        score = calculate_viral_score(grouped_article)
+
+        self.assertGreaterEqual(score, 75)
+
+    def test_discovery_message_includes_summary_links_and_short_scripts(self):
+        grouped_article = {
+            "title": "Messi makes history with a stunning free kick",
+            "summary": "The clip is exploding across official accounts and broadcasters.",
+            "sources": ["FIFA", "BBC Sport Football", "ESPN FC"],
+            "links": ["https://www.fifa.com/article", "https://www.bbc.com/article"],
+            "video_links": ["https://www.youtube.com/watch?v=abc123"],
+            "video_url": "https://www.youtube.com/watch?v=abc123",
+            "score": 9.6,
+            "reason": "The story is trending because it combines a huge star and a dramatic moment.",
+        }
+
+        message = build_content_discovery_telegram_message(grouped_article, {})
+
+        self.assertIn("Resumo da história", message)
+        self.assertIn("Por que está explodindo", message)
+        self.assertIn("Links para todos os artigos", message)
+        self.assertIn("Links para todos os vídeos", message)
+        self.assertIn("30s", message)
+        self.assertIn("45s", message)
+        self.assertIn("60s", message)
+        self.assertIn("CTA", message)
+
+    def test_discovery_message_uses_structured_messi_alert_layout(self):
+        grouped_article = {
+            "title": "Messi marca golaço!",
+            "summary": "Momento decisivo com reação enorme das redes.",
+            "sources": ["FIFA", "ESPN", "BBC", "Reuters"],
+            "links": ["https://www.fifa.com/article", "https://www.espn.com/article"],
+            "video_links": ["https://www.youtube.com/watch?v=abc123"],
+            "video_url": "https://www.youtube.com/watch?v=abc123",
+            "score": 9.6,
+            "reason": "A story with a huge star and dramatic moment is exploding.",
+        }
+
+        message = build_content_discovery_telegram_message(grouped_article, {})
+
+        self.assertIn("🚨 Messi marca golaço!", message)
+        self.assertIn("📰 Notícias", message)
+        self.assertIn("🎥 Vídeos", message)
+        self.assertIn("🔥 Viral Score: 96/100", message)
+        self.assertIn("🎙 HeyGen", message)
+        self.assertIn("📝 Shorts", message)
+        self.assertIn("📸 Thumbnail", message)
 
 
 if __name__ == "__main__":

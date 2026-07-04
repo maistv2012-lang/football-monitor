@@ -20,7 +20,6 @@ def get_feeds() -> dict[str, str]:
         "BBC Sport Football": "https://feeds.bbci.co.uk/sport/football/rss.xml",
         "ESPN FC": "https://www.espn.com/espn/rss/soccer/news",
         "FIFA": "https://www.fifa.com/fifaplus/en/news/rss.xml",
-        "Reuters Soccer": "https://www.reutersagency.com/feed/?best-topics=soccer&post_type=best",
     }
 
     youtube_channel_ids = {

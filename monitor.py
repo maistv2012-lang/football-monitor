@@ -1016,6 +1016,12 @@ def run_forever() -> None:
     load_dotenv()
     config = load_config()
 
+    # Safe debug info: indicate whether Telegram credentials are configured (do not log values)
+    bot_cfg = bool(config.get("telegram_bot_token"))
+    chat_cfg = bool(config.get("telegram_chat_id"))
+    logger.info("Telegram bot token configured: %s", "yes" if bot_cfg else "no")
+    logger.info("Telegram chat id configured: %s", "yes" if chat_cfg else "no")
+
     while True:
         try:
             process_cycle(config)
@@ -1033,6 +1039,12 @@ def main() -> int:
     """CLI entry point."""
     load_dotenv()
     config = load_config()
+
+    # Safe debug info: indicate whether Telegram credentials are configured (do not log values)
+    bot_cfg = bool(config.get("telegram_bot_token"))
+    chat_cfg = bool(config.get("telegram_chat_id"))
+    logger.info("Telegram bot token configured: %s", "yes" if bot_cfg else "no")
+    logger.info("Telegram chat id configured: %s", "yes" if chat_cfg else "no")
 
     debug_mode = False
     args = sys.argv[1:]

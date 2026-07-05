@@ -27,6 +27,52 @@ from config import (
     load_config,
     normalize_text,
 )
+def build_priority_youtube_queries():
+    priority_teams = [
+        "Brazil", "Argentina", "Portugal", "France", "Spain",
+        "Colombia", "Mexico", "England", "Germany", "Uruguay",
+    ]
+
+    priority_players = [
+        "Messi", "Cristiano Ronaldo", "Neymar", "Mbappe",
+        "Vini Jr", "Rodrygo", "Endrick", "Lamine Yamal",
+        "Luis Diaz", "Bellingham",
+    ]
+
+    event_terms = [
+        "goal World Cup 2026",
+        "highlights World Cup 2026",
+        "VAR World Cup 2026",
+        "red card World Cup 2026",
+        "penalty World Cup 2026",
+        "funny moment World Cup 2026",
+        "fan reaction World Cup 2026",
+    ]
+
+    queries = []
+
+    for team in priority_teams:
+        for term in event_terms:
+            queries.append(f"{team} {term}")
+
+    for player in priority_players:
+        queries.append(f"{player} goal World Cup 2026")
+        queries.append(f"{player} highlights World Cup 2026")
+        queries.append(f"{player} funny moment World Cup 2026")
+
+    queries.extend([
+        "gol Brasil Copa 2026",
+        "Brasil melhores momentos Copa 2026",
+        "gol Argentina Copa 2026",
+        "Argentina melhores momentos Copa 2026",
+        "gol Portugal Copa 2026",
+        "gol França Copa 2026",
+        "gol Espanha Copa 2026",
+        "gol Colombia Copa 2026",
+        "gol Mexico Copa 2026",
+    ])
+
+    return list(dict.fromkeys(queries))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("football-monitor")
@@ -504,6 +550,50 @@ def fetch_feed_entries(feed_url: str) -> list[Any]:
     response.raise_for_status()
     parsed_feed = feedparser.parse(response.content)
     return parsed_feed.entries
+
+
+def is_live_match_entry(entry: dict[str, Any]) -> bool:
+    """Heuristic to detect if a feed entry refers to a live match or live event for priority competitions."""
+    title = normalize_text(entry.get("title", ""))
+    if not title:
+        return False
+
+    # Priority competition mentions
+    if "fifa world cup" in title or "copa do mundo" in title or "fifa" in title:
+        # If it mentions live or contains a score pattern it's likely live
+        if "live" in title or re.search(r"\b\d+-\d+\b", title) or "ft" in title:
+            return True
+
+    # Generic live indicators
+    live_indicators = ["live", "live commentary", "liveblog", "minute", "'", "\baos\b"]
+    if any(ind in title for ind in live_indicators):
+        # require also a score or a vs separator to reduce false positives
+        if re.search(r"\b\d+-\d+\b", title) or re.search(r"\bvs\b|\bx\b|\b-\b", title):
+            return True
+
+    return False
+
+
+def find_live_matches_from_feeds() -> list[dict[str, Any]]:
+    """Scan configured feeds for likely live matches; returns a list of matching entries.
+
+    This is a heuristic scan: it looks for entries with 'live' indicators, score patterns,
+    or explicit mentions of FIFA World Cup / Copa do Mundo.
+    """
+    matches: list[dict[str, Any]] = []
+    feeds = get_feeds()
+    for source_name, feed_url in feeds.items():
+        try:
+            entries = fetch_feed_entries(feed_url)
+        except Exception:
+            continue
+
+        for raw in entries:
+            normalized = normalize_entry(raw, source_name)
+            if is_live_match_entry(normalized):
+                matches.append(normalized)
+
+    return matches
 
 
 def is_live_goal_event(article: dict[str, str]) -> bool:
@@ -1024,15 +1114,27 @@ def run_forever() -> None:
 
     while True:
         try:
-            process_cycle(config)
+            # Quick scan for live matches and adjust polling interval when any are active
+            try:
+                live_matches = find_live_matches_from_feeds()
+            except Exception:
+                live_matches = []
+
+            if live_matches:
+                logger.info("Live matches detected (%d). Polling every 120s for immediate events.", len(live_matches))
+                process_cycle(config)
+                sleep_interval = 120
+            else:
+                process_cycle(config)
+                sleep_interval = CHECK_INTERVAL_SECONDS
         except KeyboardInterrupt:
             logger.info("Monitoring stopped by user")
             raise
         except Exception as exc:  # pragma: no cover - protects long-running loop
             logger.exception("Unexpected failure in monitoring loop: %s", exc)
 
-        logger.info("Sleeping for %s seconds", CHECK_INTERVAL_SECONDS)
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        logger.info("Sleeping for %s seconds", sleep_interval)
+        time.sleep(sleep_interval)
 
 
 def main() -> int:

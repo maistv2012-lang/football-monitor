@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
@@ -14,9 +15,15 @@ from monitor import (
     build_portuguese_telegram_message,
     build_youtube_feed_url,
     calculate_viral_score,
+    download_youtube_video,
     group_articles,
     is_live_goal_event,
+    is_trusted_youtube_uploader,
     process_cycle,
+    prepare_telegram_message,
+    search_and_download_youtube_video,
+    select_official_youtube_candidate,
+    send_telegram_notification,
     should_send_notification,
 )
 
@@ -24,6 +31,161 @@ from monitor import save_seen_articles
 
 
 class MonitorTests(unittest.TestCase):
+    def test_youtube_metadata_timeout_returns_cleanly(self):
+        with patch("monitor.subprocess.run", side_effect=subprocess.TimeoutExpired("yt-dlp", 20)) as run_mock, \
+             self.assertLogs("football-monitor", level="WARNING") as captured:
+            result = search_and_download_youtube_video(
+                "Messi goal", {}, set(), preferred_url="https://youtu.be/official001"
+            )
+
+        self.assertEqual(result, (None, None))
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 20)
+        self.assertIn("Video inspection timed out.", "\n".join(captured.output))
+
+    def test_youtube_download_subprocess_has_timeout(self):
+        completed = type("Completed", (), {"stdout": "downloads/video.mp4\n", "stderr": ""})()
+        with patch("monitor.subprocess.run", return_value=completed) as run_mock:
+            path = download_youtube_video(
+                "https://youtu.be/official001", Path("downloads"), "yt-dlp"
+            )
+
+        self.assertEqual(path, "downloads/video.mp4")
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 120)
+
+    def test_very_long_telegram_message_is_compacted_before_first_send(self):
+        response = type("Response", (), {"status_code": 200, "text": ""})()
+        article = {
+            "title": "Messi scores the winning goal",
+            "score": 9.7,
+            "sources": ["FIFA"],
+            "links": ["https://example.com/original"],
+            "video_url": "https://www.youtube.com/watch?v=official001",
+            "shorts_title": "Messi decidiu no último minuto!",
+            "is_manual_event": True,
+        }
+
+        with patch("monitor.build_manual_telegram_message", return_value="long section " * 1000), \
+             patch("monitor.requests.post", return_value=response) as post_mock:
+            sent = send_telegram_notification(
+                article,
+                {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
+            )
+
+        payload = post_mock.call_args.kwargs["json"]["text"]
+        self.assertTrue(sent)
+        self.assertLess(len(payload), 3500)
+        self.assertIn("Messi scores the winning goal", payload)
+        self.assertIn("9.7", payload)
+        self.assertIn("FIFA", payload)
+        self.assertIn("https://example.com/original", payload)
+        self.assertIn("https://www.youtube.com/watch?v=official001", payload)
+        self.assertIn("Messi decidiu no último minuto!", payload)
+        self.assertNotIn("long section long section", payload)
+
+    def test_telegram_400_logs_response_and_truncated_message_without_token(self):
+        token = "SECRET_TEST_BOT_TOKEN"
+        response = type("Response", (), {
+            "status_code": 400,
+            "text": '{"ok":false,"error_code":400,"description":"Bad Request: invalid message"}',
+        })()
+        message = f"alert {token} " + ("x" * 600)
+
+        with patch("monitor.build_manual_telegram_message", return_value=message), \
+             patch("monitor.requests.post", return_value=response), \
+             self.assertLogs("football-monitor", level="INFO") as captured:
+            sent = send_telegram_notification(
+                {"title": "Test", "is_manual_event": True},
+                {"telegram_bot_token": token, "telegram_chat_id": "123"},
+            )
+
+        logs = "\n".join(captured.output)
+        self.assertFalse(sent)
+        self.assertIn("Telegram 400", logs)
+        self.assertIn('"description":"Bad Request: invalid message"', logs)
+        self.assertIn("[REDACTED]", logs)
+        self.assertNotIn(token, logs)
+        self.assertNotIn("x" * 501, logs)
+
+    def test_telegram_transport_failure_returns_false_and_does_not_expose_token(self):
+        token = "SECRET_TRANSPORT_TOKEN"
+        with patch("monitor.build_manual_telegram_message", return_value="test message"), \
+             patch("monitor.requests.post", side_effect=Exception(f"request failed for {token}")), \
+             self.assertLogs("football-monitor", level="ERROR") as captured:
+            sent = send_telegram_notification(
+                {"title": "Test", "is_manual_event": True},
+                {"telegram_bot_token": token, "telegram_chat_id": "123"},
+            )
+
+        self.assertFalse(sent)
+        self.assertNotIn(token, "\n".join(captured.output))
+
+    def test_trusted_youtube_uploader_requires_exact_channel_name(self):
+        self.assertTrue(is_trusted_youtube_uploader({"channel": "CazéTV"}))
+        self.assertTrue(is_trusted_youtube_uploader({"channel": "FIFA+"}))
+        self.assertTrue(is_trusted_youtube_uploader({"uploader": "ESPN FC"}))
+        self.assertFalse(is_trusted_youtube_uploader({"channel": "FIFA Fan Clips"}))
+
+    def test_search_selection_skips_untrusted_and_unrelated_videos(self):
+        candidates = [
+            {"id": "untrusted01", "title": "Messi goal", "channel": "Fan Football"},
+            {"id": "unrelated01", "title": "Football gaming compilation", "channel": "FIFA"},
+            {"id": "official001", "title": "Messi scores dramatic goal", "channel": "FIFA"},
+        ]
+
+        selected = select_official_youtube_candidate(candidates, "Messi dramatic goal", set())
+
+        self.assertEqual(selected["id"], "official001")
+
+    def test_search_selection_ranks_all_results_instead_of_taking_first(self):
+        candidates = [
+            {"id": "firstresult", "title": "Messi football update", "channel": "FIFA"},
+            {"id": "betterresult", "title": "Messi dramatic winning goal Argentina", "channel": "FIFA+"},
+        ]
+
+        selected = select_official_youtube_candidate(
+            candidates, "Messi dramatic winning goal Argentina", set()
+        )
+
+        self.assertEqual(selected["id"], "betterresult")
+
+    def test_official_channel_still_rejects_rap_music_and_parody(self):
+        candidates = [
+            {"id": "rapbattle01", "title": "Yamal vs Messi Rap Battle Music Video", "channel": "FIFA"},
+            {"id": "parodyvid1", "title": "Messi goal parody reaction", "channel": "ESPN FC"},
+        ]
+
+        self.assertIsNone(select_official_youtube_candidate(candidates, "Messi goal", set()))
+
+    def test_article_youtube_url_is_preferred_without_searching(self):
+        metadata = '{"id":"official001","title":"Messi goal","channel":"FIFA"}'
+        completed = type("Completed", (), {"stdout": metadata, "stderr": ""})()
+        config = {"yt_dlp_bin": "yt-dlp", "downloads_dir": Path("downloads")}
+
+        with patch("monitor.subprocess.run", return_value=completed) as run_mock, \
+             patch("monitor.download_youtube_video", return_value="downloads/video.mp4") as download_mock:
+            path, url = search_and_download_youtube_video(
+                "Messi goal", config, set(), preferred_url="https://youtu.be/official001"
+            )
+
+        self.assertEqual(path, "downloads/video.mp4")
+        self.assertEqual(url, "https://youtu.be/official001")
+        self.assertNotIn("ytsearch", " ".join(run_mock.call_args.args[0]))
+        download_mock.assert_called_once()
+
+    def test_untrusted_article_youtube_url_is_not_downloaded_or_replaced(self):
+        metadata = '{"id":"fanvideo001","title":"Messi fan reaction","channel":"Fan Football"}'
+        completed = type("Completed", (), {"stdout": metadata, "stderr": ""})()
+
+        with patch("monitor.subprocess.run", return_value=completed) as run_mock, \
+             patch("monitor.download_youtube_video") as download_mock:
+            result = search_and_download_youtube_video(
+                "Messi goal", {}, set(), preferred_url="https://youtu.be/fanvideo001"
+            )
+
+        self.assertEqual(result, (None, None))
+        self.assertEqual(run_mock.call_count, 1)
+        download_mock.assert_not_called()
+
     def test_group_articles_merges_duplicate_titles_from_multiple_sources(self):
         articles = [
             {"title": "Messi magic lights up the match", "source": "ESPN FC", "link": "https://example.com/1"},

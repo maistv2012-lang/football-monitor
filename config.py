@@ -8,6 +8,10 @@ ROOT_DIR = Path(__file__).resolve().parent
 STATE_FILE = ROOT_DIR / ".seen_articles.json"
 ALERTS_FILE = ROOT_DIR / "alerts.json"
 
+# New: Folder for downloaded videos
+DOWNLOADS_DIR = ROOT_DIR / "downloads"
+DOWNLOADS_DIR.mkdir(exist_ok=True)
+
 def build_youtube_feed_url(channel_id: str) -> str:
     channel_id = (channel_id or "").strip()
     if not channel_id:
@@ -76,6 +80,16 @@ KEYWORDS = [
     "injury",
     "emotional",
     "celebration",
+    # New keywords for video content prioritization
+    "goals World Cup 2026",
+    "highlights World Cup 2026",
+    "funny moments World Cup 2026",
+    "VAR decisions World Cup 2026",
+    "red cards World Cup 2026",
+    "penalties World Cup 2026",
+    "own goals World Cup 2026",
+    "interviews World Cup 2026",
+    "viral moments World Cup 2026",
 ]
 
 TELEGRAM_BOT_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
@@ -86,6 +100,29 @@ CHECK_INTERVAL_SECONDS = 5 * 60
 REQUEST_TIMEOUT_SECONDS = 20
 USER_AGENT = "football-monitor/2.0"
 VIRAL_SCORE_THRESHOLD = 8.5
+
+# New: YouTube search related configurations
+YT_DLP_BIN = os.getenv("YT_DLP_BIN", "yt-dlp") # Path to yt-dlp executable
+YT_SEARCH_TERMS = [
+    "World Cup 2026 goals",
+    "World Cup 2026 highlights",
+    "World Cup 2026 funny moments",
+    "World Cup 2026 VAR",
+    "World Cup 2026 red card",
+    "World Cup 2026 penalty",
+    "World Cup 2026 own goal",
+    "World Cup 2026 interview",
+    "World Cup 2026 viral",
+    "Copa do Mundo 2026 gols",
+    "Copa do Mundo 2026 melhores momentos",
+    "Copa do Mundo 2026 momentos engraçados",
+    "Copa do Mundo 2026 VAR",
+    "Copa do Mundo 2026 cartão vermelho",
+    "Copa do Mundo 2026 pênalti",
+    "Copa do Mundo 2026 gol contra",
+    "Copa do Mundo 2026 entrevistas",
+    "Copa do Mundo 2026 viral",
+]
 
 
 def normalize_text(value: Any) -> str:
@@ -105,4 +142,7 @@ def load_config() -> dict[str, Any]:
         "state_file": STATE_FILE,
         "alerts_file": ALERTS_FILE,
         "debug_mode": debug_mode,
+        "yt_dlp_bin": os.getenv("YT_DLP_BIN", "yt-dlp"),
+        "downloads_dir": DOWNLOADS_DIR,
+        "yt_search_terms": YT_SEARCH_TERMS,
     }

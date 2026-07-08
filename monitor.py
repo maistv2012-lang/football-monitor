@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -81,7 +82,7 @@ def build_priority_youtube_queries() -> list[str]:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("football-monitor")
 
-TRUSTED_YOUTUBE_CHANNELS = {
+TRUSTED_YOUTUBE_CHANNEL_ORDER = [
     "fifa",
     "fifa+",
     "cazetv",
@@ -94,7 +95,58 @@ TRUSTED_YOUTUBE_CHANNELS = {
     "cbs sports golazo",
     "bein sports",
     "dazn football",
-}
+    "tvnz",
+    "tvnz+",
+    "tvnz sport",
+    "sky sport nz",
+    "sky sport next",
+    "all whites",
+    "wellington phoenix",
+    "auckland fc",
+]
+TRUSTED_YOUTUBE_CHANNELS = set(TRUSTED_YOUTUBE_CHANNEL_ORDER)
+DOWNLOAD_BLOCKED_CHANNELS = {"cazetv"}
+
+CAZETV_NEWS_FALLBACK_CHANNEL_ORDER = [
+    "fifa", "fifa+", "uefa", "premier league", "espn fc", "bbc sport",
+    "sky sports football", "tnt sports", "cbs sports golazo", "bein sports",
+    "dazn football", "tvnz sport", "sky sport nz",
+]
+
+GEO_RESTRICTED_FALLBACK_CHANNEL_ORDER = [
+    "fifa",
+    "fifa+",
+    "tvnz",
+    "tvnz sport",
+    "sky sport nz",
+    "espn fc",
+    "bbc sport",
+    "uefa",
+    "premier league",
+    "tnt sports",
+    "cbs sports golazo",
+    "bein sports",
+    "dazn football",
+] + [
+    channel for channel in TRUSTED_YOUTUBE_CHANNEL_ORDER
+    if channel not in {
+        "fifa", "fifa+", "tvnz", "tvnz sport", "sky sport nz", "espn fc",
+        "bbc sport", "uefa", "premier league", "tnt sports", "cbs sports golazo",
+        "bein sports", "dazn football",
+    }
+]
+
+GEO_RESTRICTION_TERMS = (
+    "unavailable in your country",
+    "geo restricted",
+    "geo-restricted",
+    "available in brazil",
+    "not available in your country",
+)
+
+
+class GeoRestrictedVideoError(RuntimeError):
+    """Raised when an official YouTube upload cannot be accessed in this region."""
 
 UNOFFICIAL_VIDEO_TERMS = {
     "ai generated", "ai-generated", "ai video", "compilation", "fan edit",
@@ -210,19 +262,30 @@ def is_youtube_link(value: str) -> bool:
 
 def normalize_channel_name(value: Any) -> str:
     """Normalize a YouTube channel name for strict trusted-list comparison."""
-    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(
+        character for character in str(value or "")
+        if not unicodedata.category(character).startswith(("P", "S"))
+    )
+    text = unicodedata.normalize("NFKD", text)
     text = "".join(character for character in text if not unicodedata.combining(character))
-    text = text.casefold().strip().lstrip("@").replace("✓", "")
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text).casefold()
     return re.sub(r"\s+", " ", text).strip()
+
+
+def channel_identity(value: Any) -> str:
+    """Create a spacing-independent identity for trusted channel matching."""
+    value_with_named_plus = str(value or "").replace("+", " plus ")
+    return normalize_channel_name(value_with_named_plus).replace(" ", "")
 
 
 def is_trusted_youtube_uploader(metadata: dict[str, Any]) -> bool:
     """Return True only for an exact trusted channel or uploader name."""
     names = {
-        normalize_channel_name(metadata.get("channel")),
-        normalize_channel_name(metadata.get("uploader")),
+        channel_identity(metadata.get("channel")),
+        channel_identity(metadata.get("uploader")),
     }
-    return bool(names & TRUSTED_YOUTUBE_CHANNELS)
+    trusted_names = {channel_identity(name) for name in TRUSTED_YOUTUBE_CHANNELS}
+    return bool(names & trusted_names)
 
 
 def is_relevant_video_candidate(metadata: dict[str, Any], query: str) -> bool:
@@ -238,30 +301,269 @@ def is_relevant_video_candidate(metadata: dict[str, Any], query: str) -> bool:
     return not query_terms or bool(query_terms & set(re.findall(r"[a-z0-9]+", title)))
 
 
-def select_official_youtube_candidate(
-    candidates: list[dict[str, Any]], query: str, seen_video_ids: set[str]
-) -> dict[str, Any] | None:
-    """Select the most article-relevant unseen result from a trusted channel."""
+def is_geo_restriction_error(value: Any) -> bool:
+    """Detect the common yt-dlp messages for regional restrictions."""
+    text = str(value or "").casefold()
+    return any(term in text for term in GEO_RESTRICTION_TERMS)
+
+
+HIGHLIGHT_TITLE_TERMS = ("highlights", "melhores momentos", "gols", "resumo")
+HIGHLIGHT_REJECTED_TERMS = (
+    "reaction", "live", "ao vivo", "jogo completo", "full match", "rap",
+    "parody", "gaming", " ai ", "ai generated", "aigenerated", "ai video", "edit",
+)
+SPAM_UPLOADER_TERMS = ("spam", "reupload", "clips daily", "viral videos", "highlights hub")
+
+TRUSTED_X_ACCOUNTS = {
+    "FIFAcom", "FIFAWorldCup", "ESPNFC", "BBCSport", "SkyFootball",
+    "CBSSportsGolazo", "UEFA", "premierleague", "TVNZSport", "NZ_Football",
+}
+
+
+def build_x_search_terms(article: dict[str, Any]) -> list[str]:
+    """Build X discovery terms from the match, teams, competition, and relevant players."""
+    title = str(article.get("title", "")).strip()
+    terms = [title] if title else []
+    teams = extract_match_teams(title)
+    if teams:
+        terms.extend(teams)
+        terms.append(f"{teams[0]} vs {teams[1]}")
+    competition = str(article.get("competition", "")).strip()
+    if competition:
+        terms.append(competition)
+    normalized_title = normalize_text(title)
+    terms.extend(keyword for keyword in KEYWORDS if len(keyword) >= 4 and keyword.lower() in normalized_title)
+    return list(dict.fromkeys(term for term in terms if term))
+
+
+def discover_x_posts(article: dict[str, Any], config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Find relevant recent posts from trusted official X accounts."""
+    bearer_token = str(config.get("x_bearer_token", "") or "")
+    if not bearer_token:
+        return []
+    configured_accounts = {str(account).strip().lstrip("@") for account in config.get("x_official_accounts", []) if str(account).strip()}
+    trusted_accounts = TRUSTED_X_ACCOUNTS | configured_accounts
+    terms = build_x_search_terms(article)
+    if not terms or not trusted_accounts:
+        return []
+    account_query = " OR ".join(f"from:{account}" for account in sorted(trusted_accounts)[:20])
+    query = f'("{terms[0][:120]}") ({account_query}) -is:retweet'
+    try:
+        response = requests.get(
+            "https://api.x.com/2/tweets/search/recent",
+            headers={"Authorization": f"Bearer {bearer_token}"},
+            params={
+                "query": query,
+                "max_results": 10,
+                "tweet.fields": "created_at,public_metrics,author_id",
+                "expansions": "author_id",
+                "user.fields": "name,username,verified",
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            logger.warning("X discovery request failed with status %s", response.status_code)
+            return []
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        logger.warning("X discovery request failed; continuing without X results.")
+        return []
+
+    users = {str(user.get("id")): user for user in payload.get("includes", {}).get("users", [])}
+    trusted_normalized = {account.casefold() for account in trusted_accounts}
+    relevant_terms = {term for term in re.findall(r"[a-z0-9]+", normalize_channel_name(" ".join(terms))) if len(term) >= 4}
+    posts: list[dict[str, Any]] = []
+    for post in payload.get("data", []):
+        user = users.get(str(post.get("author_id")), {})
+        username = str(user.get("username", ""))
+        if username.casefold() not in trusted_normalized:
+            continue
+        text_value = str(post.get("text", ""))
+        post_terms = set(re.findall(r"[a-z0-9]+", normalize_channel_name(text_value)))
+        if relevant_terms and not (relevant_terms & post_terms):
+            continue
+        metrics = post.get("public_metrics", {}) or {}
+        posts.append({
+            "text": text_value,
+            "account_name": user.get("name") or username,
+            "username": username,
+            "url": f"https://x.com/{username}/status/{post.get('id')}",
+            "likes": metrics.get("like_count"),
+            "reposts": metrics.get("retweet_count"),
+            "views": metrics.get("impression_count"),
+        })
+    return posts
+
+
+def build_x_telegram_message(post: dict[str, Any]) -> str:
+    """Format an X discovery result for Telegram."""
+    lines = [
+        "X football discovery",
+        f"Post: {post.get('text', '')}",
+        f"Account: {post.get('account_name', '')}",
+        f"URL: {post.get('url', '')}",
+    ]
+    for label, field in (("Likes", "likes"), ("Reposts", "reposts"), ("Views", "views")):
+        if post.get(field) is not None:
+            lines.append(f"{label}: {post[field]}")
+    return "\n".join(lines)[:TELEGRAM_SAFE_TEXT_LIMIT]
+
+
+def build_match_highlight_queries(team_one: str, team_two: str, competition: str) -> list[str]:
+    """Build English and Portuguese searches for supported match competitions."""
+    competition_key = normalize_channel_name(competition)
+    if "brasileiro" in competition_key or "brasileirao" in competition_key:
+        return [
+            f"{team_one} vs {team_two} highlights Campeonato Brasileiro",
+            f"{team_one} {team_two} melhores momentos Brasileirão",
+        ]
+    if "champions" in competition_key:
+        return [
+            f"{team_one} vs {team_two} highlights Champions League",
+            f"{team_one} vs {team_two} melhores momentos Champions League",
+        ]
+    return [
+        f"{team_one} vs {team_two} highlights World Cup 2026",
+        f"{team_one} {team_two} melhores momentos Copa 2026",
+    ]
+
+
+def extract_match_teams(value: str) -> tuple[str, str] | None:
+    """Extract two team names from common match-title separators."""
+    match = re.search(
+        r"^\s*(.+?)\s+(?:vs\.?|v\.?|x)\s+(.+?)(?:\s*[-:|]|\s+(?:highlights|melhores momentos|gols|resumo)\b|$)",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def validate_highlight_candidate(
+    metadata: dict[str, Any],
+    team_names: tuple[str, str] | None,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Validate a recent match-highlights upload, including non-official channels."""
+    title = normalize_channel_name(metadata.get("title"))
+    padded_title = f" {title} "
+    if any(term in padded_title for term in HIGHLIGHT_REJECTED_TERMS):
+        return False, "title contains rejected content"
+    if not any(term in title for term in HIGHLIGHT_TITLE_TERMS):
+        return False, "title is not a highlights video"
+    has_both_teams = bool(team_names) and all(normalize_channel_name(team) in title for team in team_names)
+    if not has_both_teams:
+        return False, "title does not identify both teams"
+
+    try:
+        duration = float(metadata.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if not 120 <= duration <= 900:
+        return False, "duration is outside 2-15 minutes"
+
+    uploader = normalize_channel_name(metadata.get("channel") or metadata.get("uploader"))
+    if not uploader or any(term in uploader for term in SPAM_UPLOADER_TERMS):
+        return False, "uploader appears to be spam"
+
+    uploaded_at: datetime | None = None
+    upload_date = str(metadata.get("upload_date") or "")
+    if re.fullmatch(r"\d{8}", upload_date):
+        uploaded_at = datetime.strptime(upload_date, "%Y%m%d").replace(tzinfo=timezone.utc)
+    elif metadata.get("timestamp"):
+        try:
+            uploaded_at = datetime.fromtimestamp(float(metadata["timestamp"]), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            uploaded_at = None
+    if uploaded_at is None:
+        return False, "upload date is missing"
+    reference_time = now or datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    age_days = (reference_time - uploaded_at).total_seconds() / 86400
+    if age_days < -1 or age_days > 14:
+        return False, "video is not recent"
+    return True, "valid recent match highlights"
+
+
+def rank_highlight_candidates(
+    candidates: list[dict[str, Any]], team_names: tuple[str, str] | None
+) -> list[dict[str, Any]]:
+    """Log and return acceptable match-highlight candidates, newest first."""
+    accepted: list[dict[str, Any]] = []
+    for candidate in candidates:
+        uploader = candidate.get("channel") or candidate.get("uploader") or ""
+        if channel_identity(uploader) in {channel_identity(name) for name in DOWNLOAD_BLOCKED_CHANNELS}:
+            logger.info("Highlight candidate rejected because uploader is blocked for downloads: %s", candidate.get("title", ""))
+            continue
+        valid, reason = validate_highlight_candidate(candidate, team_names)
+        title = candidate.get("title", "")
+        if valid:
+            logger.info("Highlight candidate accepted: %s", title)
+            accepted.append(candidate)
+        else:
+            logger.info("Highlight candidate rejected because %s: %s", reason, title)
+    return sorted(
+        accepted,
+        key=lambda candidate: str(candidate.get("upload_date") or candidate.get("timestamp") or ""),
+        reverse=True,
+    )
+
+
+def rank_official_youtube_candidates(
+    candidates: list[dict[str, Any]],
+    query: str,
+    seen_video_ids: set[str],
+    channel_priority: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return all acceptable candidates in official-channel priority order."""
     query_terms = set(re.findall(r"[a-z0-9]+", normalize_channel_name(query)))
-    ranked_candidates: list[tuple[int, dict[str, Any]]] = []
+    priority_names = channel_priority or TRUSTED_YOUTUBE_CHANNEL_ORDER
+    channel_order = {
+        channel_identity(name): index for index, name in enumerate(priority_names)
+    }
+    ranked_candidates: list[tuple[int, int, dict[str, Any]]] = []
     for candidate in candidates:
         uploader = candidate.get("channel") or candidate.get("uploader") or "unknown"
+        video_id = str(candidate.get("id") or "")
+        candidate_url = candidate.get("webpage_url") or candidate.get("url")
+        if not candidate_url and video_id:
+            candidate_url = f"https://www.youtube.com/watch?v={video_id}"
+        logger.info(
+            "YouTube candidate | title=%s | uploader=%s | url=%s",
+            candidate.get("title", ""), uploader, candidate_url or "unknown",
+        )
+        if channel_identity(uploader) in {channel_identity(name) for name in DOWNLOAD_BLOCKED_CHANNELS}:
+            logger.info("Skipping because uploader is blocked for downloads: %s", uploader)
+            continue
         if not is_trusted_youtube_uploader(candidate):
             logger.info("Skipping because uploader is not trusted: %s", uploader)
             continue
-        video_id = str(candidate.get("id") or "")
         if not video_id or video_id in seen_video_ids:
             continue
         if not is_relevant_video_candidate(candidate, query):
             logger.info("Skipping official-channel video because it is not relevant to the article: %s", candidate.get("title", ""))
             continue
         title_terms = set(re.findall(r"[a-z0-9]+", normalize_channel_name(candidate.get("title"))))
-        ranked_candidates.append((len(query_terms & title_terms), candidate))
+        channel_name = candidate.get("channel") or candidate.get("uploader") or ""
+        priority = channel_order.get(channel_identity(channel_name), len(channel_order))
+        ranked_candidates.append((priority, -len(query_terms & title_terms), candidate))
+
+    ranked_candidates.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked_candidates]
+
+
+def select_official_youtube_candidate(
+    candidates: list[dict[str, Any]], query: str, seen_video_ids: set[str]
+) -> dict[str, Any] | None:
+    """Select the highest-priority relevant candidate."""
+    ranked_candidates = rank_official_youtube_candidates(candidates, query, seen_video_ids)
 
     if not ranked_candidates:
         return None
 
-    selected = max(ranked_candidates, key=lambda item: item[0])[1]
+    selected = ranked_candidates[0]
     uploader = selected.get("channel") or selected.get("uploader") or "unknown"
     logger.info("Official channel found: %s", uploader)
     return selected
@@ -465,6 +767,28 @@ def prepare_telegram_message(grouped_article: dict[str, Any], message: str) -> s
     compact_fields.append(f"Ideia de legenda curta: {caption}")
     compact_fields.append("Mensagem resumida automaticamente para respeitar o limite do Telegram.")
     return "\n".join(compact_fields)[:TELEGRAM_SAFE_TEXT_LIMIT]
+
+
+def send_x_discovery_notification(post: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Send one X discovery link to Telegram without entering the download pipeline."""
+    token = str(config.get("telegram_bot_token", "") or "")
+    chat_id = str(config.get("telegram_chat_id", "") or "")
+    if not token or not chat_id:
+        return False
+    message = build_x_telegram_message(post).replace(token, "[REDACTED]")
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            logger.warning("X discovery Telegram notification failed with status %s", response.status_code)
+            return False
+        return True
+    except requests.RequestException:
+        logger.warning("X discovery Telegram notification failed; monitoring will continue.")
+        return False
 
 
 def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
@@ -983,7 +1307,7 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
             f"*🏷 Hashtags:* {" ".join(shorts_pack.get("hashtags", []))}\n"
             f"*📌 Título:* {shorts_pack.get("shorts_title", "")}\n"
             f"*⏱ Tempo estimado:* 30s, 45s, 60s\n"
-            f"*🎙 30s:* {shorts_pack.get("narration_scripts", {}).get("30s", "")}\n"
+            f"*🎙 30s:* {shorts_pack.get("narration_scripts", {}).get('30s', '')}\n"
             f"*🎙 45s:* {shorts_pack.get("narration_scripts", {}).get("45s", "")}\n"
             f"*🎙 60s:* {shorts_pack.get("narration_scripts", {}).get("60s", "")}\n"
             f"*🔍 Search keywords:* {", ".join(shorts_pack.get("search_keywords", []))}\n"
@@ -1225,6 +1549,11 @@ def process_cycle(config: dict[str, str]) -> int:
 
         notification_sent = send_telegram_notification(article, config)
         if notification_sent:
+            try:
+                for x_post in discover_x_posts(article, config)[:3]:
+                    send_x_discovery_notification(x_post, config)
+            except Exception:
+                logger.warning("X discovery failed unexpectedly; monitoring will continue.")
             if not debug_mode:
                 for duplicate_key in article.get("duplicate_keys", []):
                     if duplicate_key:
@@ -1232,8 +1561,9 @@ def process_cycle(config: dict[str, str]) -> int:
             # Prefer an article-provided YouTube URL; otherwise search trusted channels.
             article_url = article.get("video_url") or article.get("link") or ""
             preferred_url = article_url if is_youtube_link(article_url) else ""
+            article_source = article.get("official_source", "") or next(iter(article.get("sources", [])), "")
             downloaded_path = None
-            video_id_for_download = extract_youtube_video_id(preferred_url)
+            video_id_for_download = "" if channel_identity(article_source) == channel_identity("CazéTV") else extract_youtube_video_id(preferred_url)
             article["downloaded_video_path"] = "" # Initialize for consistency
 
             if video_id_for_download and video_id_for_download in downloaded_video_ids:
@@ -1241,7 +1571,11 @@ def process_cycle(config: dict[str, str]) -> int:
             else:
                 search_query = article.get("title", "") or "World Cup 2026 football highlights"
                 downloaded_path, actual_video_url = search_and_download_youtube_video(
-                    search_query, config, downloaded_video_ids, preferred_url=preferred_url
+                    search_query,
+                    config,
+                    downloaded_video_ids,
+                    preferred_url=preferred_url,
+                    trusted_source=article_source,
                 )
 
                 if downloaded_path:
@@ -1364,6 +1698,8 @@ def download_youtube_video(video_url: str, output_path: Path, yt_dlp_bin: str = 
         paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return paths[-1] if paths else None
     except subprocess.CalledProcessError as exc:
+        if is_geo_restriction_error(exc.stderr):
+            raise GeoRestrictedVideoError(str(exc.stderr or "")) from None
         logger.error("yt-dlp failed to download %s: %s (stderr: %s)", video_url, exc, exc.stderr)
         return None
     except subprocess.TimeoutExpired:
@@ -1382,6 +1718,11 @@ def search_and_download_youtube_video(
     config: dict[str, str],
     seen_video_ids: set[str],
     preferred_url: str = "",
+    trusted_source: str = "",
+    prefer_geo_fallback_order: bool = False,
+    validation_mode: str = "official",
+    highlights_fallback: bool = False,
+    cazetv_news_fallback: bool = False,
 ) -> tuple[str | None, str | None]:
     """Searches YouTube for a video and downloads the best match, skipping duplicates.
 
@@ -1395,9 +1736,44 @@ def search_and_download_youtube_video(
     """
     yt_dlp_bin = config.get("yt_dlp_bin", YT_DLP_BIN)
     downloads_dir = config.get("downloads_dir", DOWNLOADS_DIR)
+    geo_restriction_seen = highlights_fallback
 
     try:
+        if channel_identity(trusted_source) == channel_identity("CazéTV") and not cazetv_news_fallback:
+            logger.info("CazéTV is news-only; skipping its original video and searching other trusted highlights.")
+            return search_and_download_youtube_video(
+                query,
+                config,
+                seen_video_ids,
+                cazetv_news_fallback=True,
+            )
+
         if preferred_url:
+            if channel_identity(trusted_source) == channel_identity("CazéTV"):
+                logger.info(
+                    "YouTube candidate | title=%s | uploader=%s | url=%s",
+                    query, trusted_source, preferred_url,
+                )
+                if not is_relevant_video_candidate({"title": query}, query):
+                    logger.info("Skipping CazéTV video because it contains rejected content terms: %s", query)
+                    logger.info("No trusted official video found.")
+                    return None, None
+                logger.info("Official channel found: %s", trusted_source)
+                logger.info("Downloading...")
+                try:
+                    downloaded_path = download_youtube_video(preferred_url, Path(downloads_dir), str(yt_dlp_bin))
+                except GeoRestrictedVideoError:
+                    logger.warning("Official download is geo-restricted.")
+                    logger.warning("Trying next trusted official channel...")
+                    return search_and_download_youtube_video(
+                        query,
+                        config,
+                        seen_video_ids,
+                        prefer_geo_fallback_order=True,
+                        highlights_fallback=True,
+                    )
+                return (downloaded_path, preferred_url) if downloaded_path else (None, None)
+
             logger.info("Inspecting article YouTube URL before download...")
             metadata_command = [
                 str(yt_dlp_bin), preferred_url, "--dump-single-json", "--skip-download",
@@ -1408,40 +1784,101 @@ def search_and_download_youtube_video(
                     metadata_command, capture_output=True, text=True, check=True, timeout=20
                 )
             except subprocess.TimeoutExpired:
-                logger.warning("Video inspection timed out.")
-                return None, None
+                logger.warning("Article video inspection timed out. Falling back to YouTube search.")
+                return search_and_download_youtube_video(query, config, seen_video_ids)
+            except subprocess.CalledProcessError as exc:
+                if is_geo_restriction_error(exc.stderr):
+                    logger.warning("Official download is geo-restricted.")
+                    logger.warning("Trying next trusted official channel...")
+                    return search_and_download_youtube_video(
+                        query,
+                        config,
+                        seen_video_ids,
+                        prefer_geo_fallback_order=channel_identity(trusted_source) == channel_identity("CazéTV"),
+                        highlights_fallback=True,
+                    )
+                logger.warning("Article video inspection failed. Falling back to YouTube search.")
+                return search_and_download_youtube_video(query, config, seen_video_ids)
             metadata = json.loads(metadata_result.stdout)
             uploader = metadata.get("channel") or metadata.get("uploader") or "unknown"
+            logger.info(
+                "YouTube candidate | title=%s | uploader=%s | url=%s",
+                metadata.get("title", ""), uploader, preferred_url,
+            )
             if not is_trusted_youtube_uploader(metadata):
                 logger.info("Skipping because uploader is not trusted: %s", uploader)
-                logger.info("No trusted official video found.")
-                return None, None
+                logger.info("Falling back to trusted YouTube search.")
+                return search_and_download_youtube_video(query, config, seen_video_ids)
             logger.info("Official channel found: %s", uploader)
             if not is_relevant_video_candidate(metadata, query):
                 logger.info("Skipping official-channel video because it is not relevant to the article: %s", metadata.get("title", ""))
-                logger.info("No trusted official video found.")
-                return None, None
+                logger.info("Falling back to trusted YouTube search.")
+                return search_and_download_youtube_video(query, config, seen_video_ids)
             logger.info("Downloading...")
-            downloaded_path = download_youtube_video(preferred_url, Path(downloads_dir), str(yt_dlp_bin))
-            return (downloaded_path, preferred_url) if downloaded_path else (None, None)
+            try:
+                downloaded_path = download_youtube_video(preferred_url, Path(downloads_dir), str(yt_dlp_bin))
+            except GeoRestrictedVideoError:
+                logger.warning("Official download is geo-restricted.")
+                logger.warning("Trying next trusted official channel...")
+                geo_restriction_seen = True
+                return search_and_download_youtube_video(
+                    query,
+                    config,
+                    seen_video_ids,
+                    prefer_geo_fallback_order=channel_identity(uploader) == channel_identity("CazéTV"),
+                    highlights_fallback=True,
+                )
+            if downloaded_path:
+                return downloaded_path, preferred_url
+            logger.info("Article video download failed. Falling back to trusted YouTube search.")
+            return search_and_download_youtube_video(query, config, seen_video_ids)
 
-        logger.info("Searching official YouTube video...")
-        search_command = [
-            yt_dlp_bin,
-            f"ytsearch10:{query}",  # Search for top 10 results
-            "--dump-json",
-            "--flat-playlist",
-            "--no-warnings",
-            "--quiet",
-        ]
-        logger.debug("Executing yt-dlp search command: %s", " ".join(search_command))
-        search_result = subprocess.run(
-            search_command, capture_output=True, text=True, check=True, timeout=20
-        )
-        video_metadata = [json.loads(line) for line in search_result.stdout.strip().split('\n') if line.strip()]
+        team_names = extract_match_teams(query)
+        if validation_mode == "highlights_discovery" or cazetv_news_fallback:
+            if validation_mode == "highlights_discovery":
+                logger.info("Searching non-official match highlights...")
+            else:
+                logger.info("Searching match highlights...")
+            normalized_query = normalize_channel_name(query)
+            if team_names:
+                if "champions" in normalized_query:
+                    competition = "Champions League"
+                elif "brasileir" in normalized_query:
+                    competition = "Campeonato Brasileiro"
+                else:
+                    competition = "FIFA World Cup"
+                search_queries = build_match_highlight_queries(*team_names, competition)
+            else:
+                search_queries = [query if any(term in normalized_query for term in HIGHLIGHT_TITLE_TERMS) else f"{query} highlights"]
+        else:
+            logger.info("Searching official YouTube video...")
+            search_queries = [query]
 
-        selected_video = select_official_youtube_candidate(video_metadata, query, seen_video_ids)
-        if selected_video:
+        video_metadata: list[dict[str, Any]] = []
+        for search_query in search_queries:
+            search_command = [
+                yt_dlp_bin, f"ytsearch20:{search_query}", "--dump-json",
+                "--flat-playlist", "--no-warnings", "--quiet",
+            ]
+            logger.debug("Executing yt-dlp search command: %s", " ".join(search_command))
+            search_result = subprocess.run(
+                search_command, capture_output=True, text=True, check=True, timeout=20
+            )
+            video_metadata.extend(
+                json.loads(line) for line in search_result.stdout.strip().split('\n') if line.strip()
+            )
+
+        if validation_mode == "highlights_discovery":
+            official_candidates = rank_highlight_candidates(video_metadata, team_names)
+        else:
+            if cazetv_news_fallback:
+                channel_priority = CAZETV_NEWS_FALLBACK_CHANNEL_ORDER
+            else:
+                channel_priority = GEO_RESTRICTED_FALLBACK_CHANNEL_ORDER if prefer_geo_fallback_order else None
+            official_candidates = rank_official_youtube_candidates(
+                video_metadata, query, seen_video_ids, channel_priority=channel_priority
+            )
+        for selected_video in official_candidates:
             best_video_id = str(selected_video.get("id"))
             best_video_url = selected_video.get("webpage_url") or selected_video.get("url")
             if best_video_url == best_video_id:
@@ -1449,14 +1886,38 @@ def search_and_download_youtube_video(
             if not best_video_url:
                 best_video_url = f"https://www.youtube.com/watch?v={best_video_id}"
             logger.info("Downloading...")
-            downloaded_path = download_youtube_video(best_video_url, Path(downloads_dir), str(yt_dlp_bin))
+            try:
+                downloaded_path = download_youtube_video(best_video_url, Path(downloads_dir), str(yt_dlp_bin))
+            except GeoRestrictedVideoError:
+                logger.warning("Official download is geo-restricted.")
+                logger.warning("Trying next trusted official channel...")
+                geo_restriction_seen = True
+                selected_uploader = selected_video.get("channel") or selected_video.get("uploader") or ""
+                if channel_identity(selected_uploader) == channel_identity("CazéTV") and not prefer_geo_fallback_order:
+                    return search_and_download_youtube_video(
+                        query,
+                        config,
+                        seen_video_ids | {best_video_id},
+                        prefer_geo_fallback_order=True,
+                        highlights_fallback=True,
+                    )
+                continue
             if downloaded_path:
                 return downloaded_path, best_video_url
-        else:
-            logger.info("No trusted official video found.")
-            return None, None
+        if validation_mode == "official" and (geo_restriction_seen or cazetv_news_fallback) and team_names:
+            return search_and_download_youtube_video(
+                query,
+                config,
+                seen_video_ids,
+                validation_mode="highlights_discovery",
+            )
+        logger.info("No trusted official video found.")
+        return None, None
 
     except subprocess.CalledProcessError as exc:
+        if preferred_url:
+            logger.warning("Article video inspection failed. Falling back to YouTube search.")
+            return search_and_download_youtube_video(query, config, seen_video_ids)
         logger.error("yt-dlp search failed for query %s: %s", query, exc.stderr)
         logger.info("No trusted official video found.")
         return None, None
@@ -1465,6 +1926,9 @@ def search_and_download_youtube_video(
         logger.info("No trusted official video found.")
         return None, None
     except Exception as exc:
+        if preferred_url:
+            logger.warning("Article video inspection failed. Falling back to YouTube search.")
+            return search_and_download_youtube_video(query, config, seen_video_ids)
         logger.error("An unexpected error occurred during YouTube search/download: %s", exc)
         logger.info("No trusted official video found.")
         return None, None

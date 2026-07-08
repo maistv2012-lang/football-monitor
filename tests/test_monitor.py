@@ -1,21 +1,27 @@
 import subprocess
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from monitor import (
+    GeoRestrictedVideoError,
     build_article_key,
     build_content_discovery_telegram_message,
     build_live_event_telegram_message,
+    build_match_highlight_queries,
     build_manual_grouped_article,
     build_portuguese_shorts_pack,
     build_portuguese_telegram_message,
     build_youtube_feed_url,
+    build_x_search_terms,
+    build_x_telegram_message,
     calculate_viral_score,
     download_youtube_video,
+    discover_x_posts,
     group_articles,
     is_live_goal_event,
     is_trusted_youtube_uploader,
@@ -25,22 +31,138 @@ from monitor import (
     select_official_youtube_candidate,
     send_telegram_notification,
     should_send_notification,
+    validate_highlight_candidate,
 )
 
 from monitor import save_seen_articles
 
 
 class MonitorTests(unittest.TestCase):
+    def test_x_search_terms_include_match_teams_competition_and_player(self):
+        terms = build_x_search_terms({
+            "title": "Argentina vs Egypt: Messi scores",
+            "competition": "FIFA World Cup",
+        })
+        self.assertIn("Argentina", terms)
+        self.assertIn("Egypt", terms)
+        self.assertIn("FIFA World Cup", terms)
+        self.assertIn("Messi", terms)
+
+    def test_x_discovery_accepts_only_trusted_relevant_accounts_with_metrics(self):
+        response = type("Response", (), {
+            "status_code": 200,
+            "json": lambda self: {
+                "data": [
+                    {"id": "101", "author_id": "1", "text": "Argentina vs Egypt match update", "public_metrics": {"like_count": 50, "retweet_count": 8, "impression_count": 900}},
+                    {"id": "102", "author_id": "2", "text": "Argentina vs Egypt fan post", "public_metrics": {}},
+                ],
+                "includes": {"users": [
+                    {"id": "1", "name": "FIFA World Cup", "username": "FIFAWorldCup"},
+                    {"id": "2", "name": "Fan Account", "username": "RandomFan"},
+                ]},
+            },
+        })()
+        with patch("monitor.requests.get", return_value=response), \
+             patch("monitor.download_youtube_video") as download_mock:
+            posts = discover_x_posts(
+                {"title": "Argentina vs Egypt", "competition": "FIFA World Cup"},
+                {"x_bearer_token": "TEST_X_TOKEN"},
+            )
+
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["url"], "https://x.com/FIFAWorldCup/status/101")
+        self.assertEqual(posts[0]["likes"], 50)
+        self.assertEqual(posts[0]["reposts"], 8)
+        self.assertEqual(posts[0]["views"], 900)
+        download_mock.assert_not_called()
+
+    def test_x_discovery_message_contains_post_account_url_and_metrics(self):
+        message = build_x_telegram_message({
+            "text": "Late winning goal!",
+            "account_name": "BBC Sport",
+            "url": "https://x.com/BBCSport/status/123",
+            "likes": 100,
+            "reposts": 20,
+            "views": 5000,
+        })
+        self.assertIn("Late winning goal!", message)
+        self.assertIn("BBC Sport", message)
+        self.assertIn("https://x.com/BBCSport/status/123", message)
+        self.assertIn("Likes: 100", message)
+        self.assertIn("Reposts: 20", message)
+        self.assertIn("Views: 5000", message)
+
+    def test_x_discovery_without_credentials_continues_without_request(self):
+        with patch("monitor.requests.get") as get_mock:
+            self.assertEqual(discover_x_posts({"title": "Argentina vs Egypt"}, {}), [])
+        get_mock.assert_not_called()
+
+    def test_match_highlight_queries_cover_supported_competitions(self):
+        self.assertIn("World Cup 2026", " ".join(build_match_highlight_queries("Portugal", "Spain", "FIFA World Cup")))
+        self.assertIn("Brasileirão", " ".join(build_match_highlight_queries("Flamengo", "Palmeiras", "Campeonato Brasileiro")))
+        self.assertIn("Champions League", " ".join(build_match_highlight_queries("Real Madrid", "Manchester City", "Champions League")))
+
+    def test_highlights_discovery_accepts_valid_non_official_video(self):
+        valid, reason = validate_highlight_candidate(
+            {"title": "Portugal vs Spain highlights World Cup 2026", "uploader": "NZ Football Coverage", "duration": 420, "upload_date": "20260706"},
+            ("Portugal", "Spain"), datetime(2026, 7, 7, tzinfo=timezone.utc),
+        )
+        self.assertTrue(valid, reason)
+
+    def test_highlights_discovery_rejects_reaction_video(self):
+        valid, _ = validate_highlight_candidate(
+            {"title": "Portugal vs Spain highlights reaction", "uploader": "Football Talk", "duration": 300, "upload_date": "20260706"},
+            ("Portugal", "Spain"), datetime(2026, 7, 7, tzinfo=timezone.utc),
+        )
+        self.assertFalse(valid)
+
+    def test_highlights_discovery_rejects_full_match(self):
+        for title in ("Portugal vs Spain highlights full match", "Portugal vs Spain melhores momentos jogo completo"):
+            with self.subTest(title=title):
+                valid, _ = validate_highlight_candidate(
+                    {"title": title, "uploader": "Football Coverage", "duration": 600, "upload_date": "20260706"},
+                    ("Portugal", "Spain"), datetime(2026, 7, 7, tzinfo=timezone.utc),
+                )
+                self.assertFalse(valid)
+
+    def test_highlights_discovery_rejects_video_missing_one_team(self):
+        valid, _ = validate_highlight_candidate(
+            {"title": "Portugal highlights World Cup 2026", "uploader": "Football Coverage", "duration": 300, "upload_date": "20260706"},
+            ("Portugal", "Spain"), datetime(2026, 7, 7, tzinfo=timezone.utc),
+        )
+        self.assertFalse(valid)
+
+    def test_highlights_discovery_rejects_old_video(self):
+        valid, _ = validate_highlight_candidate(
+            {"title": "Portugal vs Spain highlights", "uploader": "Football Coverage", "duration": 300, "upload_date": "20260101"},
+            ("Portugal", "Spain"), datetime(2026, 7, 7, tzinfo=timezone.utc),
+        )
+        self.assertFalse(valid)
     def test_youtube_metadata_timeout_returns_cleanly(self):
-        with patch("monitor.subprocess.run", side_effect=subprocess.TimeoutExpired("yt-dlp", 20)) as run_mock, \
+        search_result = type("Completed", (), {
+            "stdout": '{"id":"official001","title":"Messi goal","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=official001"}',
+            "stderr": "",
+        })()
+        with patch(
+            "monitor.subprocess.run",
+            side_effect=[subprocess.TimeoutExpired("yt-dlp", 20), search_result],
+        ) as run_mock, \
+             patch("monitor.download_youtube_video", return_value="downloads/official.mp4"), \
              self.assertLogs("football-monitor", level="WARNING") as captured:
             result = search_and_download_youtube_video(
                 "Messi goal", {}, set(), preferred_url="https://youtu.be/official001"
             )
 
-        self.assertEqual(result, (None, None))
-        self.assertEqual(run_mock.call_args.kwargs["timeout"], 20)
-        self.assertIn("Video inspection timed out.", "\n".join(captured.output))
+        self.assertEqual(
+            result,
+            ("downloads/official.mp4", "https://youtube.com/watch?v=official001"),
+        )
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertTrue(all(call.kwargs["timeout"] == 20 for call in run_mock.call_args_list))
+        self.assertIn(
+            "Article video inspection timed out. Falling back to YouTube search.",
+            "\n".join(captured.output),
+        )
 
     def test_youtube_download_subprocess_has_timeout(self):
         completed = type("Completed", (), {"stdout": "downloads/video.mp4\n", "stderr": ""})()
@@ -120,10 +242,120 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn(token, "\n".join(captured.output))
 
     def test_trusted_youtube_uploader_requires_exact_channel_name(self):
-        self.assertTrue(is_trusted_youtube_uploader({"channel": "CazéTV"}))
+        for channel_name in ("CazéTV", "CazeTV", "Cazé TV", "Caze TV", "@CazeTV", "⚽ CazéTV™"):
+            with self.subTest(channel_name=channel_name):
+                self.assertTrue(is_trusted_youtube_uploader({"channel": channel_name}))
         self.assertTrue(is_trusted_youtube_uploader({"channel": "FIFA+"}))
         self.assertTrue(is_trusted_youtube_uploader({"uploader": "ESPN FC"}))
         self.assertFalse(is_trusted_youtube_uploader({"channel": "FIFA Fan Clips"}))
+
+    def test_new_zealand_uploaders_are_trusted(self):
+        self.assertTrue(is_trusted_youtube_uploader({"channel": "TVNZ"}))
+        self.assertTrue(is_trusted_youtube_uploader({"channel": "TVNZ+"}))
+        self.assertTrue(is_trusted_youtube_uploader({"uploader": "Sky Sport NZ"}))
+
+    def test_geo_blocked_cazetv_uses_requested_fallback_order(self):
+        search_output = "\n".join([
+            '{"id":"fifavideo01","title":"CR7 World Cup goals","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=fifavideo01"}',
+            '{"id":"tvnzvideo01","title":"CR7 World Cup goals","channel":"TVNZ","webpage_url":"https://youtube.com/watch?v=tvnzvideo01"}',
+        ])
+        completed = type("Completed", (), {"stdout": search_output, "stderr": ""})()
+
+        with patch("monitor.subprocess.run", return_value=completed), \
+             patch("monitor.download_youtube_video", return_value="downloads/fifa.mp4") as download_mock:
+            result = search_and_download_youtube_video(
+                "CR7 World Cup goals",
+                {},
+                set(),
+                preferred_url="https://youtube.com/watch?v=cazevideo01",
+                trusted_source="CazéTV",
+            )
+
+        self.assertEqual(
+            result,
+            ("downloads/fifa.mp4", "https://youtube.com/watch?v=fifavideo01"),
+        )
+        self.assertEqual(download_mock.call_count, 1)
+        self.assertEqual(download_mock.call_args.args[0], "https://youtube.com/watch?v=fifavideo01")
+        self.assertNotIn("cazevideo01", str(download_mock.call_args))
+
+    def test_cazetv_source_skips_original_video_and_searches_other_sources(self):
+        url = "https://www.youtube.com/watch?v=official001"
+        search_result = type("Completed", (), {
+            "stdout": '{"id":"fifavideo01","title":"GOLEADA World Cup match highlights","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=fifavideo01"}',
+            "stderr": "",
+        })()
+        with patch("monitor.subprocess.run", return_value=search_result) as search_mock, \
+             patch("monitor.download_youtube_video", return_value="downloads/fifa.mp4") as download_mock:
+            result = search_and_download_youtube_video(
+                "GOLEADA NOS ANFITRIÕES E DESPEDIDA DO CR7",
+                {},
+                set(),
+                preferred_url=url,
+                trusted_source="Cazé TV",
+            )
+
+        self.assertEqual(result, ("downloads/fifa.mp4", "https://youtube.com/watch?v=fifavideo01"))
+        self.assertNotIn(url, " ".join(search_mock.call_args.args[0]))
+        self.assertNotIn(url, str(download_mock.call_args))
+
+    def test_cazetv_source_still_rejects_forbidden_content(self):
+        empty_result = type("Completed", (), {"stdout": "", "stderr": ""})()
+        with patch("monitor.subprocess.run", return_value=empty_result), \
+             patch("monitor.download_youtube_video") as download_mock:
+            result = search_and_download_youtube_video(
+                "Yamal vs Messi rap battle reaction",
+                {},
+                set(),
+                preferred_url="https://www.youtube.com/watch?v=fanvideo001",
+                trusted_source="@CazeTV",
+            )
+
+        self.assertEqual(result, (None, None))
+        download_mock.assert_not_called()
+
+    def test_cazetv_news_only_falls_back_to_non_official_highlights(self):
+        highlight = type("Completed", (), {
+            "stdout": (
+                '{"id":"highlight01","title":"Portugal vs Spain highlights World Cup 2026",'
+                '"uploader":"NZ Match Coverage","duration":420,"upload_date":"20260707",'
+                '"webpage_url":"https://youtube.com/watch?v=highlight01"}'
+            ),
+            "stderr": "",
+        })()
+        with patch("monitor.subprocess.run", return_value=highlight), \
+             patch("monitor.download_youtube_video", return_value="downloads/highlight.mp4"), \
+             self.assertLogs("football-monitor", level="INFO") as captured:
+            result = search_and_download_youtube_video(
+                "Portugal vs Spain highlights World Cup 2026",
+                {},
+                set(),
+                preferred_url="https://youtube.com/watch?v=cazevideo01",
+                trusted_source="CazéTV",
+            )
+
+        self.assertEqual(
+            result,
+            ("downloads/highlight.mp4", "https://youtube.com/watch?v=highlight01"),
+        )
+        logs = "\n".join(captured.output)
+        self.assertIn("Searching non-official match highlights...", logs)
+        self.assertIn("Highlight candidate accepted", logs)
+
+    def test_youtube_candidate_diagnostics_include_title_uploader_and_url(self):
+        candidate = {
+            "id": "official001",
+            "title": "Messi winning goal",
+            "channel": "FIFA",
+            "webpage_url": "https://www.youtube.com/watch?v=official001",
+        }
+        with self.assertLogs("football-monitor", level="INFO") as captured:
+            select_official_youtube_candidate([candidate], "Messi winning goal", set())
+
+        logs = "\n".join(captured.output)
+        self.assertIn("Messi winning goal", logs)
+        self.assertIn("FIFA", logs)
+        self.assertIn("https://www.youtube.com/watch?v=official001", logs)
 
     def test_search_selection_skips_untrusted_and_unrelated_videos(self):
         candidates = [
@@ -136,7 +368,7 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(selected["id"], "official001")
 
-    def test_search_selection_ranks_all_results_instead_of_taking_first(self):
+    def test_search_selection_uses_official_channel_priority(self):
         candidates = [
             {"id": "firstresult", "title": "Messi football update", "channel": "FIFA"},
             {"id": "betterresult", "title": "Messi dramatic winning goal Argentina", "channel": "FIFA+"},
@@ -146,7 +378,43 @@ class MonitorTests(unittest.TestCase):
             candidates, "Messi dramatic winning goal Argentina", set()
         )
 
-        self.assertEqual(selected["id"], "betterresult")
+        self.assertEqual(selected["id"], "firstresult")
+
+    def test_geo_restricted_candidate_falls_back_to_next_official_upload(self):
+        search_output = "\n".join([
+            '{"id":"fifavideo01","title":"Messi winning goal","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=fifavideo01"}',
+            '{"id":"espnvideo01","title":"Messi winning goal","channel":"ESPN FC","webpage_url":"https://youtube.com/watch?v=espnvideo01"}',
+        ])
+        completed = type("Completed", (), {"stdout": search_output, "stderr": ""})()
+
+        with patch("monitor.subprocess.run", return_value=completed), \
+             patch(
+                 "monitor.download_youtube_video",
+                 side_effect=[GeoRestrictedVideoError(), "downloads/espn.mp4"],
+             ) as download_mock, \
+             self.assertLogs("football-monitor", level="INFO") as captured:
+            result = search_and_download_youtube_video("Messi winning goal", {}, set())
+
+        self.assertEqual(
+            result,
+            ("downloads/espn.mp4", "https://youtube.com/watch?v=espnvideo01"),
+        )
+        self.assertEqual(download_mock.call_count, 2)
+        logs = "\n".join(captured.output)
+        self.assertIn("Official download is geo-restricted.", logs)
+        self.assertIn("Trying next trusted official channel...", logs)
+
+    def test_available_in_brazil_download_error_is_geo_restriction(self):
+        error = subprocess.CalledProcessError(
+            1,
+            ["yt-dlp"],
+            stderr="ERROR: This video is available in Brazil.",
+        )
+        with patch("monitor.subprocess.run", side_effect=error):
+            with self.assertRaises(GeoRestrictedVideoError):
+                download_youtube_video(
+                    "https://youtube.com/watch?v=cazevideo01", Path("downloads"), "yt-dlp"
+                )
 
     def test_official_channel_still_rejects_rap_music_and_parody(self):
         candidates = [
@@ -183,7 +451,7 @@ class MonitorTests(unittest.TestCase):
             )
 
         self.assertEqual(result, (None, None))
-        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(run_mock.call_count, 2)
         download_mock.assert_not_called()
 
     def test_group_articles_merges_duplicate_titles_from_multiple_sources(self):

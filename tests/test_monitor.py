@@ -9,10 +9,12 @@ from unittest.mock import patch
 
 from monitor import (
     GeoRestrictedVideoError,
+    attach_article_to_match,
     build_article_key,
     build_content_discovery_telegram_message,
     build_live_event_telegram_message,
     build_match_highlight_queries,
+    build_match_day_queries,
     build_manual_grouped_article,
     build_portuguese_shorts_pack,
     build_portuguese_telegram_message,
@@ -23,8 +25,10 @@ from monitor import (
     download_youtube_video,
     discover_x_posts,
     group_articles,
+    is_download_eligible_title,
     is_live_goal_event,
     is_trusted_youtube_uploader,
+    load_todays_fixtures,
     process_cycle,
     prepare_telegram_message,
     search_and_download_youtube_video,
@@ -32,12 +36,93 @@ from monitor import (
     send_telegram_notification,
     should_send_notification,
     validate_highlight_candidate,
+    validate_youtube_download_candidate,
 )
 
 from monitor import save_seen_articles
 
 
 class MonitorTests(unittest.TestCase):
+    def test_download_eligibility_requires_explicit_football_event_title(self):
+        accepted = (
+            "Portugal match highlights", "Melhores momentos Portugal x Espanha",
+            "Resumo do jogo", "Todos os gols", "Two incredible goals",
+            "Penalty shootout", "Messi goal", "Gol de falta", "VAR decision",
+            "Red card incident", "Brilliant save",
+        )
+        for title in accepted:
+            with self.subTest(title=title):
+                self.assertTrue(is_download_eligible_title(title))
+
+        rejected = (
+            "Geral CazéTV highlights", "Live da madrugada highlights",
+            "Jogo ao vivo highlights", "Aqui é Copa goal", "Debate: World Cup goal",
+            "Análise do gol", "Opinion: best goal", "Match preview highlights",
+            "Football podcast goal", "Coach reacts to goal", "Reação ao gol",
+            "Programa de futebol highlights", "World Cup tracker goals",
+            "Golden boot race goals", "Monday musings: highlights",
+            "World Cup discussion and news",
+        )
+        for title in rejected:
+            with self.subTest(title=title):
+                self.assertFalse(is_download_eligible_title(title))
+
+    def test_generic_article_does_not_start_youtube_search(self):
+        with patch("monitor.subprocess.run") as run_mock, \
+             patch("monitor.download_youtube_video") as download_mock:
+            result = search_and_download_youtube_video(
+                "World Cup discussion and commentary", {}, set()
+            )
+
+        self.assertEqual(result, (None, None))
+        run_mock.assert_not_called()
+        download_mock.assert_not_called()
+
+    def test_match_day_structure_attaches_article_when_one_team_is_mentioned(self):
+        match = {
+            "home_team": "Argentina",
+            "away_team": "Egypt",
+            "competition": "FIFA World Cup 2026",
+            "kickoff_time": "20:00",
+            "status": "scheduled",
+        }
+        article = attach_article_to_match(
+            {"title": "Argentina prepares for tonight's match", "summary": ""}, [match]
+        )
+        self.assertEqual(article["match"], match)
+
+    def test_match_day_queries_use_both_teams_before_article_title(self):
+        queries = build_match_day_queries({
+            "home_team": "Argentina",
+            "away_team": "Egypt",
+            "competition": "FIFA World Cup 2026",
+            "kickoff_time": "20:00",
+            "status": "scheduled",
+        })
+        self.assertEqual(queries[0], "Argentina vs Egypt highlights FIFA World Cup 2026")
+        self.assertIn("Argentina Egypt match highlights", queries)
+        self.assertIn("Argentina Egypt melhores momentos", queries)
+        self.assertIn("Argentina x Egypt melhores momentos", queries)
+
+    def test_article_uses_best_match_from_entire_daily_list(self):
+        matches = [
+            {"home_team": "Argentina", "away_team": "Egypt", "competition": "World Cup", "kickoff_time": "18:00", "status": "scheduled"},
+            {"home_team": "Switzerland", "away_team": "Colombia", "competition": "World Cup", "kickoff_time": "21:00", "status": "scheduled"},
+        ]
+        article = attach_article_to_match(
+            {"title": "Switzerland vs Colombia: match preview", "summary": "Argentina also plays today"},
+            matches,
+        )
+        self.assertEqual(article["match"]["home_team"], "Switzerland")
+        self.assertEqual(article["match"]["away_team"], "Colombia")
+
+    def test_article_without_match_remains_unattached(self):
+        article = {"title": "Unrelated transfer story", "summary": ""}
+        self.assertNotIn("match", attach_article_to_match(article, [{
+            "home_team": "Argentina", "away_team": "Egypt", "competition": "FIFA World Cup 2026",
+            "kickoff_time": "20:00", "status": "scheduled",
+        }]))
+
     def test_x_search_terms_include_match_teams_competition_and_player(self):
         terms = build_x_search_terms({
             "title": "Argentina vs Egypt: Messi scores",
@@ -140,7 +225,7 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(valid)
     def test_youtube_metadata_timeout_returns_cleanly(self):
         search_result = type("Completed", (), {
-            "stdout": '{"id":"official001","title":"Messi goal","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=official001"}',
+            "stdout": '{"id":"official001","title":"Messi match highlights","channel":"TVNZ Sport","webpage_url":"https://youtube.com/watch?v=official001"}',
             "stderr": "",
         })()
         with patch(
@@ -150,7 +235,7 @@ class MonitorTests(unittest.TestCase):
              patch("monitor.download_youtube_video", return_value="downloads/official.mp4"), \
              self.assertLogs("football-monitor", level="WARNING") as captured:
             result = search_and_download_youtube_video(
-                "Messi goal", {}, set(), preferred_url="https://youtu.be/official001"
+                "Messi highlights", {}, set(), preferred_url="https://youtu.be/official001"
             )
 
         self.assertEqual(
@@ -254,15 +339,52 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(is_trusted_youtube_uploader({"channel": "TVNZ+"}))
         self.assertTrue(is_trusted_youtube_uploader({"uploader": "Sky Sport NZ"}))
 
+    def test_downloads_accept_only_tvnz_sport_match_highlights(self):
+        valid, _ = validate_youtube_download_candidate({
+            "channel": "TVNZ Sport", "title": "Portugal v Spain extended highlights",
+        })
+        self.assertTrue(valid)
+
+        for channel in ("FIFA", "BBC Sport", "ESPN FC", "CazéTV", "TVNZ"):
+            with self.subTest(channel=channel):
+                valid, reason = validate_youtube_download_candidate({
+                    "channel": channel, "title": "Portugal v Spain match highlights",
+                })
+                self.assertFalse(valid)
+                self.assertIn("not TVNZ Sport", reason)
+
+    def test_tvnz_download_rejects_non_highlight_and_blocked_titles(self):
+        valid, _ = validate_youtube_download_candidate({
+            "channel": "TVNZ Sport", "title": "Portugal v Spain goals",
+        })
+        self.assertFalse(valid)
+
+        rejected_terms = (
+            "analysis", "reaction", "live", "podcast", "debate", "preview",
+            "press conference", "opinion", "heroics", "greatest comeback", "daily",
+        )
+        for term in rejected_terms:
+            with self.subTest(term=term):
+                valid, _ = validate_youtube_download_candidate({
+                    "channel": "TVNZ Sport",
+                    "title": f"Portugal v Spain highlights {term}",
+                })
+                self.assertFalse(valid)
+
+        valid, _ = validate_youtube_download_candidate({
+            "channel": "TVNZ Sport", "title": "Liverpool match highlights",
+        })
+        self.assertTrue(valid)
+
     def test_geo_blocked_cazetv_uses_requested_fallback_order(self):
         search_output = "\n".join([
-            '{"id":"fifavideo01","title":"CR7 World Cup goals","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=fifavideo01"}',
-            '{"id":"tvnzvideo01","title":"CR7 World Cup goals","channel":"TVNZ","webpage_url":"https://youtube.com/watch?v=tvnzvideo01"}',
+            '{"id":"fifavideo01","title":"CR7 World Cup highlights","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=fifavideo01"}',
+            '{"id":"tvnzvideo01","title":"CR7 World Cup goals match highlights","channel":"TVNZ Sport","webpage_url":"https://youtube.com/watch?v=tvnzvideo01"}',
         ])
         completed = type("Completed", (), {"stdout": search_output, "stderr": ""})()
 
         with patch("monitor.subprocess.run", return_value=completed), \
-             patch("monitor.download_youtube_video", return_value="downloads/fifa.mp4") as download_mock:
+             patch("monitor.download_youtube_video", return_value="downloads/tvnz.mp4") as download_mock:
             result = search_and_download_youtube_video(
                 "CR7 World Cup goals",
                 {},
@@ -273,29 +395,29 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            ("downloads/fifa.mp4", "https://youtube.com/watch?v=fifavideo01"),
+            ("downloads/tvnz.mp4", "https://youtube.com/watch?v=tvnzvideo01"),
         )
         self.assertEqual(download_mock.call_count, 1)
-        self.assertEqual(download_mock.call_args.args[0], "https://youtube.com/watch?v=fifavideo01")
+        self.assertEqual(download_mock.call_args.args[0], "https://youtube.com/watch?v=tvnzvideo01")
         self.assertNotIn("cazevideo01", str(download_mock.call_args))
 
     def test_cazetv_source_skips_original_video_and_searches_other_sources(self):
         url = "https://www.youtube.com/watch?v=official001"
         search_result = type("Completed", (), {
-            "stdout": '{"id":"fifavideo01","title":"GOLEADA World Cup match highlights","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=fifavideo01"}',
+            "stdout": '{"id":"tvnzvideo01","title":"GOLEADA World Cup match highlights","channel":"TVNZ Sport","webpage_url":"https://youtube.com/watch?v=tvnzvideo01"}',
             "stderr": "",
         })()
         with patch("monitor.subprocess.run", return_value=search_result) as search_mock, \
-             patch("monitor.download_youtube_video", return_value="downloads/fifa.mp4") as download_mock:
+             patch("monitor.download_youtube_video", return_value="downloads/tvnz.mp4") as download_mock:
             result = search_and_download_youtube_video(
-                "GOLEADA NOS ANFITRIÕES E DESPEDIDA DO CR7",
+                "TODOS OS GOLS: GOLEADA NOS ANFITRIÕES E DESPEDIDA DO CR7",
                 {},
                 set(),
                 preferred_url=url,
                 trusted_source="Cazé TV",
             )
 
-        self.assertEqual(result, ("downloads/fifa.mp4", "https://youtube.com/watch?v=fifavideo01"))
+        self.assertEqual(result, ("downloads/tvnz.mp4", "https://youtube.com/watch?v=tvnzvideo01"))
         self.assertNotIn(url, " ".join(search_mock.call_args.args[0]))
         self.assertNotIn(url, str(download_mock.call_args))
 
@@ -314,7 +436,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(result, (None, None))
         download_mock.assert_not_called()
 
-    def test_cazetv_news_only_falls_back_to_non_official_highlights(self):
+    def test_cazetv_news_only_rejects_non_tvnz_highlights(self):
         highlight = type("Completed", (), {
             "stdout": (
                 '{"id":"highlight01","title":"Portugal vs Spain highlights World Cup 2026",'
@@ -324,7 +446,7 @@ class MonitorTests(unittest.TestCase):
             "stderr": "",
         })()
         with patch("monitor.subprocess.run", return_value=highlight), \
-             patch("monitor.download_youtube_video", return_value="downloads/highlight.mp4"), \
+             patch("monitor.download_youtube_video") as download_mock, \
              self.assertLogs("football-monitor", level="INFO") as captured:
             result = search_and_download_youtube_video(
                 "Portugal vs Spain highlights World Cup 2026",
@@ -334,13 +456,11 @@ class MonitorTests(unittest.TestCase):
                 trusted_source="CazéTV",
             )
 
-        self.assertEqual(
-            result,
-            ("downloads/highlight.mp4", "https://youtube.com/watch?v=highlight01"),
-        )
+        self.assertEqual(result, (None, None))
+        download_mock.assert_not_called()
         logs = "\n".join(captured.output)
         self.assertIn("Searching non-official match highlights...", logs)
-        self.assertIn("Highlight candidate accepted", logs)
+        self.assertIn("uploader is not TVNZ Sport", logs)
 
     def test_youtube_candidate_diagnostics_include_title_uploader_and_url(self):
         candidate = {
@@ -360,8 +480,8 @@ class MonitorTests(unittest.TestCase):
     def test_search_selection_skips_untrusted_and_unrelated_videos(self):
         candidates = [
             {"id": "untrusted01", "title": "Messi goal", "channel": "Fan Football"},
-            {"id": "unrelated01", "title": "Football gaming compilation", "channel": "FIFA"},
-            {"id": "official001", "title": "Messi scores dramatic goal", "channel": "FIFA"},
+            {"id": "unrelated01", "title": "Football gaming compilation", "channel": "TVNZ Sport"},
+            {"id": "official001", "title": "Messi dramatic match highlights", "channel": "TVNZ Sport"},
         ]
 
         selected = select_official_youtube_candidate(candidates, "Messi dramatic goal", set())
@@ -370,34 +490,34 @@ class MonitorTests(unittest.TestCase):
 
     def test_search_selection_uses_official_channel_priority(self):
         candidates = [
-            {"id": "firstresult", "title": "Messi football update", "channel": "FIFA"},
-            {"id": "betterresult", "title": "Messi dramatic winning goal Argentina", "channel": "FIFA+"},
+            {"id": "firstresult", "title": "Messi highlights", "channel": "TVNZ Sport"},
+            {"id": "betterresult", "title": "Messi dramatic winning goal Argentina highlights", "channel": "TVNZ Sport"},
         ]
 
         selected = select_official_youtube_candidate(
             candidates, "Messi dramatic winning goal Argentina", set()
         )
 
-        self.assertEqual(selected["id"], "firstresult")
+        self.assertEqual(selected["id"], "betterresult")
 
     def test_geo_restricted_candidate_falls_back_to_next_official_upload(self):
         search_output = "\n".join([
-            '{"id":"fifavideo01","title":"Messi winning goal","channel":"FIFA","webpage_url":"https://youtube.com/watch?v=fifavideo01"}',
-            '{"id":"espnvideo01","title":"Messi winning goal","channel":"ESPN FC","webpage_url":"https://youtube.com/watch?v=espnvideo01"}',
+            '{"id":"tvnzvideo01","title":"Messi match highlights","channel":"TVNZ Sport","webpage_url":"https://youtube.com/watch?v=tvnzvideo01"}',
+            '{"id":"tvnzvideo02","title":"Messi extended highlights","channel":"TVNZ Sport","webpage_url":"https://youtube.com/watch?v=tvnzvideo02"}',
         ])
         completed = type("Completed", (), {"stdout": search_output, "stderr": ""})()
 
         with patch("monitor.subprocess.run", return_value=completed), \
              patch(
                  "monitor.download_youtube_video",
-                 side_effect=[GeoRestrictedVideoError(), "downloads/espn.mp4"],
+                 side_effect=[GeoRestrictedVideoError(), "downloads/tvnz.mp4"],
              ) as download_mock, \
              self.assertLogs("football-monitor", level="INFO") as captured:
-            result = search_and_download_youtube_video("Messi winning goal", {}, set())
+            result = search_and_download_youtube_video("Messi highlights", {}, set())
 
         self.assertEqual(
             result,
-            ("downloads/espn.mp4", "https://youtube.com/watch?v=espnvideo01"),
+            ("downloads/tvnz.mp4", "https://youtube.com/watch?v=tvnzvideo02"),
         )
         self.assertEqual(download_mock.call_count, 2)
         logs = "\n".join(captured.output)
@@ -425,14 +545,14 @@ class MonitorTests(unittest.TestCase):
         self.assertIsNone(select_official_youtube_candidate(candidates, "Messi goal", set()))
 
     def test_article_youtube_url_is_preferred_without_searching(self):
-        metadata = '{"id":"official001","title":"Messi goal","channel":"FIFA"}'
+        metadata = '{"id":"official001","title":"Messi match highlights","channel":"TVNZ Sport"}'
         completed = type("Completed", (), {"stdout": metadata, "stderr": ""})()
         config = {"yt_dlp_bin": "yt-dlp", "downloads_dir": Path("downloads")}
 
         with patch("monitor.subprocess.run", return_value=completed) as run_mock, \
              patch("monitor.download_youtube_video", return_value="downloads/video.mp4") as download_mock:
             path, url = search_and_download_youtube_video(
-                "Messi goal", config, set(), preferred_url="https://youtu.be/official001"
+                "Messi highlights", config, set(), preferred_url="https://youtu.be/official001"
             )
 
         self.assertEqual(path, "downloads/video.mp4")

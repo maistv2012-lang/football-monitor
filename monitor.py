@@ -9,6 +9,7 @@ import sys
 import time
 import unicodedata
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,22 @@ TRUSTED_YOUTUBE_CHANNEL_ORDER = [
 ]
 TRUSTED_YOUTUBE_CHANNELS = set(TRUSTED_YOUTUBE_CHANNEL_ORDER)
 DOWNLOAD_BLOCKED_CHANNELS = {"cazetv"}
+YOUTUBE_DOWNLOAD_CHANNEL = "TVNZ Sport"
+YOUTUBE_DOWNLOAD_TITLE_TERMS = ("match highlights", "extended highlights", "highlights")
+YOUTUBE_DOWNLOAD_REJECTED_TERMS = (
+    "analysis", "reaction", "live", "podcast", "debate", "preview",
+    "press conference", "opinion", "heroics", "greatest comeback", "daily",
+)
+DOWNLOAD_ELIGIBLE_TITLE_TERMS = (
+    "match highlights", "highlights", "extended highlights", "melhores momentos",
+    "resumo do jogo", "todos os gols", "goals", "penalty shootout", "goal",
+    "gol", "var", "red card", "save",
+)
+DOWNLOAD_INELIGIBLE_TITLE_TERMS = (
+    "geral cazetv", "live da madrugada", "ao vivo", "aqui e copa", "debate",
+    "analise", "opinion", "preview", "podcast", "reacts", "reacao",
+    "programa", "tracker", "golden boot", "race", "musings",
+)
 
 CAZETV_NEWS_FALLBACK_CHANNEL_ORDER = [
     "fifa", "fifa+", "uefa", "premier league", "espn fc", "bbc sport",
@@ -226,6 +243,7 @@ def group_articles(articles: list[dict[str, str]]) -> list[dict[str, Any]]:
                     "summary": article.get("summary", "") or article.get("description", ""),
                     "description": article.get("description", ""),
                     "official_source": article.get("official_source") or article.get("source", ""),
+                    "match": article.get("match"),
                     "duplicate_keys": [article.get("duplicate_key") or article.get("video_id") or article.get("link") or article.get("title") or ""],
                 }
             )
@@ -286,6 +304,37 @@ def is_trusted_youtube_uploader(metadata: dict[str, Any]) -> bool:
     }
     trusted_names = {channel_identity(name) for name in TRUSTED_YOUTUBE_CHANNELS}
     return bool(names & trusted_names)
+
+
+def _contains_normalized_phrase(value: Any, phrase: str) -> bool:
+    """Match a normalized word or phrase without substring false positives."""
+    normalized = normalize_channel_name(value)
+    return bool(re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", normalized))
+
+
+def validate_youtube_download_candidate(metadata: dict[str, Any]) -> tuple[bool, str]:
+    """Allow downloads only for genuine TVNZ Sport match-highlight videos."""
+    uploader_names = {
+        channel_identity(metadata.get("channel")),
+        channel_identity(metadata.get("uploader")),
+    }
+    if channel_identity(YOUTUBE_DOWNLOAD_CHANNEL) not in uploader_names:
+        return False, "uploader is not TVNZ Sport"
+
+    title = metadata.get("title") or ""
+    for term in YOUTUBE_DOWNLOAD_REJECTED_TERMS:
+        if _contains_normalized_phrase(title, term):
+            return False, f"title contains rejected term: {term}"
+    if not any(_contains_normalized_phrase(title, term) for term in YOUTUBE_DOWNLOAD_TITLE_TERMS):
+        return False, "title is not a match highlight"
+    return True, "TVNZ Sport match highlight"
+
+
+def is_download_eligible_title(title: Any) -> bool:
+    """Return whether a story title warrants starting the YouTube download pipeline."""
+    if any(_contains_normalized_phrase(title, term) for term in DOWNLOAD_INELIGIBLE_TITLE_TERMS):
+        return False
+    return any(_contains_normalized_phrase(title, term) for term in DOWNLOAD_ELIGIBLE_TITLE_TERMS)
 
 
 def is_relevant_video_candidate(metadata: dict[str, Any], query: str) -> bool:
@@ -428,6 +477,137 @@ def build_match_highlight_queries(team_one: str, team_two: str, competition: str
     ]
 
 
+TEAM_NAMES_PT = {"egypt": "Egito", "brazil": "Brasil", "spain": "Espanha", "switzerland": "Suíça"}
+
+SUPPORTED_FIXTURE_COMPETITIONS = {
+    "fifa world cup", "champions league", "campeonato brasileiro", "premier league",
+    "la liga", "serie a", "bundesliga", "ligue 1",
+}
+
+
+def normalize_fixture_competition(name: Any, country: Any = "") -> str:
+    """Map provider league names to the supported competition names."""
+    league = normalize_channel_name(name)
+    league_country = normalize_channel_name(country)
+    if "world cup" in league:
+        return "FIFA World Cup"
+    if "champions league" in league:
+        return "Champions League"
+    if "brasileir" in league or (league == "serie a" and league_country == "brazil"):
+        return "Campeonato Brasileiro"
+    if "premier league" in league:
+        return "Premier League"
+    if league in {"la liga", "primera division"} and league_country == "spain":
+        return "La Liga"
+    if league == "serie a" and league_country == "italy":
+        return "Serie A"
+    if "bundesliga" in league and league_country == "germany":
+        return "Bundesliga"
+    if league == "ligue 1" and league_country == "france":
+        return "Ligue 1"
+    return ""
+
+
+def load_todays_fixtures(config: dict[str, Any]) -> list[dict[str, str]]:
+    """Load today's supported fixtures, preferring an explicit config list."""
+    configured = config.get("today_matches", [])
+    if isinstance(configured, list) and configured:
+        return configured
+    api_key = str(config.get("football_api_key", "") or "")
+    if not api_key:
+        return []
+    timezone_name = str(config.get("football_api_timezone", "Pacific/Auckland"))
+    try:
+        local_zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        local_zone = timezone.utc
+    fixture_date = datetime.now(local_zone).date().isoformat()
+    try:
+        response = requests.get(
+            str(config.get("football_api_url", "https://v3.football.api-sports.io/fixtures")),
+            headers={"x-apisports-key": api_key},
+            params={"date": fixture_date, "timezone": timezone_name},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        logger.warning("Fixture loading failed; monitoring will continue without fixtures.")
+        return []
+
+    fixtures: list[dict[str, str]] = []
+    for item in payload.get("response", []):
+        league = item.get("league", {}) or {}
+        competition = normalize_fixture_competition(league.get("name"), league.get("country"))
+        if not competition:
+            continue
+        fixture = item.get("fixture", {}) or {}
+        teams = item.get("teams", {}) or {}
+        home = str((teams.get("home", {}) or {}).get("name", "")).strip()
+        away = str((teams.get("away", {}) or {}).get("name", "")).strip()
+        if not home or not away:
+            continue
+        fixture_datetime = str(fixture.get("date", ""))
+        kickoff_time = fixture_datetime[11:16] if len(fixture_datetime) >= 16 else fixture_datetime
+        status_data = fixture.get("status", {}) or {}
+        fixtures.append({
+            "home_team": home,
+            "away_team": away,
+            "competition": competition,
+            "kickoff_time": kickoff_time,
+            "status": str(status_data.get("short") or status_data.get("long") or ""),
+        })
+    return fixtures
+
+
+def build_match_day_queries(match: dict[str, Any]) -> list[str]:
+    """Build team-first YouTube searches for a configured match."""
+    home = str(match.get("home_team", "")).strip()
+    away = str(match.get("away_team", "")).strip()
+    competition = str(match.get("competition", "")).strip()
+    if not home or not away:
+        return []
+    return [
+        f"{home} vs {away} highlights {competition}".strip(),
+        f"{home} {away} match highlights",
+        f"{home} {away} melhores momentos",
+        f"{home} x {away} melhores momentos",
+    ]
+
+
+def attach_article_to_match(
+    article: dict[str, Any], matches: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Attach the first configured fixture whose home or away team appears in the story."""
+    title = normalize_channel_name(article.get("title"))
+    supporting_text = normalize_channel_name(
+        " ".join(str(article.get(field, "")) for field in ("summary", "description"))
+    )
+    best_match: dict[str, Any] | None = None
+    best_score = 0
+    for match in matches:
+        home = normalize_channel_name(match.get("home_team"))
+        away = normalize_channel_name(match.get("away_team"))
+        score = 0
+        score += 3 if home and home in title else 0
+        score += 3 if away and away in title else 0
+        score += 1 if home and home in supporting_text else 0
+        score += 1 if away and away in supporting_text else 0
+        if score > best_score:
+            best_score = score
+            best_match = match
+    if best_match is not None:
+        article["match"] = {
+            field: str(best_match.get(field, "")).strip()
+            for field in ("home_team", "away_team", "competition", "kickoff_time", "status")
+        }
+        logger.info(
+            "Matched today's game: %s vs %s",
+            article["match"]["home_team"], article["match"]["away_team"],
+        )
+    return article
+
+
 def extract_match_teams(value: str) -> tuple[str, str] | None:
     """Extract two team names from common match-title separators."""
     match = re.search(
@@ -493,9 +673,9 @@ def rank_highlight_candidates(
     """Log and return acceptable match-highlight candidates, newest first."""
     accepted: list[dict[str, Any]] = []
     for candidate in candidates:
-        uploader = candidate.get("channel") or candidate.get("uploader") or ""
-        if channel_identity(uploader) in {channel_identity(name) for name in DOWNLOAD_BLOCKED_CHANNELS}:
-            logger.info("Highlight candidate rejected because uploader is blocked for downloads: %s", candidate.get("title", ""))
+        valid_download, download_reason = validate_youtube_download_candidate(candidate)
+        if not valid_download:
+            logger.info("Highlight candidate rejected because %s: %s", download_reason, candidate.get("title", ""))
             continue
         valid, reason = validate_highlight_candidate(candidate, team_names)
         title = candidate.get("title", "")
@@ -534,11 +714,9 @@ def rank_official_youtube_candidates(
             "YouTube candidate | title=%s | uploader=%s | url=%s",
             candidate.get("title", ""), uploader, candidate_url or "unknown",
         )
-        if channel_identity(uploader) in {channel_identity(name) for name in DOWNLOAD_BLOCKED_CHANNELS}:
-            logger.info("Skipping because uploader is blocked for downloads: %s", uploader)
-            continue
-        if not is_trusted_youtube_uploader(candidate):
-            logger.info("Skipping because uploader is not trusted: %s", uploader)
+        valid_download, download_reason = validate_youtube_download_candidate(candidate)
+        if not valid_download:
+            logger.info("Skipping YouTube download because %s: %s", download_reason, uploader)
             continue
         if not video_id or video_id in seen_video_ids:
             continue
@@ -1367,6 +1545,11 @@ def process_cycle(config: dict[str, str]) -> int:
     articles_found = 0
     stories_rejected = 0
     videos_downloaded = 0
+    today_matches = load_todays_fixtures(config)
+    if today_matches:
+        logger.info("Loaded today's matches: %s", len(today_matches))
+    else:
+        logger.info("No fixtures loaded.")
 
     for source, feed_url in get_feeds().items():
         sources_checked += 1
@@ -1414,6 +1597,7 @@ def process_cycle(config: dict[str, str]) -> int:
 
         for entry in entries:
             article = normalize_entry(entry, source)
+            attach_article_to_match(article, today_matches)
             latest_titles.append(article.get("title", ""))
             if article.get("video_url") and is_youtube_link(article.get("video_url")):
                 videos_found += 1
@@ -1569,13 +1753,26 @@ def process_cycle(config: dict[str, str]) -> int:
             if video_id_for_download and video_id_for_download in downloaded_video_ids:
                 logger.info("Skipping download for %s because video ID %s already downloaded.", article.get("title"), video_id_for_download)
             else:
+                attach_article_to_match(article, today_matches)
                 search_query = article.get("title", "") or "World Cup 2026 football highlights"
+                download_config = dict(config)
+                if article.get("match"):
+                    match_queries = build_match_day_queries(article["match"])
+                    if match_queries:
+                        search_query = match_queries[0]
+                        download_config["match_queries"] = match_queries
+                        logger.info("Matched today's game: %s vs %s", article["match"]["home_team"], article["match"]["away_team"])
+                        logger.info("Search query: %s", search_query)
+                else:
+                    logger.info("Using article title fallback.")
+                    logger.info("Search query: %s", search_query)
                 downloaded_path, actual_video_url = search_and_download_youtube_video(
                     search_query,
-                    config,
+                    download_config,
                     downloaded_video_ids,
                     preferred_url=preferred_url,
                     trusted_source=article_source,
+                    eligibility_title=article.get("title", ""),
                 )
 
                 if downloaded_path:
@@ -1723,6 +1920,7 @@ def search_and_download_youtube_video(
     validation_mode: str = "official",
     highlights_fallback: bool = False,
     cazetv_news_fallback: bool = False,
+    eligibility_title: str = "",
 ) -> tuple[str | None, str | None]:
     """Searches YouTube for a video and downloads the best match, skipping duplicates.
 
@@ -1734,6 +1932,11 @@ def search_and_download_youtube_video(
     Returns:
         A tuple containing (downloaded_file_path, video_url) or (None, None).
     """
+    title_to_check = eligibility_title or query
+    if not is_download_eligible_title(title_to_check):
+        logger.info("Skipping YouTube download because the article title is not download-eligible: %s", title_to_check)
+        return None, None
+
     yt_dlp_bin = config.get("yt_dlp_bin", YT_DLP_BIN)
     downloads_dir = config.get("downloads_dir", DOWNLOADS_DIR)
     geo_restriction_seen = highlights_fallback
@@ -1805,8 +2008,9 @@ def search_and_download_youtube_video(
                 "YouTube candidate | title=%s | uploader=%s | url=%s",
                 metadata.get("title", ""), uploader, preferred_url,
             )
-            if not is_trusted_youtube_uploader(metadata):
-                logger.info("Skipping because uploader is not trusted: %s", uploader)
+            valid_download, download_reason = validate_youtube_download_candidate(metadata)
+            if not valid_download:
+                logger.info("Skipping YouTube download because %s: %s", download_reason, uploader)
                 logger.info("Falling back to trusted YouTube search.")
                 return search_and_download_youtube_video(query, config, seen_video_ids)
             logger.info("Official channel found: %s", uploader)
@@ -1854,8 +2058,13 @@ def search_and_download_youtube_video(
             logger.info("Searching official YouTube video...")
             search_queries = [query]
 
+        configured_match_queries = config.get("match_queries", [])
+        if isinstance(configured_match_queries, list) and configured_match_queries:
+            search_queries = [str(item) for item in configured_match_queries if str(item).strip()]
+
         video_metadata: list[dict[str, Any]] = []
         for search_query in search_queries:
+            logger.info("Search query: %s", search_query)
             search_command = [
                 yt_dlp_bin, f"ytsearch20:{search_query}", "--dump-json",
                 "--flat-playlist", "--no-warnings", "--quiet",

@@ -22,9 +22,11 @@ from monitor import (
     build_x_search_terms,
     build_x_telegram_message,
     calculate_viral_score,
+    classify_story_content,
     download_youtube_video,
     discover_x_posts,
     group_articles,
+    is_cazetv_discussion_content,
     is_download_eligible_title,
     is_live_goal_event,
     is_trusted_youtube_uploader,
@@ -33,6 +35,7 @@ from monitor import (
     prepare_telegram_message,
     search_and_download_youtube_video,
     select_official_youtube_candidate,
+    send_downloaded_video_to_telegram,
     send_telegram_notification,
     should_send_notification,
     validate_highlight_candidate,
@@ -43,12 +46,62 @@ from monitor import save_seen_articles
 
 
 class MonitorTests(unittest.TestCase):
+    def test_classify_story_content_download_categories(self):
+        cases = (
+            ("Portugal vs Spain match highlights", "MATCH_HIGHLIGHT"),
+            ("Messi scores dramatic goal", "GOAL_CLIP"),
+            ("VAR awards late penalty to Argentina", "VAR_OR_PENALTY"),
+            ("Red card drama in Brazil vs Norway", "RED_CARD"),
+            ("Penalty shootout: Switzerland v Colombia", "SHOOTOUT"),
+        )
+        for title, category in cases:
+            with self.subTest(title=title):
+                decision = classify_story_content(title, "BBC Sport")
+                self.assertEqual(decision["category"], category)
+                self.assertTrue(decision["should_alert"])
+                self.assertTrue(decision["should_download"])
+
+    def test_classify_story_content_blocks_discussion_and_live_downloads(self):
+        cases = (
+            ("GERAL CAZÉTV debate da rodada", "DISCUSSION"),
+            ("AQUI É COPA reacts ao jogo", "DISCUSSION"),
+            ("AO VIVO live da madrugada", "LIVE_STREAM"),
+            ("Transfer news: striker signs", "TRANSFER_NEWS"),
+            ("World Cup schedule update", "GENERAL_NEWS"),
+            ("", "UNKNOWN"),
+        )
+        for title, category in cases:
+            with self.subTest(title=title):
+                decision = classify_story_content(title, "CazéTV")
+                self.assertEqual(decision["category"], category)
+                self.assertFalse(decision["should_download"])
+
+    def test_cazetv_discussion_filter_is_source_specific(self):
+        ignored_terms = (
+            "GERAL CAZÉTV", "AQUI É COPA", "AO VIVO", "LIVE DA MADRUGADA",
+            "DEBATE", "OPINIÃO", "REAGE", "PODCAST",
+        )
+        for term in ignored_terms:
+            with self.subTest(term=term):
+                self.assertTrue(is_cazetv_discussion_content("CazéTV", f"{term}: gol da rodada"))
+                self.assertFalse(is_cazetv_discussion_content("BBC Sport", f"{term}: gol da rodada"))
+
+        accepted_titles = (
+            "GOL", "GOLAÇO", "PÊNALTI", "PENALTY", "VAR", "CARTÃO",
+            "RED CARD", "DEFESA", "SAVE", "MELHORES MOMENTOS", "HIGHLIGHTS",
+            "RESUMO DO DIA", "TODOS OS GOLS",
+        )
+        for title in accepted_titles:
+            with self.subTest(title=title):
+                self.assertFalse(is_cazetv_discussion_content("CazéTV", title))
+
     def test_download_eligibility_requires_explicit_football_event_title(self):
         accepted = (
-            "Portugal match highlights", "Melhores momentos Portugal x Espanha",
-            "Resumo do jogo", "Todos os gols", "Two incredible goals",
-            "Penalty shootout", "Messi goal", "Gol de falta", "VAR decision",
-            "Red card incident", "Brilliant save",
+            "Portugal vs Spain match highlights", "Melhores momentos Portugal x Espanha",
+            "Brazil vs Norway resumo do jogo", "Portugal x Spain todos os gols",
+            "Argentina score two incredible goals", "Penalty shootout: Switzerland v Colombia",
+            "Messi goal", "Gol de falta do Brasil", "VAR decision for Argentina",
+            "Red card incident in Brazil vs Norway", "Brazil brilliant save",
         )
         for title in accepted:
             with self.subTest(title=title):
@@ -67,11 +120,76 @@ class MonitorTests(unittest.TestCase):
             with self.subTest(title=title):
                 self.assertFalse(is_download_eligible_title(title))
 
+    def test_generic_listicle_articles_alert_but_do_not_download(self):
+        titles = (
+            "Late goals, comebacks and upsets - is record-breaking World Cup best ever?",
+            "A Golden Boot race for the ages - but who will come out on top?",
+            "How to take a World Cup shootout penalty",
+            "Goals galore - how dominant is Premier League wealth at World Cup?",
+            "Best Group Stage Goals | FIFA World Cup 2026",
+            "OS 5 GOLS MAIS BONITOS",
+            "top goals",
+            "best goals",
+            "melhores gols",
+            "gols mais bonitos",
+            "best moments",
+            "iconic moments",
+        )
+        for title in titles:
+            with self.subTest(title=title):
+                decision = classify_story_content(title, "FIFA")
+                self.assertEqual(decision["category"], "GENERAL_NEWS")
+                self.assertTrue(decision["should_alert"])
+                self.assertFalse(decision["should_download"])
+
+    def test_transfer_titles_are_not_downloadable(self):
+        titles = (
+            "Star signs for Real Madrid",
+            "Forward joins Premier League club",
+            "Midfielder agrees deal with Barcelona",
+            "World Cup winner transfer latest",
+            "Young striker loan confirmed",
+            "Defender set to sign tomorrow",
+            "Goalkeeper close to signing",
+        )
+        for title in titles:
+            with self.subTest(title=title):
+                decision = classify_story_content(title, "BBC Sport")
+                self.assertEqual(decision["category"], "TRANSFER_NEWS")
+                self.assertTrue(decision["should_alert"])
+                self.assertFalse(decision["should_download"])
+
+    def test_specific_match_or_event_titles_can_download(self):
+        titles = (
+            "Argentina vs Egypt Match Highlights",
+            "France v Belgium Extended Highlights",
+            "Messi scores winner against Egypt",
+            "Penalty shootout: Switzerland v Colombia",
+            "Red card drama in Brazil vs Norway",
+        )
+        for title in titles:
+            with self.subTest(title=title):
+                decision = classify_story_content(title, "BBC Sport")
+                self.assertTrue(decision["should_download"])
+
     def test_generic_article_does_not_start_youtube_search(self):
         with patch("monitor.subprocess.run") as run_mock, \
              patch("monitor.download_youtube_video") as download_mock:
             result = search_and_download_youtube_video(
                 "World Cup discussion and commentary", {}, set()
+            )
+
+        self.assertEqual(result, (None, None))
+        run_mock.assert_not_called()
+        download_mock.assert_not_called()
+
+    def test_generic_goal_article_does_not_start_youtube_search(self):
+        with patch("monitor.subprocess.run") as run_mock, \
+             patch("monitor.download_youtube_video") as download_mock:
+            result = search_and_download_youtube_video(
+                "Late goals, comebacks and upsets - is record-breaking World Cup best ever?",
+                {},
+                set(),
             )
 
         self.assertEqual(result, (None, None))
@@ -325,6 +443,70 @@ class MonitorTests(unittest.TestCase):
 
         self.assertFalse(sent)
         self.assertNotIn(token, "\n".join(captured.output))
+
+    def test_downloaded_video_sends_with_sendvideo(self):
+        response = type("Response", (), {"status_code": 200, "text": '{"ok":true}'})()
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "clip.mp4"
+            video_path.write_bytes(b"mp4")
+            story = {
+                "title": "Argentina vs Egypt Match Highlights",
+                "sources": ["TVNZ Sport"],
+                "content_category": "MATCH_HIGHLIGHT",
+                "links": ["https://example.com/story"],
+                "_telegram_config": {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
+            }
+
+            with patch("monitor.requests.post", return_value=response) as post_mock:
+                sent = send_downloaded_video_to_telegram(video_path, story)
+
+        self.assertTrue(sent)
+        self.assertIn("/sendVideo", post_mock.call_args.args[0])
+        self.assertIn("Argentina vs Egypt Match Highlights", post_mock.call_args.kwargs["data"]["caption"])
+        self.assertIn("TVNZ Sport", post_mock.call_args.kwargs["data"]["caption"])
+        self.assertIn("MATCH_HIGHLIGHT", post_mock.call_args.kwargs["data"]["caption"])
+        self.assertIn("https://example.com/story", post_mock.call_args.kwargs["data"]["caption"])
+
+    def test_downloaded_video_falls_back_to_senddocument(self):
+        fail_response = type("Response", (), {"status_code": 400, "text": '{"ok":false,"description":"Bad Request"}'})()
+        ok_response = type("Response", (), {"status_code": 200, "text": '{"ok":true}'})()
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "clip.mp4"
+            video_path.write_bytes(b"mp4")
+            story = {
+                "title": "Messi scores winner against Egypt",
+                "sources": ["TVNZ Sport"],
+                "content_category": "GOAL_CLIP",
+                "_telegram_config": {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
+            }
+
+            with patch("monitor.requests.post", side_effect=[fail_response, ok_response]) as post_mock:
+                sent = send_downloaded_video_to_telegram(video_path, story)
+
+        self.assertTrue(sent)
+        self.assertIn("/sendVideo", post_mock.call_args_list[0].args[0])
+        self.assertIn("/sendDocument", post_mock.call_args_list[1].args[0])
+
+    def test_oversized_downloaded_video_sends_text_notice(self):
+        response = type("Response", (), {"status_code": 200, "text": '{"ok":true}'})()
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "large.mp4"
+            video_path.write_bytes(b"mp4")
+            story = {
+                "title": "France v Belgium Extended Highlights",
+                "_telegram_config": {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
+            }
+            fake_stat = type("Stat", (), {"st_size": 46 * 1024 * 1024})()
+
+            with patch("monitor.Path.stat", return_value=fake_stat), \
+                 patch("monitor.requests.post", return_value=response) as post_mock:
+                sent = send_downloaded_video_to_telegram(video_path, story)
+
+        self.assertTrue(sent)
+        self.assertIn("/sendMessage", post_mock.call_args.args[0])
+        payload = post_mock.call_args.kwargs["json"]["text"]
+        self.assertIn("Vídeo baixado no PC, mas muito grande para enviar pelo Telegram.", payload)
+        self.assertIn(str(video_path), payload)
 
     def test_trusted_youtube_uploader_requires_exact_channel_name(self):
         for channel_name in ("CazéTV", "CazeTV", "Cazé TV", "Caze TV", "@CazeTV", "⚽ CazéTV™"):
@@ -692,6 +874,76 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Amistoso", message)
         self.assertIn("BBC Sport Football", message)
 
+    def test_general_news_uses_generic_telegram_template(self):
+        response = type("Response", (), {"status_code": 200, "text": '{"ok":true}'})()
+        article = {
+            "title": "Late goals, comebacks and upsets - is record-breaking World Cup best ever?",
+            "summary": "A broad tournament analysis piece.",
+            "sources": ["BBC Sport"],
+            "links": ["https://example.com/general-news"],
+            "reason": "No AI API key configured; falling back to heuristics.",
+            "content_category": "GENERAL_NEWS",
+            "is_live_event": True,
+        }
+
+        with patch("monitor.requests.post", return_value=response) as post_mock:
+            sent = send_telegram_notification(
+                article,
+                {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
+            )
+
+        payload = post_mock.call_args.kwargs["json"]["text"]
+        self.assertTrue(sent)
+        self.assertIn("Alerta de notícia", payload)
+        self.assertIn("Título", payload)
+        self.assertIn("Fonte", payload)
+        self.assertIn("Link original", payload)
+        self.assertIn("Por que importa", payload)
+        self.assertIn("Ideia para Shorts", payload)
+        self.assertIn("Late goals, comebacks and upsets", payload)
+        self.assertIn("https://example.com/general-news", payload)
+        self.assertIn("Esse assunto está movimentando o futebol", payload)
+        self.assertNotIn("No AI API key configured", payload)
+        self.assertNotIn("falling back to heuristics", payload)
+        self.assertNotIn("Why it matters", payload)
+        self.assertNotIn("Shorts idea", payload)
+        self.assertNotIn("*⚽ Match:*", payload)
+        self.assertNotIn("*⏱ Minute:*", payload)
+        self.assertNotIn("*🥅 Goal scorer:*", payload)
+
+    def test_transfer_news_uses_transfer_telegram_template(self):
+        response = type("Response", (), {"status_code": 200, "text": '{"ok":true}'})()
+        article = {
+            "title": "Striker joins Barcelona on loan",
+            "sources": ["Sky Sports Football"],
+            "links": ["https://example.com/transfer-news"],
+            "player": "Striker",
+            "club": "Barcelona",
+            "content_category": "TRANSFER_NEWS",
+        }
+
+        with patch("monitor.requests.post", return_value=response) as post_mock:
+            sent = send_telegram_notification(
+                article,
+                {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
+            )
+
+        payload = post_mock.call_args.kwargs["json"]["text"]
+        self.assertTrue(sent)
+        self.assertIn("Alerta de transferência", payload)
+        self.assertIn("Jogador/Clube", payload)
+        self.assertIn("Fonte", payload)
+        self.assertIn("Link original", payload)
+        self.assertIn("Ideia para Shorts", payload)
+        self.assertIn("Striker", payload)
+        self.assertIn("Sky Sports Football", payload)
+        self.assertIn("https://example.com/transfer-news", payload)
+        self.assertNotIn("Player/club", payload)
+        self.assertNotIn("Shorts idea", payload)
+        self.assertNotIn("*⚽ Match:*", payload)
+        self.assertNotIn("*⏱ Minute:*", payload)
+        self.assertNotIn("*🥅 Goal scorer:*", payload)
+
     def test_manual_grouped_article_builds_portuguese_shorts_package(self):
         article = build_manual_grouped_article("Cape Verde goal")
 
@@ -842,6 +1094,32 @@ class MonitorTests(unittest.TestCase):
             self.assertIn("FINAL HIGH POTENTIAL STORIES: 1", text)
             self.assertIn("ACCEPTED OR REJECTED", text)
             self.assertIn("accepted", text.lower())
+
+    def test_process_cycle_skips_cazetv_discussion_video_with_log(self):
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "state_file": Path(temp_dir) / "state.json",
+                "alerts_file": Path(temp_dir) / "alerts.json",
+                "debug_mode": True,
+                "telegram_bot_token": "",
+                "telegram_chat_id": "",
+            }
+            entries = [{
+                "title": "GERAL CAZÉTV AO VIVO: debate da Copa",
+                "video_url": "https://www.youtube.com/watch?v=discussion1",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"CazéTV": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.send_telegram_notification") as telegram_mock, \
+                 self.assertLogs("football-monitor", level="INFO") as captured:
+                process_cycle(config)
+
+            self.assertIn("Skipping CazéTV discussion content.", "\n".join(captured.output))
+            telegram_mock.assert_not_called()
 
     def test_debug_mode_does_not_persist_seen_articles(self):
         with TemporaryDirectory() as temp_dir:

@@ -113,6 +113,7 @@ YOUTUBE_DOWNLOAD_REJECTED_TERMS = (
     "analysis", "reaction", "live", "podcast", "debate", "preview",
     "press conference", "opinion", "heroics", "greatest comeback", "daily",
 )
+SHORTS_FONT_PATH = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 DOWNLOAD_ELIGIBLE_TITLE_TERMS = (
     "match highlights", "highlights", "extended highlights", "melhores momentos",
     "resumo do jogo", "todos os gols", "goals", "penalty shootout", "goal",
@@ -1754,19 +1755,95 @@ def build_downloaded_video_caption(story: dict[str, Any]) -> str:
     """Build a compact caption for a downloaded video sent to Telegram."""
     sources = ", ".join(str(source) for source in story.get("sources", []) if str(source))
     original_url = story.get("link") or next((link for link in story.get("links", []) if link), "")
+    short_file_name = Path(str(story.get("vertical_short_path") or story.get("downloaded_video_path") or "")).name
     lines = [
         f"Title: {story.get('title', '')}",
         f"Source: {sources or story.get('source', '') or story.get('official_source', '')}",
-        f"Content category: {story.get('content_category', '') or 'UNKNOWN'}",
+        f"Category: {story.get('content_category', '') or 'UNKNOWN'}",
     ]
+    if short_file_name:
+        lines.append(f"Short file: {short_file_name}")
     if original_url:
         lines.append(f"Original URL: {original_url}")
     return "\n".join(lines)[:1024]
 
 
+def _shorten_short_text(value: Any, limit: int = 55) -> str:
+    """Return one-line overlay text that fits a vertical short."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 3)].rstrip(" .,;:-") + "..."
+
+
+def _escape_drawtext_text(value: Any) -> str:
+    """Escape text for ffmpeg drawtext text='...' filter arguments."""
+    text = re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
+    text = text.replace("\\", "\\\\")
+    text = text.replace("'", r"\'")
+    text = text.replace(":", r"\:")
+    text = text.replace(",", r"\,")
+    text = text.replace("%", r"\%")
+    return text
+
+
+def _drawtext_filter(text: str, x: str, y: str, fontsize: int, boxcolor: str = "black@0.55") -> str:
+    return (
+        "drawtext="
+        f"fontfile='{SHORTS_FONT_PATH}':"
+        f"text='{_escape_drawtext_text(text)}':"
+        f"x={x}:y={y}:"
+        f"fontsize={fontsize}:fontcolor=white:"
+        "borderw=2:bordercolor=black@0.45:"
+        f"box=1:boxcolor={boxcolor}:boxborderw=28"
+    )
+
+
+def build_short_metadata(story: dict[str, Any], vertical_path: str | Path) -> dict[str, Any]:
+    """Build companion metadata for the generated vertical short."""
+    title = _shorten_short_text(story.get("shorts_title") or story.get("title") or Path(vertical_path).stem, 70)
+    sources = ", ".join(str(source) for source in story.get("sources", []) if str(source))
+    source = sources or story.get("source") or story.get("official_source") or "Fonte oficial"
+    category = story.get("content_category") or "UNKNOWN"
+    hashtags = story.get("hashtags") or ["#Futebol", "#ShortsFutebol", "#Futeba"]
+    if isinstance(hashtags, str):
+        hashtags = [tag for tag in hashtags.split() if tag]
+    description = (
+        f"{title}\n\n"
+        f"Fonte: {source}\n"
+        f"Categoria: {category}\n"
+        f"Arquivo: {Path(vertical_path).name}"
+    )
+    return {
+        "title": title,
+        "description": description,
+        "hashtags": hashtags,
+    }
+
+
+def _write_short_metadata_file(story: dict[str, Any], vertical_path: str | Path) -> None:
+    metadata = build_short_metadata(story, vertical_path)
+    metadata_path = Path(vertical_path).with_suffix(".txt")
+    hashtags = " ".join(str(tag) for tag in metadata.get("hashtags", []) if str(tag))
+    metadata_path.write_text(
+        "\n".join([
+            f"Title: {metadata.get('title', '')}",
+            "",
+            "Description:",
+            str(metadata.get("description", "")),
+            "",
+            f"Hashtags: {hashtags}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    logger.info("Saved short metadata: %s", metadata_path)
+
+
 def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None = None, max_duration_seconds: int = 60) -> str | None:
     """Create a Telegram-friendly vertical 9:16 MP4 short from a downloaded video."""
     source_path = Path(video_path)
+    story = story or {}
     try:
         if not source_path.exists() or not source_path.is_file():
             logger.warning("Cannot create vertical short because source video was not found: %s", source_path)
@@ -1782,12 +1859,25 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
             "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
         )
-        command = [
+        font_available = SHORTS_FONT_PATH.exists()
+        if font_available:
+            headline = _shorten_short_text(story.get("title") or story.get("shorts_title") or source_path.stem)
+            text_filters = ",".join([
+                _drawtext_filter(headline, "(w-text_w)/2", "120", 58),
+                _drawtext_filter("COMENTA AÍ 👇", "(w-text_w)/2", "h-text_h-210", 64),
+                _drawtext_filter("Futeba & Juninho", "w-text_w-42", "h-text_h-48", 28, "black@0.35"),
+            ])
+            filter_complex = filter_complex[:-3] + f",{text_filters}[v]"
+        else:
+            logger.warning("Shorts font not found at %s. Creating vertical video without text overlay.", SHORTS_FONT_PATH)
+
+        command_base = [
             "ffmpeg",
             "-y",
             "-i", str(source_path),
             "-t", str(duration_limit),
-            "-filter_complex", filter_complex,
+        ]
+        command_tail = [
             "-map", "[v]",
             "-map", "0:a?",
             "-c:v", "libx264",
@@ -1798,12 +1888,28 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
             "-movflags", "+faststart",
             str(output_path),
         ]
+        command = command_base + ["-filter_complex", filter_complex] + command_tail
         logger.info("Creating vertical short for Telegram: %s", source_path)
-        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
+        except subprocess.CalledProcessError as exc:
+            if not font_available:
+                raise
+            logger.warning("ffmpeg text overlay failed. Retrying vertical short without text: %s", str(exc.stderr or exc).strip())
+            filter_complex = (
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,boxblur=30:1[bg];"
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
+            )
+            command = command_base + ["-filter_complex", filter_complex] + command_tail
+            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
         if result.stderr:
             logger.debug("ffmpeg stderr: %s", result.stderr)
         if output_path.exists() and output_path.is_file():
             logger.info("Created vertical short: %s", output_path)
+            _write_short_metadata_file(story, output_path)
+            story["vertical_short_path"] = str(output_path)
             return str(output_path)
         logger.error("ffmpeg completed but vertical short was not created: %s", output_path)
         return None

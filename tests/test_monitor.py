@@ -17,6 +17,7 @@ from monitor import (
     build_match_highlight_queries,
     build_match_day_queries,
     build_manual_grouped_article,
+    build_short_metadata,
     build_portuguese_shorts_pack,
     build_portuguese_telegram_message,
     build_youtube_feed_url,
@@ -456,6 +457,7 @@ class MonitorTests(unittest.TestCase):
                 "sources": ["TVNZ Sport"],
                 "content_category": "MATCH_HIGHLIGHT",
                 "links": ["https://example.com/story"],
+                "vertical_short_path": "shorts/clip_vertical.mp4",
                 "_telegram_config": {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
             }
 
@@ -467,6 +469,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Argentina vs Egypt Match Highlights", post_mock.call_args.kwargs["data"]["caption"])
         self.assertIn("TVNZ Sport", post_mock.call_args.kwargs["data"]["caption"])
         self.assertIn("MATCH_HIGHLIGHT", post_mock.call_args.kwargs["data"]["caption"])
+        self.assertIn("clip_vertical.mp4", post_mock.call_args.kwargs["data"]["caption"])
         self.assertIn("https://example.com/story", post_mock.call_args.kwargs["data"]["caption"])
 
     def test_downloaded_video_falls_back_to_senddocument(self):
@@ -510,7 +513,78 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Vídeo baixado no PC, mas muito grande para enviar pelo Telegram.", payload)
         self.assertIn(str(video_path), payload)
 
-    def test_create_vertical_short_builds_ffmpeg_command(self):
+    def test_create_vertical_short_builds_ffmpeg_command_with_drawtext_when_font_exists(self):
+        with TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                video_path = Path("downloads") / "clip.mp4"
+                video_path.parent.mkdir()
+                video_path.write_bytes(b"mp4")
+                font_path = Path(temp_dir) / "DejaVuSans-Bold.ttf"
+                font_path.write_bytes(b"font")
+
+                def fake_run(command, **kwargs):
+                    Path(command[-1]).write_bytes(b"short")
+                    return type("Result", (), {"stderr": ""})()
+
+                with patch("monitor.SHORTS_FONT_PATH", font_path), \
+                     patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                    output = create_vertical_short(
+                        video_path,
+                        {"title": "Argentina vs Egypt Match Highlights that needs shortening for a polished short"},
+                    )
+                metadata_exists = (Path("shorts") / "clip_vertical.txt").exists()
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(output, str(Path("shorts") / "clip_vertical.mp4"))
+        self.assertTrue(metadata_exists)
+        command = run_mock.call_args.args[0]
+        command_text = " ".join(command)
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("1080:1920", command_text)
+        self.assertIn("boxblur", command_text)
+        self.assertIn("overlay=(W-w)/2:(H-h)/2", command_text)
+        self.assertIn("drawtext", command_text)
+        self.assertIn("COMENTA AÍ 👇", command_text)
+        self.assertIn("Futeba & Juninho", command_text)
+        self.assertIn("libx264", command)
+        self.assertIn("veryfast", command)
+        self.assertIn("28", command)
+        self.assertIn("aac", command)
+        self.assertIn("128k", command)
+        self.assertIn("+faststart", command)
+
+    def test_create_vertical_short_falls_back_without_text_when_drawtext_fails(self):
+        with TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                video_path = Path("downloads") / "clip.mp4"
+                video_path.parent.mkdir()
+                video_path.write_bytes(b"mp4")
+                font_path = Path(temp_dir) / "DejaVuSans-Bold.ttf"
+                font_path.write_bytes(b"font")
+
+                def fake_run(command, **kwargs):
+                    if "drawtext" in " ".join(command):
+                        raise subprocess.CalledProcessError(1, command, stderr="drawtext failed")
+                    Path(command[-1]).write_bytes(b"short")
+                    return type("Result", (), {"stderr": ""})()
+
+                with patch("monitor.SHORTS_FONT_PATH", font_path), \
+                     patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                    output = create_vertical_short(video_path, {"title": "Messi scores winner"})
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(output, str(Path("shorts") / "clip_vertical.mp4"))
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertIn("drawtext", " ".join(run_mock.call_args_list[0].args[0]))
+        self.assertNotIn("drawtext", " ".join(run_mock.call_args_list[1].args[0]))
+
+    def test_create_vertical_short_skips_drawtext_when_font_missing(self):
         with TemporaryDirectory() as temp_dir:
             old_cwd = Path.cwd()
             os.chdir(temp_dir)
@@ -523,24 +597,31 @@ class MonitorTests(unittest.TestCase):
                     Path(command[-1]).write_bytes(b"short")
                     return type("Result", (), {"stderr": ""})()
 
-                with patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
-                    output = create_vertical_short(video_path, {"title": "Argentina vs Egypt Match Highlights"})
+                with patch("monitor.SHORTS_FONT_PATH", Path(temp_dir) / "missing.ttf"), \
+                     patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                    output = create_vertical_short(video_path, {"title": "Messi scores winner"})
             finally:
                 os.chdir(old_cwd)
 
         self.assertEqual(output, str(Path("shorts") / "clip_vertical.mp4"))
-        command = run_mock.call_args.args[0]
-        command_text = " ".join(command)
-        self.assertEqual(command[0], "ffmpeg")
-        self.assertIn("1080:1920", command_text)
-        self.assertIn("boxblur", command_text)
-        self.assertIn("overlay=(W-w)/2:(H-h)/2", command_text)
-        self.assertIn("libx264", command)
-        self.assertIn("veryfast", command)
-        self.assertIn("28", command)
-        self.assertIn("aac", command)
-        self.assertIn("128k", command)
-        self.assertIn("+faststart", command)
+        self.assertNotIn("drawtext", " ".join(run_mock.call_args.args[0]))
+
+    def test_build_short_metadata_returns_expected_fields(self):
+        metadata = build_short_metadata(
+            {
+                "title": "Argentina score a dramatic late winner against Egypt in extra time",
+                "sources": ["TVNZ Sport"],
+                "content_category": "GOAL_CLIP",
+                "hashtags": ["#Futebol", "#ShortsFutebol"],
+            },
+            Path("shorts") / "clip_vertical.mp4",
+        )
+
+        self.assertIn("title", metadata)
+        self.assertIn("description", metadata)
+        self.assertIn("hashtags", metadata)
+        self.assertIn("TVNZ Sport", metadata["description"])
+        self.assertIn("clip_vertical.mp4", metadata["description"])
 
     def test_process_cycle_sends_vertical_file_when_created(self):
         with TemporaryDirectory() as temp_dir:

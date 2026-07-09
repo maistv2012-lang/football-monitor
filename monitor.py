@@ -1446,8 +1446,8 @@ def build_content_discovery_telegram_message(grouped_article: dict[str, Any], co
 
     title = grouped_article.get("title", "") or "Nova história de futebol"
     summary = grouped_article.get("summary", "") or grouped_article.get("description", "") or "História em alta no futebol"
-    reason = grouped_article.get("reason", "") or shorts_pack.get("viral_reason", "")
-    viral_score = grouped_article.get("viral_score", shorts_pack.get("viral_score", 0)) or 0
+    reason = grouped_article.get("reason", "") or shorts_pack.get('viral_reason', "")
+    viral_score = grouped_article.get("viral_score", shorts_pack.get('viral_score', 0)) or 0
     content_score = grouped_article.get("score", 0) or 0
     if isinstance(content_score, (int, float)) and 0 <= float(content_score) <= 10:
         score_label = str(int(round(float(content_score) * 10)))
@@ -1459,8 +1459,8 @@ def build_content_discovery_telegram_message(grouped_article: dict[str, Any], co
     article_links_block = "\n".join(f"- {link}" for link in article_links) if article_links else "- Não informado"
     video_links_block = "\n".join(f"- {link}" for link in video_links) if video_links else "- Não informado"
     official_sources_block = ", ".join(official_sources) if official_sources else "Não informado"
-    hashtags_block = " ".join(shorts_pack.get("hashtags", [])) or "#Futebol #ShortsFutebol"
-    scripts = shorts_pack.get("narration_scripts", {}) or {}
+    hashtags_block = " ".join(shorts_pack.get('hashtags', [])) or "#Futebol #ShortsFutebol"
+    scripts = shorts_pack.get('narration_scripts', {}) or {}
 
     return (
         f"🚨 {title}\n\n"
@@ -1521,7 +1521,7 @@ def build_generic_news_telegram_message(grouped_article: dict[str, Any], config:
         grouped_article.get("reason")
         or grouped_article.get("summary")
         or grouped_article.get("description")
-        or shorts_pack.get("viral_reason", "")
+        or shorts_pack.get('viral_reason', "")
     )
     why_it_matters = public_telegram_text(why_it_matters)
     return (
@@ -1591,10 +1591,10 @@ def build_portuguese_telegram_message(grouped_article: dict[str, Any], config: d
     video_search_link = grouped_article.get("video_search_link") or ""
 
     shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
-    video_url = original_video_url or grouped_article.get("video_url") or shorts_pack.get("video_url", "")
+    video_url = original_video_url or grouped_article.get("video_url") or shorts_pack.get('video_url', "")
     if not video_search_link:
         video_search_link = build_video_search_url(f"{title} CazéTV")
-    search_keywords = original_search_keywords or grouped_article.get("search_keywords") or shorts_pack.get("search_keywords", [])
+    search_keywords = original_search_keywords or grouped_article.get("search_keywords") or shorts_pack.get('search_keywords', [])
 
     warning_block = ""
     if video_status in {"unavailable", "region_blocked", "blocked", "region-blocked"}:
@@ -1679,28 +1679,28 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
 
         message = (
             "*⚡ Alerta de Conteúdo — Futeba & Juninho*\n\n"
-            f"*🚨 Viral Score:* {shorts_pack.get("score", 0)}/10\n"
+            f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
             f"*📺 Source:* {sources}\n"
             f"*🔗 Original URL:* {grouped_article.get("link") or grouped_article.get("links", [""])[0]}\n"
-            f"*🎥 Link do vídeo oficial:* {shorts_pack.get("video_url", "")}\n"
+            f"*🎥 Link do vídeo oficial:* {shorts_pack.get('video_url', "")}\n"
             f"*🔎 YouTube search link:* {search_links[0]}\n"
             f"*🔎 FIFA/ESPN/BBC/Google search links:* {" | ".join(search_links[1:])}\n"
             f"{download_block}"
             f"*📰 Notícia:* {notification_title}\n"
-            f"*🖼 Melhor thumbnail:* {shorts_pack.get("thumbnail_frame_idea", "")}\n"
-            f"*🎙 Narração HeyGen:* {shorts_pack.get("heygen_narration", "")}\n"
+            f"*🖼 Melhor thumbnail:* {shorts_pack.get('thumbnail_frame_idea', "")}\n"
+            f"*🎙 Narração HeyGen:* {shorts_pack.get('heygen_narration', "")}\n"
             f"*📜 Prompt para HeyGen:* {heygen_prompt}\n"
             f"*🎬 Prompt para Veo 3/Kling:* {veo_prompt}\n"
-            f"*📝 Descrição YouTube:* {shorts_pack.get("description", "")}\n"
-            f"*🏷 Hashtags:* {" ".join(shorts_pack.get("hashtags", []))}\n"
-            f"*📌 Título:* {shorts_pack.get("shorts_title", "")}\n"
+            f"*📝 Descrição YouTube:* {shorts_pack.get('description', "")}\n"
+            f"*🏷 Hashtags:* {" ".join(shorts_pack.get('hashtags', []))}\n"
+            f"*📌 Título:* {shorts_pack.get('shorts_title', "")}\n"
             f"*⏱ Tempo estimado:* 30s, 45s, 60s\n"
-            f"*🎙 30s:* {shorts_pack.get("narration_scripts", {}).get('30s', '')}\n"
+            f"*🎙 30s:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
             f"*🎙 45s:* {shorts_pack.get('narration_scripts', {}).get('45s', '')}\n"
             f"*🎙 60s:* {shorts_pack.get('narration_scripts', {}).get('60s', '')}\n"
-            f"*🔍 Search keywords:* {", ".join(shorts_pack.get("search_keywords", []))}\n"
-            f"*🔥 Potencial viral:* {shorts_pack.get("score", 0)}/10\n"
-            f"*💡 Por que vale postar:* {shorts_pack.get("viral_reason", "")}\n"
+            f"*🔍 Search keywords:* {", ".join(shorts_pack.get('search_keywords', []))}\n"
+            f"*🔥 Potencial viral:* {shorts_pack.get('score', 0)}/10\n"
+            f"*💡 Por que vale postar:* {shorts_pack.get('viral_reason', "")}\n"
             f"*📰 Link da notícia:* {links}\n"
             f"*Source:* {sources}"
         ).strip()

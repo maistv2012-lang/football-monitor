@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from monitor import (
     GeoRestrictedVideoError,
+    _format_drawtext_font_path,
     attach_article_to_match,
     build_article_key,
     build_content_discovery_telegram_message,
@@ -28,6 +29,7 @@ from monitor import (
     create_vertical_short,
     download_youtube_video,
     discover_x_posts,
+    find_short_font_path,
     group_articles,
     is_cazetv_discussion_content,
     is_download_eligible_title,
@@ -521,14 +523,15 @@ class MonitorTests(unittest.TestCase):
                 video_path = Path("downloads") / "clip.mp4"
                 video_path.parent.mkdir()
                 video_path.write_bytes(b"mp4")
-                font_path = Path(temp_dir) / "DejaVuSans-Bold.ttf"
+                font_path = Path("fonts") / "DejaVuSans-Bold.ttf"
+                font_path.parent.mkdir()
                 font_path.write_bytes(b"font")
 
                 def fake_run(command, **kwargs):
                     Path(command[-1]).write_bytes(b"short")
                     return type("Result", (), {"stderr": ""})()
 
-                with patch("monitor.SHORTS_FONT_PATH", font_path), \
+                with patch("monitor.find_short_font_path", return_value=font_path), \
                      patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
                     output = create_vertical_short(
                         video_path,
@@ -547,7 +550,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("boxblur", command_text)
         self.assertIn("overlay=(W-w)/2:(H-h)/2", command_text)
         self.assertIn("drawtext", command_text)
-        self.assertIn("COMENTA AÍ 👇", command_text)
+        self.assertIn("COMENTA AI", command_text)
         self.assertIn("Futeba & Juninho", command_text)
         self.assertIn("libx264", command)
         self.assertIn("veryfast", command)
@@ -573,7 +576,7 @@ class MonitorTests(unittest.TestCase):
                     Path(command[-1]).write_bytes(b"short")
                     return type("Result", (), {"stderr": ""})()
 
-                with patch("monitor.SHORTS_FONT_PATH", font_path), \
+                with patch("monitor.find_short_font_path", return_value=font_path), \
                      patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
                     output = create_vertical_short(video_path, {"title": "Messi scores winner"})
             finally:
@@ -597,7 +600,7 @@ class MonitorTests(unittest.TestCase):
                     Path(command[-1]).write_bytes(b"short")
                     return type("Result", (), {"stderr": ""})()
 
-                with patch("monitor.SHORTS_FONT_PATH", Path(temp_dir) / "missing.ttf"), \
+                with patch("monitor.find_short_font_path", return_value=None), \
                      patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
                     output = create_vertical_short(video_path, {"title": "Messi scores winner"})
             finally:
@@ -605,6 +608,62 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(output, str(Path("shorts") / "clip_vertical.mp4"))
         self.assertNotIn("drawtext", " ".join(run_mock.call_args.args[0]))
+
+    def test_create_vertical_short_accepts_windows_font_path(self):
+        with TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                video_path = Path("downloads") / "clip.mp4"
+                video_path.parent.mkdir()
+                video_path.write_bytes(b"mp4")
+
+                def fake_run(command, **kwargs):
+                    Path(command[-1]).write_bytes(b"short")
+                    return type("Result", (), {"stderr": ""})()
+
+                with patch("monitor.find_short_font_path", return_value=Path("C:\\Windows\\Fonts\\Arial.ttf")), \
+                     patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                    output = create_vertical_short(video_path, {"title": "Messi scores winner"})
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(output, str(Path("shorts") / "clip_vertical.mp4"))
+        command_text = " ".join(run_mock.call_args.args[0])
+        self.assertIn("drawtext", command_text)
+        self.assertIn("fontfile='C\\:/Windows/Fonts/Arial.ttf'", command_text)
+
+    def test_format_drawtext_font_path_escapes_windows_drive_colon(self):
+        self.assertEqual(
+            _format_drawtext_font_path("C:/Windows/Fonts/arialbd.ttf"),
+            r"C\:/Windows/Fonts/arialbd.ttf",
+        )
+
+    def test_format_drawtext_font_path_keeps_linux_path_unchanged(self):
+        self.assertEqual(
+            _format_drawtext_font_path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        )
+
+    def test_find_short_font_path_accepts_linux_candidate(self):
+        with TemporaryDirectory() as temp_dir:
+            font_path = Path(temp_dir) / "DejaVuSans-Bold.ttf"
+            font_path.write_bytes(b"font")
+
+            with patch.dict(os.environ, {}, clear=True), \
+                 patch("monitor.DEFAULT_SHORTS_FONT_PATHS", (str(font_path),)):
+                self.assertEqual(find_short_font_path(), font_path)
+
+    def test_find_short_font_path_uses_env_before_defaults(self):
+        with TemporaryDirectory() as temp_dir:
+            env_font_path = Path(temp_dir) / "env-font.ttf"
+            default_font_path = Path(temp_dir) / "default-font.ttf"
+            env_font_path.write_bytes(b"font")
+            default_font_path.write_bytes(b"font")
+
+            with patch.dict(os.environ, {"SHORTS_FONT_PATH": str(env_font_path)}, clear=True), \
+                 patch("monitor.DEFAULT_SHORTS_FONT_PATHS", (str(default_font_path),)):
+                self.assertEqual(find_short_font_path(), env_font_path)
 
     def test_build_short_metadata_returns_expected_fields(self):
         metadata = build_short_metadata(

@@ -113,7 +113,13 @@ YOUTUBE_DOWNLOAD_REJECTED_TERMS = (
     "analysis", "reaction", "live", "podcast", "debate", "preview",
     "press conference", "opinion", "heroics", "greatest comeback", "daily",
 )
-SHORTS_FONT_PATH = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+DEFAULT_SHORTS_FONT_PATHS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "C:/Windows/Fonts/Arial.ttf",
+    "C:/Windows/Fonts/calibrib.ttf",
+    "C:/Windows/Fonts/calibri.ttf",
+)
 DOWNLOAD_ELIGIBLE_TITLE_TERMS = (
     "match highlights", "highlights", "extended highlights", "melhores momentos",
     "resumo do jogo", "todos os gols", "goals", "penalty shootout", "goal",
@@ -1787,10 +1793,34 @@ def _escape_drawtext_text(value: Any) -> str:
     return text
 
 
-def _drawtext_filter(text: str, x: str, y: str, fontsize: int, boxcolor: str = "black@0.55") -> str:
+def find_short_font_path() -> Path | None:
+    """Find a font that ffmpeg drawtext can use on Linux or Windows."""
+    candidates = []
+    env_font_path = os.getenv("SHORTS_FONT_PATH")
+    if env_font_path:
+        candidates.append(env_font_path)
+    candidates.extend(DEFAULT_SHORTS_FONT_PATHS)
+
+    for candidate in candidates:
+        font_path = Path(candidate)
+        if font_path.exists() and font_path.is_file():
+            return font_path
+    return None
+
+
+def _format_drawtext_font_path(font_path: str | Path) -> str:
+    """Normalize font path separators for ffmpeg drawtext."""
+    normalized = str(font_path).replace("\\", "/")
+    normalized = normalized.replace("'", r"\'")
+    if re.match(r"^[A-Za-z]:/", normalized):
+        normalized = normalized[:1] + r"\:" + normalized[2:]
+    return normalized
+
+
+def _drawtext_filter(text: str, x: str, y: str, fontsize: int, font_path: str | Path, boxcolor: str = "black@0.55") -> str:
     return (
         "drawtext="
-        f"fontfile='{SHORTS_FONT_PATH}':"
+        f"fontfile='{_format_drawtext_font_path(font_path)}':"
         f"text='{_escape_drawtext_text(text)}':"
         f"x={x}:y={y}:"
         f"fontsize={fontsize}:fontcolor=white:"
@@ -1859,17 +1889,17 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
             "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
         )
-        font_available = SHORTS_FONT_PATH.exists()
-        if font_available:
+        font_path = find_short_font_path()
+        if font_path:
             headline = _shorten_short_text(story.get("title") or story.get("shorts_title") or source_path.stem)
             text_filters = ",".join([
-                _drawtext_filter(headline, "(w-text_w)/2", "120", 58),
-                _drawtext_filter("COMENTA AÍ 👇", "(w-text_w)/2", "h-text_h-210", 64),
-                _drawtext_filter("Futeba & Juninho", "w-text_w-42", "h-text_h-48", 28, "black@0.35"),
+                _drawtext_filter(headline, "(w-text_w)/2", "120", 58, font_path),
+                _drawtext_filter("COMENTA AI", "(w-text_w)/2", "h-text_h-210", 64, font_path),
+                _drawtext_filter("Futeba & Juninho", "w-text_w-42", "h-text_h-48", 28, font_path, "black@0.35"),
             ])
             filter_complex = filter_complex[:-3] + f",{text_filters}[v]"
         else:
-            logger.warning("Shorts font not found at %s. Creating vertical video without text overlay.", SHORTS_FONT_PATH)
+            logger.warning("No Shorts font found. Creating vertical video without text overlay.")
 
         command_base = [
             "ffmpeg",
@@ -1893,7 +1923,7 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
         try:
             result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
         except subprocess.CalledProcessError as exc:
-            if not font_available:
+            if not font_path:
                 raise
             logger.warning("ffmpeg text overlay failed. Retrying vertical short without text: %s", str(exc.stderr or exc).strip())
             filter_complex = (

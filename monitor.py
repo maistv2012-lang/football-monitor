@@ -60,7 +60,7 @@ def build_priority_youtube_queries() -> list[str]:
         "viral moments World Cup 2026",
         "melhores momentos Copa do Mundo 2026",
         "gols Copa do Mundo 2026",
-        "momentos engraÃ§ados Copa do Mundo 2026",
+        "momentos engraçados Copa do Mundo 2026",
     ]
 
     queries = []
@@ -218,7 +218,7 @@ def is_relevant_article(article: dict[str, str]) -> bool:
     if not title:
         return False
 
-    if article.get("source", "") == "CazÃ©TV":
+    if article.get("source", "") == "CazéTV":
         return any(keyword.lower() in title for keyword in KEYWORDS)
 
     if any(keyword.lower() in title for keyword in KEYWORDS):
@@ -253,7 +253,7 @@ def get_source_priority(source: str) -> int:
     source_text = normalize_text(source)
     if "fifa" in source_text:
         return 1
-    if any(token in source_text for token in ["bbc", "sky", "espn", "fox", "tnt", "uefa", "conmebol", "official", "cazÃ©", "caze"]):
+    if any(token in source_text for token in ["bbc", "sky", "espn", "fox", "tnt", "uefa", "conmebol", "official", "cazé", "caze"]):
         return 2
     if any(token in source_text for token in ["fc", "club", "national", "team"]):
         return 3
@@ -410,7 +410,7 @@ def classify_story_content(
     if not title_text:
         return _content_decision("UNKNOWN", False, False, "empty title")
 
-    is_cazetv = channel_identity(source) == channel_identity("CazÃ©TV")
+    is_cazetv = channel_identity(source) == channel_identity("CazéTV")
     if any(_contains_normalized_phrase(title_text, term) for term in GENERIC_NEWS_TERMS):
         return _content_decision("GENERAL_NEWS", True, False, "title contains generic/listicle news term")
 
@@ -459,8 +459,8 @@ def is_download_eligible_title(title: Any) -> bool:
 
 
 def is_cazetv_discussion_content(source: Any, title: Any) -> bool:
-    """Identify CazÃ©TV discussion/opinion videos that should be ignored as news noise."""
-    if channel_identity(source) != channel_identity("CazÃ©TV"):
+    """Identify CazéTV discussion/opinion videos that should be ignored as news noise."""
+    if channel_identity(source) != channel_identity("CazéTV"):
         return False
     return classify_story_content(title, source).get("category") in {"DISCUSSION", "LIVE_STREAM"}
 
@@ -592,7 +592,7 @@ def build_match_highlight_queries(team_one: str, team_two: str, competition: str
     if "brasileiro" in competition_key or "brasileirao" in competition_key:
         return [
             f"{team_one} vs {team_two} highlights Campeonato Brasileiro",
-            f"{team_one} {team_two} melhores momentos BrasileirÃ£o",
+            f"{team_one} {team_two} melhores momentos Brasileirão",
         ]
     if "champions" in competition_key:
         return [
@@ -605,7 +605,7 @@ def build_match_highlight_queries(team_one: str, team_two: str, competition: str
     ]
 
 
-TEAM_NAMES_PT = {"egypt": "Egito", "brazil": "Brasil", "spain": "Espanha", "switzerland": "SuÃ­Ã§a"}
+TEAM_NAMES_PT = {"egypt": "Egito", "brazil": "Brasil", "spain": "Espanha", "switzerland": "Suíça"}
 
 SUPPORTED_FIXTURE_COMPETITIONS = {
     "fifa world cup", "champions league", "campeonato brasileiro", "premier league",
@@ -896,16 +896,16 @@ def get_debug_acceptance_reason(title: str, sources: list[str] | None = None, vi
     """Describe why a story should be accepted or rejected for Telegram alerts."""
     title_text = normalize_text(title)
     source_names = [normalize_text(source) for source in (sources or []) if str(source)]
-    high_trigger_terms = ["goal", "gol", "golaÃ§o", "argentina", "cabo verde", "messi", "var", "penalty", "red card", "fight", "controversy", "reaction"]
+    high_trigger_terms = ["goal", "gol", "golaço", "argentina", "cabo verde", "messi", "var", "penalty", "red card", "fight", "controversy", "reaction"]
 
     for term in high_trigger_terms:
         if term in title_text:
             return f"accepted because title contains trigger term '{term}'"
 
-    if any(source_name == "cazÃ©tv" or source_name == "caze" or source_name == "cazÃ©tv" for source_name in source_names):
+    if any(source_name == "cazétv" or source_name == "caze" for source_name in source_names):
         matched_keywords = [keyword for keyword in KEYWORDS if keyword.lower() in title_text]
         if matched_keywords:
-            return f"accepted because CazÃ©TV title matched keywords: {', '.join(matched_keywords)}"
+            return f"accepted because CazéTV title matched keywords: {', '.join(matched_keywords)}"
 
     if title_text and "messi" in title_text and any(term in title_text for term in ["goal", "free kick", "penalty"]):
         return "accepted because Messi title contains a major goal-style trigger"
@@ -921,14 +921,14 @@ def get_debug_acceptance_reason(title: str, sources: list[str] | None = None, vi
 
 
 def should_send_notification(grouped_article: dict[str, Any]) -> bool:
-    """Notify for high-score stories, Messi-specific moments, or CazÃ©TV keyword matches."""
+    """Notify for high-score stories, Messi-specific moments, or CazéTV keyword matches."""
     title = normalize_text(grouped_article.get("title", ""))
     sources = [str(source) for source in grouped_article.get("sources", []) if str(source)]
 
-    if any(term in title for term in ["goal", "gol", "golaÃ§o", "argentina", "cabo verde", "messi", "var", "penalty", "red card", "fight", "controversy", "reaction"]):
+    if any(term in title for term in ["goal", "gol", "golaço", "argentina", "cabo verde", "messi", "var", "penalty", "red card", "fight", "controversy", "reaction"]):
         return True
 
-    if any(source == "CazÃ©TV" for source in sources) and any(keyword.lower() in title for keyword in KEYWORDS):
+    if any(source == "CazéTV" for source in sources) and any(keyword.lower() in title for keyword in KEYWORDS):
         return True
 
     if title and "messi" in title and any(term in title for term in ["goal", "free kick", "penalty"]):
@@ -1007,11 +1007,11 @@ def calculate_viral_score(grouped_article: dict[str, Any]) -> int:
     article_links = [str(link) for link in grouped_article.get("links", []) if str(link)]
 
     score = 0
-    if any(keyword in title for keyword in ["goal", "gol", "golaÃ§o", "penalty", "free kick", "red card", "var", "controversy", "injury", "transfer", "fan reaction", "fight", "dramatic"]):
+    if any(keyword in title for keyword in ["goal", "gol", "golaço", "penalty", "free kick", "red card", "var", "controversy", "injury", "transfer", "fan reaction", "fight", "dramatic"]):
         score += 24
     if any(star in title for star in ["messi", "ronaldo", "neymar", "vinicius", "mbappe", "haaland", "bellingham", "yamal"]):
         score += 24
-    if any(marker in summary for marker in ["viral", "explod", "breaking", "official", "trending", "dramatic", "polÃªmica", "reaÃ§Ã£o", "torcida"]):
+    if any(marker in summary for marker in ["viral", "explod", "breaking", "official", "trending", "dramatic", "polêmica", "reação", "torcida"]):
         score += 10
     if any(source.lower().startswith("fifa") for source in sources):
         score += 16
@@ -1041,7 +1041,7 @@ def sanitize_telegram_message(message: str) -> str:
 
 TELEGRAM_SAFE_TEXT_LIMIT = 3499
 TELEGRAM_VIDEO_FILE_LIMIT_BYTES = 45 * 1024 * 1024
-PUBLIC_TELEGRAM_FALLBACK_TEXT = "Esse assunto estÃ¡ movimentando o futebol e pode render um bom comentÃ¡rio para Shorts."
+PUBLIC_TELEGRAM_FALLBACK_TEXT = "Esse assunto está movimentando o futebol e pode render um bom comentário para Shorts."
 INTERNAL_TELEGRAM_TEXT_TERMS = (
     "no ai api key configured",
     "falling back to heuristics",
@@ -1080,13 +1080,13 @@ def prepare_telegram_message(grouped_article: dict[str, Any], message: str) -> s
     score = grouped_article.get("viral_score", grouped_article.get("score", 0))
 
     compact_fields = [
-        f"TÃ­tulo: {str(grouped_article.get('title', '')).strip()[:500]}",
+        f"Título: {str(grouped_article.get('title', '')).strip()[:500]}",
         f"Score: {score}",
         f"Fonte: {source_text[:300]}",
         f"URL original: {original_url[:1000]}",
     ]
     if video_url:
-        compact_fields.append(f"URL do vÃ­deo: {video_url[:1000]}")
+        compact_fields.append(f"URL do vídeo: {video_url[:1000]}")
     compact_fields.append(f"Ideia de legenda curta: {caption}")
     compact_fields.append("Mensagem resumida automaticamente para respeitar o limite do Telegram.")
     return "\n".join(compact_fields)[:TELEGRAM_SAFE_TEXT_LIMIT]
@@ -1132,50 +1132,50 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
         title_pt = title_pt[:57].rstrip() + "..."
 
     thumbnail_text_options = [
-        "PolÃªmica no futebol",
+        "Polêmica no futebol",
         "Cena de cinema",
         "Futebol em choque",
     ]
-    frame_idea = "Close no jogador e reaÃ§Ã£o da torcida"
-    presenter_expression = "Surpresa + empolgaÃ§Ã£o"
-    background_idea = "EstÃ¡dio lotado com cÃ¢mera rÃ¡pida e efeito de destaque"
+    frame_idea = "Close no jogador e reação da torcida"
+    presenter_expression = "Surpresa + empolgação"
+    background_idea = "Estádio lotado com câmera rápida e efeito de destaque"
 
     scripts = {
         "30s": (
-            f"Ã” meu Deus, isso aqui tÃ¡ pegando fogo! {original_title} virou assunto em tudo quanto Ã© canto. "
-            "A cena foi tÃ£o absurda que a galera quase caiu da cadeira. E agora, vocÃª acha que isso vai virar meme ou vai virar lenda?"
+            f"Ô meu Deus, isso aqui tá pegando fogo! {original_title} virou assunto em tudo quanto é canto. "
+            "A cena foi tão absurda que a galera quase caiu da cadeira. E agora, você acha que isso vai virar meme ou vai virar lenda?"
         ),
         "45s": (
-            f"PeraÃ­, isso aqui nÃ£o Ã© notÃ­cia comum nÃ£o. {original_title} virou o tema da semana no futebol. "
-            "Tem drama, tem reaÃ§Ã£o, tem polÃªmica e ainda tem aquele clima de filme. "
-            "Se vocÃª gosta de futebol e de confusÃ£o boa, esse assunto nÃ£o sai da cabeÃ§a de ninguÃ©m. E aÃ­, qual foi a parte mais absurda pra vocÃª?"
+            f"Peraí, isso aqui não é notícia comum não. {original_title} virou o tema da semana no futebol. "
+            "Tem drama, tem reação, tem polêmica e ainda tem aquele clima de filme. "
+            "Se você gosta de futebol e de confusão boa, esse assunto não sai da cabeça de ninguém. E aí, qual foi a parte mais absurda pra você?"
         ),
         "60s": (
-            f"Olha sÃ³, a bola nÃ£o parou de rolar nem na cabeÃ§a da galera. {original_title} Ã© o tipo de assunto que faz todo mundo comentar. "
-            "Tem gol, tem emoÃ§Ã£o, tem chance de virar meme, e ainda tem aquele toque de drama que faz o Shorts explodir. "
-            "Ã‰ o futebol sendo futebol, sÃ³ que mais exagerado, mais engraÃ§ado e mais impossÃ­vel de ignorar. EntÃ£o, vocÃª acha que isso vai virar clÃ¡ssico ou vai virar piada da semana?"
+            f"Olha só, a bola não parou de rolar nem na cabeça da galera. {original_title} é o tipo de assunto que faz todo mundo comentar. "
+            "Tem gol, tem emoção, tem chance de virar meme, e ainda tem aquele toque de drama que faz o Shorts explodir. "
+            "É o futebol sendo futebol, só que mais exagerado, mais engraçado e mais impossível de ignorar. Então, você acha que isso vai virar clássico ou vai virar piada da semana?"
         ),
     }
 
     heygen_narration = (
-        f"Isso aqui tÃ¡ pegando fogo. {original_title} virou assunto em todo lugar. "
-        "A reaÃ§Ã£o foi enorme, o drama foi real, e a galera nÃ£o parou de comentar. "
-        "Se isso nÃ£o Ã© motivo pra virar Shorts, eu nÃ£o sei o que Ã©."
+        f"Isso aqui tá pegando fogo. {original_title} virou assunto em todo lugar. "
+        "A reação foi enorme, o drama foi real, e a galera não parou de comentar. "
+        "Se isso não é motivo pra virar Shorts, eu não sei o que é."
     )
 
     description = (
-        f"Essa notÃ­cia de futebol tÃ¡ fazendo a galera falar!\n\n"
-        f"TÃ­tulo original: {original_title}\n"
+        f"Essa notícia de futebol tá fazendo a galera falar!\n\n"
+        f"Título original: {original_title}\n"
         f"Fonte: {original_source}\n\n"
-        "Se vocÃª curte futebol, polÃªmica, drama, gol, VAR e aquele momento que explode na timeline, esse Shorts Ã© pra vocÃª.\n"
-        "Comenta sua opiniÃ£o, porque esse tipo de situaÃ§Ã£o sempre gera discussÃ£o.\n\n"
-        "#Futebol #FutebolBrasil #ShortsFutebol #Gol #Var #PolÃªmica #Messi #CristianoRonaldo #Neymar #ViniJr"
+        "Se você curte futebol, polêmica, drama, gol, VAR e aquele momento que explode na timeline, esse Shorts é pra você.\n"
+        "Comenta sua opinião, porque esse tipo de situação sempre gera discussão.\n\n"
+        "#Futebol #FutebolBrasil #ShortsFutebol #Gol #Var #Polêmica #Messi #CristianoRonaldo #Neymar #ViniJr"
     )
-    hashtags = ["#Futebol", "#FutebolBrasil", "#ShortsFutebol", "#Gol", "#Var", "#PolÃªmica", "#Messi", "#CristianoRonaldo", "#Neymar", "#ViniJr"]
+    hashtags = ["#Futebol", "#FutebolBrasil", "#ShortsFutebol", "#Gol", "#Var", "#Polêmica", "#Messi", "#CristianoRonaldo", "#Neymar", "#ViniJr"]
     keywords = [
         "futebol shorts",
         "momento viral futebol",
-        "polÃªmica futebol",
+        "polêmica futebol",
         "drama futebol",
         "resumo futebol",
         "futebol brasil",
@@ -1214,17 +1214,17 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
     grouped_article["heygen_narration"] = heygen_narration
     grouped_article["description"] = description
     grouped_article["hashtags"] = hashtags
-    grouped_article["viral_reason"] = reason or f"Tema quente com cara de explosÃ£o em Shorts: {summary[:120]}"
+    grouped_article["viral_reason"] = reason or f"Tema quente com cara de explosão em Shorts: {summary[:120]}"
     grouped_article["search_keywords"] = keywords
     grouped_article["source"] = original_source
     grouped_article["score"] = float(score or 0)
     grouped_article["viral_score"] = viral_score
     grouped_article["video_search_links"] = video_search_links
     grouped_article["video_links"] = grouped_article.get("video_links", [])
-    grouped_article["suggested_hook"] = f"{original_title} estÃ¡ dominando o futebol e todo mundo estÃ¡ falando"
-    grouped_article["suggested_cta"] = "Comenta o que vocÃª achou e segue pra mais conteÃºdo de futebol"
+    grouped_article["suggested_hook"] = f"{original_title} está dominando o futebol e todo mundo está falando"
+    grouped_article["suggested_cta"] = "Comenta o que você achou e segue pra mais conteúdo de futebol"
     grouped_article["seo_description"] = (
-        f"Resumo rÃ¡pido de {original_title} com contexto, reaÃ§Ã£o e o que faz essa histÃ³ria ser tÃ£o comentada no futebol."
+        f"Resumo rápido de {original_title} com contexto, reação e o que faz essa história ser tão comentada no futebol."
     )
     return grouped_article
 
@@ -1394,7 +1394,7 @@ def is_live_goal_event(article: dict[str, str]) -> bool:
     if not title:
         return False
 
-    live_markers = ["goal", "golaÃ§o", "gol", "scores", "scored", "penalty", "free kick", "red card", "own goal"]
+    live_markers = ["goal", "golaço", "gol", "scores", "scored", "penalty", "free kick", "red card", "own goal"]
     if not any(marker in title for marker in live_markers):
         return False
 
@@ -1406,7 +1406,7 @@ def is_live_goal_event(article: dict[str, str]) -> bool:
         "neymar",
         "vinicius",
         "endrick",
-        "mbappÃ©",
+        "mbappé",
         "mbappe",
         "haaland",
         "cape verde",
@@ -1444,8 +1444,8 @@ def build_content_discovery_telegram_message(grouped_article: dict[str, Any], co
         video_links.append(str(grouped_article.get("video_url")))
     official_sources = [str(source) for source in sorted(grouped_article.get("sources", []), key=get_source_priority) if str(source)]
 
-    title = grouped_article.get("title", "") or "Nova histÃ³ria de futebol"
-    summary = grouped_article.get("summary", "") or grouped_article.get("description", "") or "HistÃ³ria em alta no futebol"
+    title = grouped_article.get("title", "") or "Nova história de futebol"
+    summary = grouped_article.get("summary", "") or grouped_article.get("description", "") or "História em alta no futebol"
     reason = grouped_article.get("reason", "") or shorts_pack.get("viral_reason", "")
     viral_score = grouped_article.get("viral_score", shorts_pack.get("viral_score", 0)) or 0
     content_score = grouped_article.get("score", 0) or 0
@@ -1456,34 +1456,34 @@ def build_content_discovery_telegram_message(grouped_article: dict[str, Any], co
     else:
         score_label = str(viral_score)
 
-    article_links_block = "\n".join(f"- {link}" for link in article_links) if article_links else "- NÃ£o informado"
-    video_links_block = "\n".join(f"- {link}" for link in video_links) if video_links else "- NÃ£o informado"
-    official_sources_block = ", ".join(official_sources) if official_sources else "NÃ£o informado"
+    article_links_block = "\n".join(f"- {link}" for link in article_links) if article_links else "- Não informado"
+    video_links_block = "\n".join(f"- {link}" for link in video_links) if video_links else "- Não informado"
+    official_sources_block = ", ".join(official_sources) if official_sources else "Não informado"
     hashtags_block = " ".join(shorts_pack.get("hashtags", [])) or "#Futebol #ShortsFutebol"
     scripts = shorts_pack.get("narration_scripts", {}) or {}
 
     return (
-        f"ðŸš¨ {title}\n\n"
-        f"ðŸ“° NotÃ­cias\n"
-        f"âœ… {official_sources_block}\n\n"
-        f"ðŸŽ¥ VÃ­deos\n"
-        f"â–¶ {' | '.join(video_links) if video_links else 'NÃ£o informado'}\n\n"
-        f"ðŸ”¥ Viral Score: {score_label}/100\n\n"
-        f"ðŸ§  Resumo da histÃ³ria: {summary}\n"
-        f"ðŸ“ˆ Por que estÃ¡ explodindo: {reason}\n\n"
-        f"ðŸ”— Links para todos os artigos:\n{article_links_block}\n\n"
-        f"ðŸ”— Links para todos os vÃ­deos:\n{video_links_block}\n\n"
-        f"ðŸŽ™ HeyGen\n"
+        f"🚨 {title}\n\n"
+        f"📰 Notícias\n"
+        f"✅ {official_sources_block}\n\n"
+        f"🎥 Vídeos\n"
+        f"▶ {' | '.join(video_links) if video_links else 'Não informado'}\n\n"
+        f"🔥 Viral Score: {score_label}/100\n\n"
+        f"🧠 Resumo da história: {summary}\n"
+        f"📈 Por que está explodindo: {reason}\n\n"
+        f"🔗 Links para todos os artigos:\n{article_links_block}\n\n"
+        f"🔗 Links para todos os vídeos:\n{video_links_block}\n\n"
+        f"🎙 HeyGen\n"
         f"{shorts_pack.get('heygen_narration', '')}\n\n"
-        f"ðŸ“ Shorts\n"
+        f"📝 Shorts\n"
         f"{shorts_pack.get('shorts_title', '')}\n\n"
-        f"ðŸ“¸ Thumbnail\n"
+        f"📸 Thumbnail\n"
         f"{', '.join(shorts_pack.get('thumbnail_text', []))}\n\n"
-        f"ðŸŽ™ 30s: {scripts.get('30s', '')}\n"
-        f"ðŸŽ™ 45s: {scripts.get('45s', '')}\n"
-        f"ðŸŽ™ 60s: {scripts.get('60s', '')}\n\n"
-        f"ðŸ‘‰ CTA: {shorts_pack.get('suggested_cta', '')}\n\n"
-        f"ðŸ· {hashtags_block}"
+        f"🎙 30s: {scripts.get('30s', '')}\n"
+        f"🎙 45s: {scripts.get('45s', '')}\n"
+        f"🎙 60s: {scripts.get('60s', '')}\n\n"
+        f"👉 CTA: {shorts_pack.get('suggested_cta', '')}\n\n"
+        f"🏷 {hashtags_block}"
     ).strip()
 
 
@@ -1498,16 +1498,16 @@ def build_live_event_telegram_message(grouped_article: dict[str, Any], config: d
     official_source = grouped_article.get("official_source") or ", ".join(grouped_article.get("sources", []))
 
     return (
-        "*âš¡ Alerta ao Vivo â€” Futebol em tempo real*\n\n"
-        f"*âš½ Match:* {match}\n"
-        f"*â± Minute:* {minute}\n"
-        f"*ðŸ¥… Goal scorer:* {scorer or 'NÃ£o informado'}\n"
-        f"*ðŸ† Competition:* {competition or 'NÃ£o informado'}\n"
-        f"*ðŸ“º Official source:* {official_source}\n"
-        f"*ðŸŽ¬ Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
-        f"*ðŸ“ Short description:* {shorts_pack.get('description', '')}\n"
-        f"*ðŸŽ™ 30-second script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
-        f"*ðŸ¤– HeyGen narration:* {shorts_pack.get('heygen_narration', '')}"
+        "*⚡ Alerta ao Vivo — Futebol em tempo real*\n\n"
+        f"*⚽ Match:* {match}\n"
+        f"*⏱ Minute:* {minute}\n"
+        f"*🥅 Goal scorer:* {scorer or 'Não informado'}\n"
+        f"*🏆 Competition:* {competition or 'Não informado'}\n"
+        f"*📺 Official source:* {official_source}\n"
+        f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
+        f"*📝 Short description:* {shorts_pack.get('description', '')}\n"
+        f"*🎙 30-second script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
+        f"*🤖 HeyGen narration:* {shorts_pack.get('heygen_narration', '')}"
     ).strip()
 
 
@@ -1525,9 +1525,9 @@ def build_generic_news_telegram_message(grouped_article: dict[str, Any], config:
     )
     why_it_matters = public_telegram_text(why_it_matters)
     return (
-        "*ðŸ“° Alerta de notÃ­cia*\n\n"
-        f"*TÃ­tulo:* {grouped_article.get('title', '')}\n"
-        f"*Fonte:* {sources or grouped_article.get('source', 'NÃ£o informado')}\n"
+        "*📰 Alerta de notícia*\n\n"
+        f"*Título:* {grouped_article.get('title', '')}\n"
+        f"*Fonte:* {sources or grouped_article.get('source', 'Não informado')}\n"
         f"*Link original:* {original_url}\n"
         f"*Por que importa:* {why_it_matters}\n"
         f"*Ideia para Shorts:* {shorts_pack.get('shorts_title', '')}"
@@ -1545,13 +1545,13 @@ def build_transfer_telegram_message(grouped_article: dict[str, Any], config: dic
         or grouped_article.get("club")
         or grouped_article.get("transfer_player")
         or grouped_article.get("transfer_club")
-        or "NÃ£o informado"
+        or "Não informado"
     )
     return (
-        "*ðŸ” Alerta de transferÃªncia*\n\n"
+        "*🔁 Alerta de transferência*\n\n"
         f"*Jogador/Clube:* {player_or_club}\n"
-        f"*TÃ­tulo:* {grouped_article.get('title', '')}\n"
-        f"*Fonte:* {sources or grouped_article.get('source', 'NÃ£o informado')}\n"
+        f"*Título:* {grouped_article.get('title', '')}\n"
+        f"*Fonte:* {sources or grouped_article.get('source', 'Não informado')}\n"
         f"*Link original:* {original_url}\n"
         f"*Ideia para Shorts:* {shorts_pack.get('shorts_title', '')}"
     ).strip()
@@ -1562,25 +1562,25 @@ def build_manual_telegram_message(grouped_article: dict[str, Any], config: dict[
     shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
     search_links = build_search_links(grouped_article)
     return (
-        "*âš¡ Alerta Manual â€” Breaking News*\n\n"
-        f"*ðŸš¨ Viral Score:* {shorts_pack.get('score', 0)}/10\n"
-        f"*ðŸ“º Source:* {', '.join(grouped_article.get('sources', []))}\n"
-        f"*ðŸ”— Original URL:* {grouped_article.get('link') or grouped_article.get('links', [''])[0]}\n"
-        f"*ðŸŽ¥ YouTube URL:* {grouped_article.get('video_url', '')}\n"
-        f"*ðŸ”Ž YouTube search link:* {search_links[0]}\n"
-        f"*ðŸ”Ž FIFA/ESPN/BBC/Google search links:* {' | '.join(search_links[1:])}\n"
-        f"*ðŸŽ¬ Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
-        f"*ðŸ–¼ Thumbnail text:* {', '.join(shorts_pack.get('thumbnail_text', []))}\n"
-        f"*ðŸŽ™ 30s script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
-        f"*ðŸ¤– HeyGen narration:* {shorts_pack.get('heygen_narration', '')}\n"
-        f"*ðŸ“ YouTube description:* {shorts_pack.get('description', '')}\n"
-        f"*ðŸ· Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
-        f"*ðŸ” Search keywords:* {', '.join(shorts_pack.get('search_keywords', []))}"
+        "*⚡ Alerta Manual — Breaking News*\n\n"
+        f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
+        f"*📺 Source:* {', '.join(grouped_article.get('sources', []))}\n"
+        f"*🔗 Original URL:* {grouped_article.get('link') or grouped_article.get('links', [''])[0]}\n"
+        f"*🎥 YouTube URL:* {grouped_article.get('video_url', '')}\n"
+        f"*🔎 YouTube search link:* {search_links[0]}\n"
+        f"*🔎 FIFA/ESPN/BBC/Google search links:* {' | '.join(search_links[1:])}\n"
+        f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
+        f"*🖼 Thumbnail text:* {', '.join(shorts_pack.get('thumbnail_text', []))}\n"
+        f"*🎙 30s script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
+        f"*🤖 HeyGen narration:* {shorts_pack.get('heygen_narration', '')}\n"
+        f"*📝 YouTube description:* {shorts_pack.get('description', '')}\n"
+        f"*🏷 Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
+        f"*🔍 Search keywords:* {', '.join(shorts_pack.get('search_keywords', []))}"
     ).strip()
 
 
 def build_portuguese_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
-    """Build a Brazilian Portuguese Telegram alert for football videos, especially CazÃ©TV Shorts."""
+    """Build a Brazilian Portuguese Telegram alert for football videos, especially CazéTV Shorts."""
     title = grouped_article.get("title", "")
     sources = ", ".join(grouped_article.get("sources", []))
     links = "\n".join(grouped_article.get("links", []))
@@ -1593,28 +1593,28 @@ def build_portuguese_telegram_message(grouped_article: dict[str, Any], config: d
     shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
     video_url = original_video_url or grouped_article.get("video_url") or shorts_pack.get("video_url", "")
     if not video_search_link:
-        video_search_link = build_video_search_url(f"{title} CazÃ©TV")
+        video_search_link = build_video_search_url(f"{title} CazéTV")
     search_keywords = original_search_keywords or grouped_article.get("search_keywords") or shorts_pack.get("search_keywords", [])
 
     warning_block = ""
     if video_status in {"unavailable", "region_blocked", "blocked", "region-blocked"}:
-        warning_block = "\nâš ï¸ Este vÃ­deo pode estar bloqueado na sua regiÃ£o."
+        warning_block = "\n⚠️ Este vídeo pode estar bloqueado na sua região."
 
     message = (
-        "*âš¡ Alerta de ConteÃºdo â€” CazÃ©TV / Futeba & Juninho*\n\n"
-        f"*ðŸ“º Fonte:* {sources}\n"
-        f"*ðŸ“° TÃ­tulo original:* {title}\n"
-        f"*ðŸ”— Link do vÃ­deo:* {video_url}\n"
+        "*⚡ Alerta de Conteúdo — CazéTV / Futeba & Juninho*\n\n"
+        f"*📺 Fonte:* {sources}\n"
+        f"*📰 Título original:* {title}\n"
+        f"*🔗 Link do vídeo:* {video_url}\n"
         f"{warning_block}\n"
-        f"*ðŸ”Ž Link de busca do YouTube:* {video_search_link}\n"
-        f"*ðŸ” Palavras-chave de busca:* {', '.join(search_keywords) if search_keywords else ', '.join(shorts_pack.get('search_keywords', []))}\n"
-        f"*ðŸŽ¬ Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
-        f"*ðŸ“ DescriÃ§Ã£o:* {shorts_pack.get('description', '')}\n"
-        f"*ðŸŽ™ 30s script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
-        f"*ðŸ¤– HeyGen narration:* {shorts_pack.get('heygen_narration', '')}\n"
-        f"*ðŸ–¼ Thumbnail text:* {', '.join(shorts_pack.get('thumbnail_text', []))}\n"
-        f"*ðŸ· Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
-        f"*ðŸ”¥ Viral Score:* {shorts_pack.get('score', 0)}/10"
+        f"*🔎 Link de busca do YouTube:* {video_search_link}\n"
+        f"*🔍 Palavras-chave de busca:* {', '.join(search_keywords) if search_keywords else ', '.join(shorts_pack.get('search_keywords', []))}\n"
+        f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
+        f"*📝 Descrição:* {shorts_pack.get('description', '')}\n"
+        f"*🎙 30s script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
+        f"*🤖 HeyGen narration:* {shorts_pack.get('heygen_narration', '')}\n"
+        f"*🖼 Thumbnail text:* {', '.join(shorts_pack.get('thumbnail_text', []))}\n"
+        f"*🏷 Hashtags:* {' '.join(shorts_pack.get('hashtags', []))}\n"
+        f"*🔥 Viral Score:* {shorts_pack.get('score', 0)}/10"
     ).strip()
     return message
 
@@ -1655,7 +1655,7 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         for source in grouped_article.get("sources", [])
     )):
         message = build_live_event_telegram_message(grouped_article, config)
-    elif grouped_article.get("sources") and any(source == "CazÃ©TV" for source in grouped_article.get("sources", [])):
+    elif grouped_article.get("sources") and any(source == "CazéTV" for source in grouped_article.get("sources", [])):
         message = build_portuguese_telegram_message(grouped_article, config)
     elif float(grouped_article.get("viral_score", 0) or 0) >= 75:
         message = build_content_discovery_telegram_message(grouped_article, config)
@@ -1666,42 +1666,42 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         heygen_prompt = (
             f"Persona: apresentador brasileiro de futebol, energia alta, olhar direto, movimentos naturais. "
             f"Contexto: {notification_title}. "
-            "Tom: empolgaÃ§Ã£o, drama, humor leve, voz firme. "
-            "CÃ¢mera: plano mÃ©dio, gesto de apoio, pequenas pausas, expressÃ£o intensa."
+            "Tom: empolgação, drama, humor leve, voz firme. "
+            "Câmera: plano médio, gesto de apoio, pequenas pausas, expressão intensa."
         )
         veo_prompt = (
             f"Criar cenas extras para um Shorts de futebol sobre {notification_title}. "
-            "Estilo cinematogrÃ¡fico, cortes rÃ¡pidos, reaÃ§Ã£o de torcida, close em jogador, cÃ¢mera dinÃ¢mica, iluminaÃ§Ã£o forte, sensaÃ§Ã£o de explosÃ£o."
+            "Estilo cinematográfico, cortes rápidos, reação de torcida, close em jogador, câmera dinâmica, iluminação forte, sensação de explosão."
         )
         search_links = build_search_links(grouped_article)
         downloaded_video_path = grouped_article.get("downloaded_video_path", "")
-        download_block = f"*ðŸ’¾ VÃ­deo baixado:* {downloaded_video_path}\n" if downloaded_video_path else ""
+        download_block = f"*💾 Vídeo baixado:* {downloaded_video_path}\n" if downloaded_video_path else ""
 
         message = (
-            "*âš¡ Alerta de ConteÃºdo â€” Futeba & Juninho*\n\n"
-            f"*ðŸš¨ Viral Score:* {shorts_pack.get("score", 0)}/10\n"
-            f"*ðŸ“º Source:* {sources}\n"
-            f"*ðŸ”— Original URL:* {grouped_article.get("link") or grouped_article.get("links", [""])[0]}\n"
-            f"*ðŸŽ¥ Link do vÃ­deo oficial:* {shorts_pack.get("video_url", "")}\n"
-            f"*ðŸ”Ž YouTube search link:* {search_links[0]}\n"
-            f"*ðŸ”Ž FIFA/ESPN/BBC/Google search links:* {" | ".join(search_links[1:])}\n"
+            "*⚡ Alerta de Conteúdo — Futeba & Juninho*\n\n"
+            f"*🚨 Viral Score:* {shorts_pack.get("score", 0)}/10\n"
+            f"*📺 Source:* {sources}\n"
+            f"*🔗 Original URL:* {grouped_article.get("link") or grouped_article.get("links", [""])[0]}\n"
+            f"*🎥 Link do vídeo oficial:* {shorts_pack.get("video_url", "")}\n"
+            f"*🔎 YouTube search link:* {search_links[0]}\n"
+            f"*🔎 FIFA/ESPN/BBC/Google search links:* {" | ".join(search_links[1:])}\n"
             f"{download_block}"
-            f"*ðŸ“° NotÃ­cia:* {notification_title}\n"
-            f"*ðŸ–¼ Melhor thumbnail:* {shorts_pack.get("thumbnail_frame_idea", "")}\n"
-            f"*ðŸŽ™ NarraÃ§Ã£o HeyGen:* {shorts_pack.get("heygen_narration", "")}\n"
-            f"*ðŸ“œ Prompt para HeyGen:* {heygen_prompt}\n"
-            f"*ðŸŽ¬ Prompt para Veo 3/Kling:* {veo_prompt}\n"
-            f"*ðŸ“ DescriÃ§Ã£o YouTube:* {shorts_pack.get("description", "")}\n"
-            f"*ðŸ· Hashtags:* {" ".join(shorts_pack.get("hashtags", []))}\n"
-            f"*ðŸ“Œ TÃ­tulo:* {shorts_pack.get("shorts_title", "")}\n"
-            f"*â± Tempo estimado:* 30s, 45s, 60s\n"
-            f"*ðŸŽ™ 30s:* {shorts_pack.get("narration_scripts", {}).get('30s', '')}\n"
-            f"*ðŸŽ™ 45s:* {shorts_pack.get('narration_scripts', {}).get('45s', '')}\n"
-            f"*ðŸŽ™ 60s:* {shorts_pack.get('narration_scripts', {}).get('60s', '')}\n"
-            f"*ðŸ” Search keywords:* {", ".join(shorts_pack.get("search_keywords", []))}\n"
-            f"*ðŸ”¥ Potencial viral:* {shorts_pack.get("score", 0)}/10\n"
-            f"*ðŸ’¡ Por que vale postar:* {shorts_pack.get("viral_reason", "")}\n"
-            f"*ðŸ“° Link da notÃ­cia:* {links}\n"
+            f"*📰 Notícia:* {notification_title}\n"
+            f"*🖼 Melhor thumbnail:* {shorts_pack.get("thumbnail_frame_idea", "")}\n"
+            f"*🎙 Narração HeyGen:* {shorts_pack.get("heygen_narration", "")}\n"
+            f"*📜 Prompt para HeyGen:* {heygen_prompt}\n"
+            f"*🎬 Prompt para Veo 3/Kling:* {veo_prompt}\n"
+            f"*📝 Descrição YouTube:* {shorts_pack.get("description", "")}\n"
+            f"*🏷 Hashtags:* {" ".join(shorts_pack.get("hashtags", []))}\n"
+            f"*📌 Título:* {shorts_pack.get("shorts_title", "")}\n"
+            f"*⏱ Tempo estimado:* 30s, 45s, 60s\n"
+            f"*🎙 30s:* {shorts_pack.get("narration_scripts", {}).get('30s', '')}\n"
+            f"*🎙 45s:* {shorts_pack.get('narration_scripts', {}).get('45s', '')}\n"
+            f"*🎙 60s:* {shorts_pack.get('narration_scripts', {}).get('60s', '')}\n"
+            f"*🔍 Search keywords:* {", ".join(shorts_pack.get("search_keywords", []))}\n"
+            f"*🔥 Potencial viral:* {shorts_pack.get("score", 0)}/10\n"
+            f"*💡 Por que vale postar:* {shorts_pack.get("viral_reason", "")}\n"
+            f"*📰 Link da notícia:* {links}\n"
             f"*Source:* {sources}"
         ).strip()
     message = prepare_telegram_message(grouped_article, message).replace(token, "[REDACTED]")
@@ -1763,7 +1763,7 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
             return False
         if path.stat().st_size > TELEGRAM_VIDEO_FILE_LIMIT_BYTES:
             message = (
-                "VÃ­deo baixado no PC, mas muito grande para enviar pelo Telegram.\n"
+                "Vídeo baixado no PC, mas muito grande para enviar pelo Telegram.\n"
                 f"Caminho local: {path}"
             )
             response = requests.post(
@@ -1887,7 +1887,7 @@ def process_cycle(config: dict[str, str]) -> int:
             logger.info("Should download: %s", content_decision["should_download"])
             logger.info("Decision reason: %s", content_decision["reason"])
             if is_cazetv_discussion_content(source, article.get("title", "")):
-                logger.info("Skipping CazÃ©TV discussion content.")
+                logger.info("Skipping CazéTV discussion content.")
                 continue
             if article.get("video_url") and is_youtube_link(article.get("video_url")):
                 videos_found += 1
@@ -2050,7 +2050,7 @@ def process_cycle(config: dict[str, str]) -> int:
             preferred_url = article_url if is_youtube_link(article_url) else ""
             article_source = article.get("official_source", "") or next(iter(article.get("sources", [])), "")
             downloaded_path = None
-            video_id_for_download = "" if channel_identity(article_source) == channel_identity("CazÃ©TV") else extract_youtube_video_id(preferred_url)
+            video_id_for_download = "" if channel_identity(article_source) == channel_identity("CazéTV") else extract_youtube_video_id(preferred_url)
             article["downloaded_video_path"] = "" # Initialize for consistency
 
             if not article.get("should_download", False):
@@ -2145,14 +2145,14 @@ def process_cycle(config: dict[str, str]) -> int:
         print(f"Videos downloaded: {videos_downloaded}") # New debug info
         print(f"Notifications sent: {len(notified_stories_in_cycle)}") # New debug info
         print(f"Final high-potential stories: {len(high_potential_articles)}")
-        print(f"notÃ­cias verificadas: {sources_checked}")
-        print(f"vÃ­deos encontrados: {videos_found}")
+        print(f"notícias verificadas: {sources_checked}")
+        print(f"vídeos encontrados: {videos_found}")
         print(f"artigos encontrados: {articles_found}")
-        print(f"histÃ³rias mescladas: {len(grouped_articles)}")
-        print(f"histÃ³rias rejeitadas: {stories_rejected}")
-        print(f"vÃ­deos baixados: {videos_downloaded}") # New debug info
-        print(f"notificaÃ§Ãµes enviadas: {len(notified_stories_in_cycle)}") # New debug info
-        print(f"histÃ³rias finais de alto potencial: {len(high_potential_articles)}")
+        print(f"histórias mescladas: {len(grouped_articles)}")
+        print(f"histórias rejeitadas: {stories_rejected}")
+        print(f"vídeos baixados: {videos_downloaded}") # New debug info
+        print(f"notificações enviadas: {len(notified_stories_in_cycle)}") # New debug info
+        print(f"histórias finais de alto potencial: {len(high_potential_articles)}")
 
         ranked_stories = sorted(
             high_potential_articles + [article for article in grouped_articles if article not in high_potential_articles],
@@ -2161,9 +2161,9 @@ def process_cycle(config: dict[str, str]) -> int:
         )[:10]
         print("\nTop 10 melhores oportunidades")
         for index, story in enumerate(ranked_stories, start=1):
-            title = str(story.get("title", "")).strip() or "Sem tÃ­tulo"
+            title = str(story.get("title", "")).strip() or "Sem título"
             score = story.get("viral_score", calculate_viral_score(story))
-            line = f"{index}ï¸âƒ£ {title} â€” Viral Score: {score}"
+            line = f"{index}️⃣ {title} — Viral Score: {score}"
             try:
                 print(line)
             except UnicodeEncodeError:
@@ -2250,8 +2250,8 @@ def search_and_download_youtube_video(
     geo_restriction_seen = highlights_fallback
 
     try:
-        if channel_identity(trusted_source) == channel_identity("CazÃ©TV") and not cazetv_news_fallback:
-            logger.info("CazÃ©TV is news-only; skipping its original video and searching other trusted highlights.")
+        if channel_identity(trusted_source) == channel_identity("CazéTV") and not cazetv_news_fallback:
+            logger.info("CazéTV is news-only; skipping its original video and searching other trusted highlights.")
             return search_and_download_youtube_video(
                 query,
                 config,
@@ -2260,13 +2260,13 @@ def search_and_download_youtube_video(
             )
 
         if preferred_url:
-            if channel_identity(trusted_source) == channel_identity("CazÃ©TV"):
+            if channel_identity(trusted_source) == channel_identity("CazéTV"):
                 logger.info(
                     "YouTube candidate | title=%s | uploader=%s | url=%s",
                     query, trusted_source, preferred_url,
                 )
                 if not is_relevant_video_candidate({"title": query}, query):
-                    logger.info("Skipping CazÃ©TV video because it contains rejected content terms: %s", query)
+                    logger.info("Skipping CazéTV video because it contains rejected content terms: %s", query)
                     logger.info("No trusted official video found.")
                     return None, None
                 logger.info("Official channel found: %s", trusted_source)
@@ -2305,7 +2305,7 @@ def search_and_download_youtube_video(
                         query,
                         config,
                         seen_video_ids,
-                        prefer_geo_fallback_order=channel_identity(trusted_source) == channel_identity("CazÃ©TV"),
+                        prefer_geo_fallback_order=channel_identity(trusted_source) == channel_identity("CazéTV"),
                         highlights_fallback=True,
                     )
                 logger.warning("Article video inspection failed. Falling back to YouTube search.")
@@ -2337,7 +2337,7 @@ def search_and_download_youtube_video(
                     query,
                     config,
                     seen_video_ids,
-                    prefer_geo_fallback_order=channel_identity(uploader) == channel_identity("CazÃ©TV"),
+                    prefer_geo_fallback_order=channel_identity(uploader) == channel_identity("CazéTV"),
                     highlights_fallback=True,
                 )
             if downloaded_path:
@@ -2410,7 +2410,7 @@ def search_and_download_youtube_video(
                 logger.warning("Trying next trusted official channel...")
                 geo_restriction_seen = True
                 selected_uploader = selected_video.get("channel") or selected_video.get("uploader") or ""
-                if channel_identity(selected_uploader) == channel_identity("CazÃ©TV") and not prefer_geo_fallback_order:
+                if channel_identity(selected_uploader) == channel_identity("CazéTV") and not prefer_geo_fallback_order:
                     return search_and_download_youtube_video(
                         query,
                         config,

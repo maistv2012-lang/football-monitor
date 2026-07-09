@@ -1,3 +1,4 @@
+import os
 import subprocess
 import unittest
 from contextlib import redirect_stdout
@@ -23,6 +24,7 @@ from monitor import (
     build_x_telegram_message,
     calculate_viral_score,
     classify_story_content,
+    create_vertical_short,
     download_youtube_video,
     discover_x_posts,
     group_articles,
@@ -450,7 +452,7 @@ class MonitorTests(unittest.TestCase):
             video_path = Path(temp_dir) / "clip.mp4"
             video_path.write_bytes(b"mp4")
             story = {
-                "title": "Argentina vs Egypt Match Highlights",
+                "title": "Messi Argentina vs Egypt Match Highlights",
                 "sources": ["TVNZ Sport"],
                 "content_category": "MATCH_HIGHLIGHT",
                 "links": ["https://example.com/story"],
@@ -507,6 +509,114 @@ class MonitorTests(unittest.TestCase):
         payload = post_mock.call_args.kwargs["json"]["text"]
         self.assertIn("Vídeo baixado no PC, mas muito grande para enviar pelo Telegram.", payload)
         self.assertIn(str(video_path), payload)
+
+    def test_create_vertical_short_builds_ffmpeg_command(self):
+        with TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                video_path = Path("downloads") / "clip.mp4"
+                video_path.parent.mkdir()
+                video_path.write_bytes(b"mp4")
+
+                def fake_run(command, **kwargs):
+                    Path(command[-1]).write_bytes(b"short")
+                    return type("Result", (), {"stderr": ""})()
+
+                with patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                    output = create_vertical_short(video_path, {"title": "Argentina vs Egypt Match Highlights"})
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(output, str(Path("shorts") / "clip_vertical.mp4"))
+        command = run_mock.call_args.args[0]
+        command_text = " ".join(command)
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("1080:1920", command_text)
+        self.assertIn("boxblur", command_text)
+        self.assertIn("overlay=(W-w)/2:(H-h)/2", command_text)
+        self.assertIn("libx264", command)
+        self.assertIn("veryfast", command)
+        self.assertIn("28", command)
+        self.assertIn("aac", command)
+        self.assertIn("128k", command)
+        self.assertIn("+faststart", command)
+
+    def test_process_cycle_sends_vertical_file_when_created(self):
+        with TemporaryDirectory() as temp_dir:
+            downloaded_path = str(Path(temp_dir) / "downloaded.mp4")
+            vertical_path = str(Path(temp_dir) / "vertical.mp4")
+            Path(downloaded_path).write_bytes(b"mp4")
+            Path(vertical_path).write_bytes(b"short")
+            config = {
+                "state_file": Path(temp_dir) / "state.json",
+                "alerts_file": Path(temp_dir) / "alerts.json",
+                "debug_mode": False,
+                "telegram_bot_token": "TEST_TOKEN",
+                "telegram_chat_id": "123",
+            }
+            entries = [{
+                "title": "Messi Argentina vs Egypt Match Highlights",
+                "summary": "Highlights from the match.",
+                "description": "Highlights from the match.",
+                "link": "https://example.com/news/1",
+                "id": "news-1",
+                "published": "2026-07-04T10:00:00Z",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"TVNZ Sport": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.save_seen_articles"), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.load_todays_fixtures", return_value=[]), \
+                 patch("monitor.should_send_notification", return_value=True), \
+                 patch("monitor.send_telegram_notification", return_value=True), \
+                 patch("monitor.search_and_download_youtube_video", return_value=(downloaded_path, "https://youtu.be/tvnzvideo01")), \
+                 patch("monitor.create_vertical_short", return_value=vertical_path), \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_video_mock:
+                process_cycle(config)
+
+        send_video_mock.assert_called_once()
+        self.assertEqual(send_video_mock.call_args.args[0], vertical_path)
+
+    def test_process_cycle_falls_back_to_original_when_vertical_creation_fails(self):
+        with TemporaryDirectory() as temp_dir:
+            downloaded_path = str(Path(temp_dir) / "downloaded.mp4")
+            Path(downloaded_path).write_bytes(b"mp4")
+            config = {
+                "state_file": Path(temp_dir) / "state.json",
+                "alerts_file": Path(temp_dir) / "alerts.json",
+                "debug_mode": False,
+                "telegram_bot_token": "TEST_TOKEN",
+                "telegram_chat_id": "123",
+            }
+            entries = [{
+                "title": "Messi Argentina vs Egypt Match Highlights",
+                "summary": "Highlights from the match.",
+                "description": "Highlights from the match.",
+                "link": "https://example.com/news/1",
+                "id": "news-1",
+                "published": "2026-07-04T10:00:00Z",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"TVNZ Sport": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.save_seen_articles"), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.load_todays_fixtures", return_value=[]), \
+                 patch("monitor.should_send_notification", return_value=True), \
+                 patch("monitor.send_telegram_notification", return_value=True), \
+                 patch("monitor.search_and_download_youtube_video", return_value=(downloaded_path, "https://youtu.be/tvnzvideo01")), \
+                 patch("monitor.create_vertical_short", return_value=None), \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_video_mock:
+                process_cycle(config)
+
+        send_video_mock.assert_called_once()
+        self.assertEqual(send_video_mock.call_args.args[0], downloaded_path)
 
     def test_trusted_youtube_uploader_requires_exact_channel_name(self):
         for channel_name in ("CazéTV", "CazeTV", "Cazé TV", "Caze TV", "@CazeTV", "⚽ CazéTV™"):

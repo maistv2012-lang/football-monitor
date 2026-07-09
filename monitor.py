@@ -1764,6 +1764,63 @@ def build_downloaded_video_caption(story: dict[str, Any]) -> str:
     return "\n".join(lines)[:1024]
 
 
+def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None = None, max_duration_seconds: int = 60) -> str | None:
+    """Create a Telegram-friendly vertical 9:16 MP4 short from a downloaded video."""
+    source_path = Path(video_path)
+    try:
+        if not source_path.exists() or not source_path.is_file():
+            logger.warning("Cannot create vertical short because source video was not found: %s", source_path)
+            return None
+
+        shorts_dir = Path("shorts")
+        shorts_dir.mkdir(parents=True, exist_ok=True)
+        output_path = shorts_dir / f"{source_path.stem}_vertical.mp4"
+        duration_limit = max(1, int(max_duration_seconds or 60))
+        filter_complex = (
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,boxblur=30:1[bg];"
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
+        )
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i", str(source_path),
+            "-t", str(duration_limit),
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "0:a?",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "28",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        logger.info("Creating vertical short for Telegram: %s", source_path)
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
+        if result.stderr:
+            logger.debug("ffmpeg stderr: %s", result.stderr)
+        if output_path.exists() and output_path.is_file():
+            logger.info("Created vertical short: %s", output_path)
+            return str(output_path)
+        logger.error("ffmpeg completed but vertical short was not created: %s", output_path)
+        return None
+    except subprocess.CalledProcessError as exc:
+        logger.error("ffmpeg failed to create vertical short: %s", str(exc.stderr or exc).strip())
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg timed out while creating vertical short.")
+        return None
+    except FileNotFoundError:
+        logger.error("ffmpeg command not found. Sending original downloaded video instead.")
+        return None
+    except Exception as exc:
+        logger.error("Unexpected error creating vertical short: %s", exc)
+        return None
+
+
 def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, Any]) -> bool:
     """Send a downloaded MP4 to Telegram, falling back safely when upload fails or is too large."""
     telegram_config = story.get("_telegram_config") if isinstance(story.get("_telegram_config"), dict) else load_config()
@@ -2110,7 +2167,8 @@ def process_cycle(config: dict[str, str]) -> int:
                     videos_downloaded += 1
                     logger.info("Downloaded video to %s for %s", downloaded_path, article.get("title"))
                     article["_telegram_config"] = config
-                    send_downloaded_video_to_telegram(downloaded_path, article)
+                    telegram_video_path = create_vertical_short(downloaded_path, article) or downloaded_path
+                    send_downloaded_video_to_telegram(telegram_video_path, article)
                     article.pop("_telegram_config", None)
                 else:
                     logger.info("No trusted official video downloaded for %s", article.get("title"))

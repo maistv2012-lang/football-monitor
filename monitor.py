@@ -1561,11 +1561,13 @@ def build_manual_telegram_message(grouped_article: dict[str, Any], config: dict[
     """Build a Brazilian Portuguese Telegram alert for a manual breaking-news trigger."""
     shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
     search_links = build_search_links(grouped_article)
+    article_links = grouped_article.get("links") or [""]
+    original_url = grouped_article.get("link") or article_links[0]
     return (
         "*⚡ Alerta Manual — Breaking News*\n\n"
         f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
         f"*📺 Source:* {', '.join(grouped_article.get('sources', []))}\n"
-        f"*🔗 Original URL:* {grouped_article.get('link') or grouped_article.get('links', [''])[0]}\n"
+        f"*🔗 Original URL:* {original_url}\n"
         f"*🎥 YouTube URL:* {grouped_article.get('video_url', '')}\n"
         f"*🔎 YouTube search link:* {search_links[0]}\n"
         f"*🔎 FIFA/ESPN/BBC/Google search links:* {' | '.join(search_links[1:])}\n"
@@ -1676,31 +1678,47 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         search_links = build_search_links(grouped_article)
         downloaded_video_path = grouped_article.get("downloaded_video_path", "")
         download_block = f"*💾 Vídeo baixado:* {downloaded_video_path}\n" if downloaded_video_path else ""
+        article_links = grouped_article.get("links") or [""]
+        original_url = grouped_article.get("link") or article_links[0]
+        score = shorts_pack.get("score", 0)
+        video_url = shorts_pack.get("video_url", "")
+        extra_search_links = " | ".join(search_links[1:])
+        thumbnail_frame_idea = shorts_pack.get("thumbnail_frame_idea", "")
+        heygen_narration = shorts_pack.get("heygen_narration", "")
+        description = shorts_pack.get("description", "")
+        hashtags = " ".join(shorts_pack.get("hashtags", []))
+        shorts_title = shorts_pack.get("shorts_title", "")
+        scripts = shorts_pack.get("narration_scripts", {})
+        script_30s = scripts.get("30s", "")
+        script_45s = scripts.get("45s", "")
+        script_60s = scripts.get("60s", "")
+        search_keywords = ", ".join(shorts_pack.get("search_keywords", []))
+        viral_reason = shorts_pack.get("viral_reason", "")
 
         message = (
             "*⚡ Alerta de Conteúdo — Futeba & Juninho*\n\n"
-            f"*🚨 Viral Score:* {shorts_pack.get('score', 0)}/10\n"
+            f"*🚨 Viral Score:* {score}/10\n"
             f"*📺 Source:* {sources}\n"
-            f"*🔗 Original URL:* {grouped_article.get("link") or grouped_article.get("links", [""])[0]}\n"
-            f"*🎥 Link do vídeo oficial:* {shorts_pack.get('video_url', "")}\n"
+            f"*🔗 Original URL:* {original_url}\n"
+            f"*🎥 Link do vídeo oficial:* {video_url}\n"
             f"*🔎 YouTube search link:* {search_links[0]}\n"
-            f"*🔎 FIFA/ESPN/BBC/Google search links:* {" | ".join(search_links[1:])}\n"
+            f"*🔎 FIFA/ESPN/BBC/Google search links:* {extra_search_links}\n"
             f"{download_block}"
             f"*📰 Notícia:* {notification_title}\n"
-            f"*🖼 Melhor thumbnail:* {shorts_pack.get('thumbnail_frame_idea', "")}\n"
-            f"*🎙 Narração HeyGen:* {shorts_pack.get('heygen_narration', "")}\n"
+            f"*🖼 Melhor thumbnail:* {thumbnail_frame_idea}\n"
+            f"*🎙 Narração HeyGen:* {heygen_narration}\n"
             f"*📜 Prompt para HeyGen:* {heygen_prompt}\n"
             f"*🎬 Prompt para Veo 3/Kling:* {veo_prompt}\n"
-            f"*📝 Descrição YouTube:* {shorts_pack.get('description', "")}\n"
-            f"*🏷 Hashtags:* {" ".join(shorts_pack.get('hashtags', []))}\n"
-            f"*📌 Título:* {shorts_pack.get('shorts_title', "")}\n"
+            f"*📝 Descrição YouTube:* {description}\n"
+            f"*🏷 Hashtags:* {hashtags}\n"
+            f"*📌 Título:* {shorts_title}\n"
             f"*⏱ Tempo estimado:* 30s, 45s, 60s\n"
-            f"*🎙 30s:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
-            f"*🎙 45s:* {shorts_pack.get('narration_scripts', {}).get('45s', '')}\n"
-            f"*🎙 60s:* {shorts_pack.get('narration_scripts', {}).get('60s', '')}\n"
-            f"*🔍 Search keywords:* {", ".join(shorts_pack.get('search_keywords', []))}\n"
-            f"*🔥 Potencial viral:* {shorts_pack.get('score', 0)}/10\n"
-            f"*💡 Por que vale postar:* {shorts_pack.get('viral_reason', "")}\n"
+            f"*🎙 30s:* {script_30s}\n"
+            f"*🎙 45s:* {script_45s}\n"
+            f"*🎙 60s:* {script_60s}\n"
+            f"*🔍 Search keywords:* {search_keywords}\n"
+            f"*🔥 Potencial viral:* {score}/10\n"
+            f"*💡 Por que vale postar:* {viral_reason}\n"
             f"*📰 Link da notícia:* {links}\n"
             f"*Source:* {sources}"
         ).strip()
@@ -2004,7 +2022,9 @@ def process_cycle(config: dict[str, str]) -> int:
     high_potential_articles.sort(key=lambda x: 1 if (x.get("video_url") or x.get("video_id")) else 0, reverse=True)
 
     for article in high_potential_articles:
-        alert_key = f"{article.get("title","").strip()}::{article.get("score",0)}"
+        alert_title = article.get("title", "").strip()
+        alert_score = article.get("score", 0)
+        alert_key = f"{alert_title}::{alert_score}"
         if alert_key in seen_alert_keys:
             logger.info("Skipping duplicate alert for %s", article.get("title"))
             continue

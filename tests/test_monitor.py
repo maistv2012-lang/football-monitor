@@ -876,6 +876,62 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("--playlist-end", command)
         self.assertEqual(command[command.index("--playlist-end") + 1], "2")
 
+    def test_tvnz_discovery_scans_30_videos_by_default(self):
+        completed = type("Completed", (), {
+            "stdout": json.dumps({"id": "tvnz1", "title": "Portugal match highlights", "channel": "TVNZ Sport"}),
+            "stderr": "",
+        })()
+
+        with patch("monitor.get_feeds", return_value={}), \
+             patch.dict(os.environ, {}, clear=True), \
+             patch("monitor.subprocess.run", return_value=completed) as run_mock:
+            videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
+
+        self.assertEqual([video["id"] for video in videos], ["tvnz1"])
+        command = run_mock.call_args.args[0]
+        self.assertIn("https://www.youtube.com/@TVNZSport/videos", command)
+        self.assertEqual(command[command.index("--playlist-end") + 1], "30")
+
+    def test_tvnz_discovery_accepts_multiple_new_match_highlights(self):
+        completed = type("Completed", (), {
+            "stdout": "\n".join([
+                json.dumps({"id": "tvnz1", "title": "Portugal v Spain Match Highlights", "channel": "TVNZ Sport"}),
+                json.dumps({"id": "tvnz2", "title": "France v Brazil Quarter Final", "channel": "TVNZ Sport"}),
+                json.dumps({"id": "tvnz3", "title": "Argentina penalties shootout", "channel": "TVNZ Sport"}),
+            ]),
+            "stderr": "",
+        })()
+
+        with patch("monitor.subprocess.run", return_value=completed):
+            videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
+
+        self.assertEqual([video["id"] for video in videos], ["tvnz1", "tvnz2", "tvnz3"])
+
+    def test_tvnz_discovery_processes_newest_videos_first(self):
+        completed = type("Completed", (), {
+            "stdout": "\n".join([
+                json.dumps({"id": "old", "title": "Old Match Highlights", "channel": "TVNZ Sport", "upload_date": "20260708"}),
+                json.dumps({"id": "new", "title": "New Match Highlights", "channel": "TVNZ Sport", "upload_date": "20260710"}),
+                json.dumps({"id": "middle", "title": "Middle Match Highlights", "channel": "TVNZ Sport", "upload_date": "20260709"}),
+            ]),
+            "stderr": "",
+        })()
+
+        with patch("monitor.subprocess.run", return_value=completed):
+            videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
+
+        self.assertEqual([video["id"] for video in videos], ["new", "middle", "old"])
+
+    def test_non_highlight_tvnz_videos_are_rejected(self):
+        for title in (
+            "Coach interview after quarter final",
+            "World Cup preview show",
+            "TVNZ Sport live training session",
+            "Full match replay Portugal v Spain",
+        ):
+            with self.subTest(title=title):
+                self.assertFalse(is_tvnz_highlight_video({"channel": "TVNZ Sport", "title": title}))
+
     def test_duplicate_tvnz_video_is_not_downloaded_twice(self):
         alerts = [{"alert_type": "tvnz_download", "video_id": "tvnz1", "video_url": "https://youtube.com/watch?v=tvnz1"}]
         with patch("monitor.discover_tvnz_sport_videos", return_value=[{
@@ -889,6 +945,69 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(count, 0)
         download_mock.assert_not_called()
+
+    def test_tvnz_max_downloads_per_run_is_respected(self):
+        with TemporaryDirectory() as temp_dir:
+            downloaded_path = str(Path(temp_dir) / "tvnz.mp4")
+            moments_path = str(Path(temp_dir) / "tvnz_moments.mp4")
+            vertical_path = str(Path(temp_dir) / "tvnz_vertical.mp4")
+            Path(downloaded_path).write_bytes(b"mp4")
+            Path(moments_path).write_bytes(b"moments")
+            Path(vertical_path).write_bytes(b"short")
+            alerts: list[dict] = []
+            videos = [
+                {"id": f"tvnz{index}", "title": f"Match Highlights {index}", "channel": "TVNZ Sport", "webpage_url": f"https://youtube.com/watch?v=tvnz{index}"}
+                for index in range(1, 4)
+            ]
+            config = {
+                "downloads_dir": Path(temp_dir),
+                "yt_dlp_bin": "yt-dlp",
+                "telegram_bot_token": "TEST_TOKEN",
+                "telegram_chat_id": "123",
+                "tvnz_max_downloads_per_run": 2,
+            }
+
+            with patch("monitor.discover_tvnz_sport_videos", return_value=videos), \
+                 patch("monitor.download_youtube_video", return_value=downloaded_path) as download_mock, \
+                 patch("monitor.create_best_moments_clip", return_value=moments_path), \
+                 patch("monitor.create_vertical_short", return_value=vertical_path), \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=True):
+                count = download_new_tvnz_sport_highlights(config, alerts)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(download_mock.call_count, 2)
+        self.assertEqual([alert["video_id"] for alert in alerts], ["tvnz1", "tvnz2"])
+
+    def test_failed_tvnz_telegram_delivery_is_not_marked_processed(self):
+        with TemporaryDirectory() as temp_dir:
+            downloaded_path = str(Path(temp_dir) / "tvnz.mp4")
+            moments_path = str(Path(temp_dir) / "tvnz_moments.mp4")
+            vertical_path = str(Path(temp_dir) / "tvnz_vertical.mp4")
+            Path(downloaded_path).write_bytes(b"mp4")
+            Path(moments_path).write_bytes(b"moments")
+            Path(vertical_path).write_bytes(b"short")
+            alerts: list[dict] = []
+            config = {
+                "downloads_dir": Path(temp_dir),
+                "yt_dlp_bin": "yt-dlp",
+                "telegram_bot_token": "TEST_TOKEN",
+                "telegram_chat_id": "123",
+            }
+
+            with patch("monitor.discover_tvnz_sport_videos", return_value=[{
+                "id": "tvnz1",
+                "title": "Portugal v Spain Match Highlights",
+                "channel": "TVNZ Sport",
+                "webpage_url": "https://youtube.com/watch?v=tvnz1",
+            }]), \
+                 patch("monitor.download_youtube_video", return_value=downloaded_path), \
+                 patch("monitor.create_best_moments_clip", return_value=moments_path), \
+                 patch("monitor.create_vertical_short", return_value=vertical_path), \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=False):
+                count = download_new_tvnz_sport_highlights(config, alerts)
+
+        self.assertEqual(count, 0)
+        self.assertEqual(alerts, [])
 
     def test_downloaded_tvnz_video_is_converted_and_sent_as_vertical(self):
         with TemporaryDirectory() as temp_dir:

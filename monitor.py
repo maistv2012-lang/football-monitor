@@ -110,11 +110,16 @@ TRUSTED_YOUTUBE_CHANNELS = set(TRUSTED_YOUTUBE_CHANNEL_ORDER)
 DOWNLOAD_BLOCKED_CHANNELS = {"cazetv"}
 YOUTUBE_DOWNLOAD_CHANNEL = "TVNZ Sport"
 DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport/videos"
-TVNZ_BACKFILL_LIMIT_DEFAULT = 5
+TVNZ_SCAN_LIMIT_DEFAULT = 30
+TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
-    "highlights",
     "match highlights",
+    "highlights",
     "extended highlights",
+    "quarter final",
+    "round of 16",
+    "fifa world cup",
+    "world cup",
     "goals",
     "every goal",
     "penalty",
@@ -133,6 +138,7 @@ TVNZ_REJECTED_VIDEO_TERMS = (
     "podcast",
     "live",
     "full match",
+    "training",
     "betting",
 )
 YOUTUBE_DOWNLOAD_TITLE_TERMS = ("match highlights", "extended highlights", "highlights")
@@ -2406,12 +2412,48 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
         return False
 
 
-def parse_tvnz_backfill_limit(value: Any) -> int:
-    """Parse the first-run TVNZ download cap."""
+def _parse_positive_int(value: Any, default: int) -> int:
     try:
-        return max(1, int(value or TVNZ_BACKFILL_LIMIT_DEFAULT))
+        return max(1, int(value or default))
     except (TypeError, ValueError):
-        return TVNZ_BACKFILL_LIMIT_DEFAULT
+        return default
+
+
+def parse_tvnz_scan_limit(config: dict[str, Any]) -> int:
+    """Parse how many recent TVNZ videos to inspect."""
+    return _parse_positive_int(
+        config.get("tvnz_scan_limit")
+        or os.getenv("TVNZ_SCAN_LIMIT")
+        or config.get("tvnz_backfill_limit"),
+        TVNZ_SCAN_LIMIT_DEFAULT,
+    )
+
+
+def parse_tvnz_max_downloads_per_run(config: dict[str, Any]) -> int:
+    """Parse how many new TVNZ highlights may be downloaded in one cycle."""
+    return _parse_positive_int(
+        config.get("tvnz_max_downloads_per_run")
+        or os.getenv("TVNZ_MAX_DOWNLOADS_PER_RUN"),
+        TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT,
+    )
+
+
+def _tvnz_newest_sort_value(metadata: dict[str, Any], original_index: int) -> tuple[int, int]:
+    """Sort newest first when yt-dlp provides dates, otherwise keep page order."""
+    for key in ("timestamp", "release_timestamp", "modified_timestamp"):
+        try:
+            value = int(float(metadata.get(key) or 0))
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            return value, -original_index
+    upload_date = re.sub(r"\D", "", str(metadata.get("upload_date") or ""))
+    if upload_date:
+        try:
+            return int(upload_date), -original_index
+        except ValueError:
+            pass
+    return 0, -original_index
 
 
 def get_tvnz_youtube_channel_url(config: dict[str, Any]) -> str:
@@ -2446,18 +2488,18 @@ def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
     """Discover recent TVNZ Sport videos only."""
     yt_dlp_bin = str(config.get("yt_dlp_bin", YT_DLP_BIN))
     source_url = get_tvnz_youtube_channel_url(config)
-    backfill_limit = parse_tvnz_backfill_limit(config.get("tvnz_backfill_limit", TVNZ_BACKFILL_LIMIT_DEFAULT))
+    scan_limit = parse_tvnz_scan_limit(config)
     command = [
         yt_dlp_bin,
         source_url,
         "--dump-json",
         "--flat-playlist",
         "--playlist-end",
-        str(backfill_limit),
+        str(scan_limit),
         "--no-warnings",
         "--quiet",
     ]
-    logger.info("Discovering recent TVNZ Sport videos from %s (limit=%s)", source_url, backfill_limit)
+    logger.info("Discovering recent TVNZ Sport videos from %s (scan_limit=%s)", source_url, scan_limit)
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30, **SUBPROCESS_TEXT_KWARGS)
     except subprocess.TimeoutExpired:
@@ -2470,7 +2512,8 @@ def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
         logger.error("yt-dlp command not found. Cannot discover TVNZ Sport videos.")
         return []
 
-    videos: list[dict[str, Any]] = []
+    scanned_videos: list[dict[str, Any]] = []
+    matched_videos: list[tuple[int, dict[str, Any]]] = []
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
@@ -2481,8 +2524,17 @@ def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
         metadata.setdefault("channel", YOUTUBE_DOWNLOAD_CHANNEL)
         metadata.setdefault("uploader", YOUTUBE_DOWNLOAD_CHANNEL)
         metadata["webpage_url"] = _video_url_from_metadata(metadata)
+        original_index = len(scanned_videos)
+        scanned_videos.append(metadata)
         if is_tvnz_highlight_video(metadata):
-            videos.append(metadata)
+            matched_videos.append((original_index, metadata))
+    matched_videos.sort(key=lambda item: _tvnz_newest_sort_value(item[1], item[0]), reverse=True)
+    videos = [metadata for _index, metadata in matched_videos]
+    logger.info(
+        "TVNZ Sport scan summary: scanned=%s matched_highlights=%s",
+        len(scanned_videos),
+        len(videos),
+    )
     return videos
 
 
@@ -2502,17 +2554,35 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
     downloaded_ids, downloaded_urls = downloaded_tvnz_video_keys(alerts)
     downloads_dir = Path(config.get("downloads_dir", DOWNLOADS_DIR))
     yt_dlp_bin = str(config.get("yt_dlp_bin", YT_DLP_BIN))
+    max_downloads = parse_tvnz_max_downloads_per_run(config)
     downloaded_count = 0
+    matched_videos = discover_tvnz_sport_videos(config)
+    selected_videos: list[tuple[dict[str, Any], str, str]] = []
+    already_processed_count = 0
 
-    for video in discover_tvnz_sport_videos(config):
+    for video in matched_videos:
         video_url = _video_url_from_metadata(video)
         video_id = str(video.get("id") or extract_youtube_video_id(video_url) or "").strip()
         duplicate_by_id = bool(video_id and video_id in downloaded_ids)
         duplicate_by_url = bool(video_url and video_url in downloaded_urls)
         if duplicate_by_id or duplicate_by_url:
-            logger.info("Skipping already downloaded TVNZ Sport video: %s", video.get("title", ""))
+            already_processed_count += 1
             continue
+        if len(selected_videos) >= max_downloads:
+            continue
+        selected_videos.append((video, video_url, video_id))
 
+    logger.info(
+        "TVNZ Sport download plan: matched=%s already_processed=%s selected_for_download=%s max_per_run=%s",
+        len(matched_videos),
+        already_processed_count,
+        len(selected_videos),
+        max_downloads,
+    )
+    for video, video_url, _video_id in selected_videos:
+        logger.info("Selected TVNZ Sport video: %s | %s", video.get("title", ""), video_url)
+
+    for video, video_url, video_id in selected_videos:
         try:
             downloaded_path = download_youtube_video(video_url, downloads_dir, yt_dlp_bin)
         except GeoRestrictedVideoError:
@@ -2545,8 +2615,11 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
             final_size = telegram_path.stat().st_size
             story["final_video_file_size_bytes"] = final_size
             logger.info("Final Telegram video file size: %s bytes", final_size)
-        send_downloaded_video_to_telegram(telegram_video_path, story)
+        telegram_sent = send_downloaded_video_to_telegram(telegram_video_path, story)
         story.pop("_telegram_config", None)
+        if not telegram_sent:
+            logger.warning("Telegram delivery failed for TVNZ Sport video; leaving unprocessed for retry: %s", video_url)
+            continue
 
         alerts.append({
             "alert_type": "tvnz_download",

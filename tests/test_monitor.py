@@ -29,6 +29,7 @@ from monitor import (
     classify_story_content,
     create_best_moments_clip,
     create_vertical_short,
+    detect_audio_peak_timestamps,
     discover_tvnz_sport_videos,
     download_new_tvnz_sport_highlights,
     download_youtube_video,
@@ -466,6 +467,8 @@ class MonitorTests(unittest.TestCase):
                 "content_category": "MATCH_HIGHLIGHT",
                 "links": ["https://example.com/story"],
                 "vertical_short_path": "shorts/clip_vertical.mp4",
+                "short_metadata_path": "shorts/clip_vertical.txt",
+                "moments_duration_seconds": 44.0,
                 "_telegram_config": {"telegram_bot_token": "TEST_TOKEN", "telegram_chat_id": "123"},
             }
 
@@ -478,6 +481,9 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("TVNZ Sport", post_mock.call_args.kwargs["data"]["caption"])
         self.assertIn("MATCH_HIGHLIGHT", post_mock.call_args.kwargs["data"]["caption"])
         self.assertIn("clip_vertical.mp4", post_mock.call_args.kwargs["data"]["caption"])
+        self.assertIn("Duration: 44.0s", post_mock.call_args.kwargs["data"]["caption"])
+        self.assertIn("File size:", post_mock.call_args.kwargs["data"]["caption"])
+        self.assertIn("clip_vertical.txt", post_mock.call_args.kwargs["data"]["caption"])
         self.assertIn("https://example.com/story", post_mock.call_args.kwargs["data"]["caption"])
 
     def test_downloaded_video_falls_back_to_senddocument(self):
@@ -674,10 +680,11 @@ class MonitorTests(unittest.TestCase):
     def test_build_short_metadata_returns_expected_fields(self):
         metadata = build_short_metadata(
             {
-                "title": "Argentina score a dramatic late winner against Egypt in extra time",
+                "title": "Argentina vs Egypt dramatic late winner match highlights",
                 "sources": ["TVNZ Sport"],
                 "content_category": "GOAL_CLIP",
                 "hashtags": ["#Futebol", "#ShortsFutebol"],
+                "video_url": "https://youtube.com/watch?v=tvnz1",
             },
             Path("shorts") / "clip_vertical.mp4",
         )
@@ -685,8 +692,45 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("title", metadata)
         self.assertIn("description", metadata)
         self.assertIn("hashtags", metadata)
+        self.assertIn("pinned_comment", metadata)
         self.assertIn("TVNZ Sport", metadata["description"])
-        self.assertIn("clip_vertical.mp4", metadata["description"])
+        self.assertIn("https://youtube.com/watch?v=tvnz1", metadata["description"])
+        self.assertIn("#WorldCup", metadata["hashtags"])
+        self.assertIn("#Futeba", metadata["hashtags"])
+        self.assertIn("#Argentina", metadata["hashtags"])
+        self.assertIn("#Egypt", metadata["hashtags"])
+
+    def test_short_metadata_txt_includes_youtube_fields(self):
+        with TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                video_path = Path("downloads") / "clip.mp4"
+                video_path.parent.mkdir()
+                video_path.write_bytes(b"mp4")
+
+                def fake_run(command, **kwargs):
+                    Path(command[-1]).write_bytes(b"short")
+                    return type("Result", (), {"stderr": ""})()
+
+                story = {
+                    "title": "Argentina vs Egypt match highlights",
+                    "sources": ["TVNZ Sport"],
+                    "video_url": "https://youtube.com/watch?v=tvnz1",
+                }
+                with patch("monitor.find_short_font_path", return_value=None), \
+                     patch("monitor.subprocess.run", side_effect=fake_run):
+                    output = create_vertical_short(video_path, story)
+                metadata_text = Path("shorts/clip_vertical.txt").read_text(encoding="utf-8")
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(output, str(Path("shorts") / "clip_vertical.mp4"))
+        self.assertIn("Title:", metadata_text)
+        self.assertIn("Description:", metadata_text)
+        self.assertIn("Hashtags:", metadata_text)
+        self.assertIn("Pinned comment:", metadata_text)
+        self.assertIn("clip_vertical.txt", story["short_metadata_path"])
 
     def test_create_best_moments_clip_long_video_creates_moments_file(self):
         with TemporaryDirectory() as temp_dir:
@@ -700,6 +744,8 @@ class MonitorTests(unittest.TestCase):
                 def fake_run(command, **kwargs):
                     if command[0] == "ffprobe":
                         return type("Result", (), {"stdout": "120.0\n", "stderr": ""})()
+                    if command[0] == "ffmpeg" and "astats" in " ".join(command):
+                        return type("Result", (), {"stdout": "", "stderr": ""})()
                     if command[0] == "ffmpeg" and "select=gt" in " ".join(command):
                         return type("Result", (), {"stdout": "", "stderr": ""})()
                     Path(command[-1]).write_bytes(b"moments")
@@ -725,21 +771,43 @@ class MonitorTests(unittest.TestCase):
         run_mock.assert_not_called()
 
     def test_selected_moments_total_duration_is_limited(self):
-        segments = select_best_moment_segments(150.0, [5, 45, 90, 130], max_total_seconds=45)
+        segments = select_best_moment_segments(150.0, [5, 45, 90, 130], max_total_seconds=50)
 
         total_duration = sum(end - start for start, end in segments)
-        self.assertLessEqual(total_duration, 45.0)
+        self.assertLessEqual(total_duration, 50.0)
         self.assertLessEqual(len(segments), 2)
 
     def test_selected_moments_include_padding_before_and_after_timestamp(self):
-        segments = select_best_moment_segments(120.0, [50.0], max_total_seconds=45)
+        segments = select_best_moment_segments(120.0, [50.0], max_total_seconds=50)
 
-        self.assertEqual(segments, [(43.0, 62.0)])
+        self.assertEqual(segments, [(42.0, 64.0)])
 
     def test_overlapping_moment_segments_are_merged(self):
-        segments = select_best_moment_segments(120.0, [50.0, 55.0], max_total_seconds=45)
+        segments = select_best_moment_segments(120.0, [50.0, 55.0], max_total_seconds=50)
 
-        self.assertEqual(segments, [(43.0, 67.0)])
+        self.assertEqual(segments, [(42.0, 69.0)])
+
+    def test_audio_peak_timestamps_are_converted_into_padded_segments(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "clip.mp4"
+            video_path.write_bytes(b"mp4")
+            astats_output = "\n".join([
+                "frame:1 pts:100 pts_time:20.0",
+                "lavfi.astats.Overall.RMS_level=-28.0",
+                "frame:2 pts:200 pts_time:50.0",
+                "lavfi.astats.Overall.RMS_level=-8.0",
+                "frame:3 pts:300 pts_time:85.0",
+                "lavfi.astats.Overall.RMS_level=-11.0",
+            ])
+
+            with patch("monitor.subprocess.run", return_value=type("Result", (), {"stdout": "", "stderr": astats_output})()):
+                timestamps = detect_audio_peak_timestamps(video_path, 120.0, limit=2)
+
+        self.assertEqual(timestamps, [50.0, 85.0])
+        self.assertEqual(
+            select_best_moment_segments(120.0, timestamps, max_total_seconds=50),
+            [(42.0, 64.0), (77.0, 99.0)],
+        )
 
     def test_create_best_moments_clip_falls_back_to_natural_windows(self):
         with TemporaryDirectory() as temp_dir:
@@ -754,6 +822,8 @@ class MonitorTests(unittest.TestCase):
                 def fake_run(command, **kwargs):
                     if command[0] == "ffprobe":
                         return type("Result", (), {"stdout": "100.0\n", "stderr": ""})()
+                    if command[0] == "ffmpeg" and "astats" in " ".join(command):
+                        raise subprocess.CalledProcessError(1, command, stderr="audio failed")
                     if command[0] == "ffmpeg" and "select=gt" in " ".join(command):
                         raise subprocess.CalledProcessError(1, command, stderr="scene failed")
                     captured_filters.append(" ".join(command))
@@ -766,8 +836,8 @@ class MonitorTests(unittest.TestCase):
                 os.chdir(old_cwd)
 
         self.assertEqual(output, str(Path("shorts") / "tvnz_moments.mp4"))
-        self.assertTrue(any("trim=start=28.0:end=47.0" in command for command in captured_filters))
-        self.assertTrue(any("trim=start=63.0:end=82.0" in command for command in captured_filters))
+        self.assertTrue(any("trim=start=27.0:end=49.0" in command for command in captured_filters))
+        self.assertTrue(any("trim=start=62.0:end=84.0" in command for command in captured_filters))
 
     def test_tvnz_highlight_video_is_accepted(self):
         self.assertTrue(is_tvnz_highlight_video({

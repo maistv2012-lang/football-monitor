@@ -1803,13 +1803,28 @@ def build_downloaded_video_caption(story: dict[str, Any]) -> str:
         or story.get("downloaded_video_path")
         or ""
     )).name
+    metadata_file_name = Path(str(story.get("short_metadata_path") or "")).name
+    duration_seconds = story.get("final_video_duration_seconds") or story.get("moments_duration_seconds")
+    if isinstance(duration_seconds, (int, float)) and duration_seconds > 0:
+        duration_text = f"{float(duration_seconds):.1f}s"
+    else:
+        duration_text = "unknown"
+    file_size_bytes = story.get("final_video_file_size_bytes")
+    if isinstance(file_size_bytes, (int, float)) and file_size_bytes >= 0:
+        file_size_text = f"{float(file_size_bytes) / (1024 * 1024):.2f} MB"
+    else:
+        file_size_text = "unknown"
     lines = [
         f"Title: {story.get('title', '')}",
         f"Source: {sources or story.get('source', '') or story.get('official_source', '')}",
         f"Category: {story.get('content_category', '') or 'UNKNOWN'}",
+        f"Duration: {duration_text}",
+        f"File size: {file_size_text}",
     ]
     if short_file_name:
         lines.append(f"Short file: {short_file_name}")
+    if metadata_file_name:
+        lines.append(f"Metadata: {metadata_file_name}")
     if original_url:
         lines.append(f"Original URL: {original_url}")
     return "\n".join(lines)[:1024]
@@ -1832,6 +1847,32 @@ def _escape_drawtext_text(value: Any) -> str:
     text = text.replace(",", r"\,")
     text = text.replace("%", r"\%")
     return text
+
+
+def _extract_teams_from_title(title: str) -> list[str]:
+    """Best-effort team extraction from common football title phrasing."""
+    clean_title = re.sub(r"\b(?:match|extended)?\s*highlights?\b", " ", str(title or ""), flags=re.IGNORECASE)
+    clean_title = re.sub(r"\s+", " ", clean_title).strip(" -|")
+    match = re.search(r"\b([A-Z][A-Za-zÀ-ÿ .'-]{2,35})\s+(?:vs\.?|v\.?|versus|against)\s+([A-Z][A-Za-zÀ-ÿ .'-]{2,35})", clean_title)
+    if not match:
+        return []
+    teams = []
+    for value in match.groups():
+        team = re.sub(r"\s+", " ", value).strip(" -|:.,")
+        team = re.split(
+            r"\b(?:dramatic|late|winner|goal|goals|score|scores|scored|in|at|after|before|highlights?)\b",
+            team,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" -|:.,")
+        if team and len(team) <= 35:
+            teams.append(team)
+    return teams
+
+
+def _hashtag_from_team(team: str) -> str:
+    tag = re.sub(r"[^A-Za-z0-9À-ÿ]", "", team)
+    return f"#{tag}" if tag else ""
 
 
 def find_short_font_path() -> Path | None:
@@ -1872,23 +1913,45 @@ def _drawtext_filter(text: str, x: str, y: str, fontsize: int, font_path: str | 
 
 def build_short_metadata(story: dict[str, Any], vertical_path: str | Path) -> dict[str, Any]:
     """Build companion metadata for the generated vertical short."""
-    title = _shorten_short_text(story.get("shorts_title") or story.get("title") or Path(vertical_path).stem, 70)
+    raw_title = str(story.get("shorts_title") or story.get("title") or Path(vertical_path).stem).strip()
+    base_title = re.sub(r"\b(?:match|extended)\s+highlights?\b", "Highlights", raw_title, flags=re.IGNORECASE)
+    title = _shorten_short_text(base_title.rstrip("!?.") + "!", 70)
     sources = ", ".join(str(source) for source in story.get("sources", []) if str(source))
-    source = sources or story.get("source") or story.get("official_source") or "Fonte oficial"
-    category = story.get("content_category") or "UNKNOWN"
-    hashtags = story.get("hashtags") or ["#Futebol", "#ShortsFutebol", "#Futeba"]
+    source = sources or story.get("source") or story.get("official_source") or YOUTUBE_DOWNLOAD_CHANNEL
+    original_url = (
+        story.get("original_video_url")
+        or story.get("video_url")
+        or story.get("webpage_url")
+        or story.get("link")
+        or next((link for link in story.get("links", []) if link), "")
+    )
+    hook = story.get("short_hook") or "Qual foi o melhor momento?"
+    hashtags = story.get("hashtags") or ["#Futebol", "#ShortsFutebol", "#WorldCup", "#Futeba"]
     if isinstance(hashtags, str):
         hashtags = [tag for tag in hashtags.split() if tag]
+    else:
+        hashtags = list(hashtags)
+    for required_tag in ("#Futebol", "#ShortsFutebol", "#WorldCup", "#Futeba"):
+        if required_tag not in hashtags:
+            hashtags.append(required_tag)
+    for team in _extract_teams_from_title(raw_title):
+        team_tag = _hashtag_from_team(team)
+        if team_tag and team_tag not in hashtags:
+            hashtags.append(team_tag)
+    hashtag_text = " ".join(str(tag) for tag in hashtags if str(tag))
+    pinned_comment = story.get("pinned_comment") or "Qual foi o melhor momento? Comenta ai."
     description = (
-        f"{title}\n\n"
+        f"{hook}\n\n"
         f"Fonte: {source}\n"
-        f"Categoria: {category}\n"
-        f"Arquivo: {Path(vertical_path).name}"
+        f"Original: {original_url or 'TVNZ Sport'}\n"
+        f"Arquivo: {Path(vertical_path).name}\n\n"
+        f"{hashtag_text}"
     )
     return {
         "title": title,
         "description": description,
         "hashtags": hashtags,
+        "pinned_comment": pinned_comment,
     }
 
 
@@ -1905,9 +1968,12 @@ def _write_short_metadata_file(story: dict[str, Any], vertical_path: str | Path)
             "",
             f"Hashtags: {hashtags}",
             "",
+            f"Pinned comment: {metadata.get('pinned_comment', '')}",
+            "",
         ]),
         encoding="utf-8",
     )
+    story["short_metadata_path"] = str(metadata_path)
     logger.info("Saved short metadata: %s", metadata_path)
 
 
@@ -2044,6 +2110,52 @@ def detect_scene_change_timestamps(video_path: str | Path, duration_seconds: flo
     return timestamps
 
 
+def detect_audio_peak_timestamps(video_path: str | Path, duration_seconds: float, limit: int = 8) -> list[float]:
+    """Detect likely excitement moments from high audio energy using ffmpeg astats."""
+    safe_start = 2.0 if duration_seconds > 5 else 0.0
+    safe_end = max(safe_start, duration_seconds - 2.0) if duration_seconds > 8 else duration_seconds
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i", str(video_path),
+        "-vn",
+        "-af", "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+        "-f", "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=90, **SUBPROCESS_TEXT_KWARGS)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+
+    candidates: list[tuple[float, float]] = []
+    current_timestamp: float | None = None
+    output = f"{result.stdout}\n{result.stderr}"
+    for line in output.splitlines():
+        timestamp_match = re.search(r"pts_time:([0-9]+(?:\.[0-9]+)?)", line)
+        if timestamp_match:
+            current_timestamp = float(timestamp_match.group(1))
+            continue
+        level_match = re.search(r"lavfi\.astats\.Overall\.RMS_level=([-+]?(?:inf|nan|[0-9]+(?:\.[0-9]+)?))", line, flags=re.IGNORECASE)
+        if not level_match or current_timestamp is None:
+            continue
+        level_text = level_match.group(1).lower()
+        if level_text in {"inf", "+inf", "-inf", "nan"}:
+            continue
+        timestamp = current_timestamp
+        if safe_start <= timestamp <= safe_end:
+            candidates.append((timestamp, float(level_text)))
+        current_timestamp = None
+
+    selected: list[float] = []
+    for timestamp, _level in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if all(abs(timestamp - selected_timestamp) >= 10.0 for selected_timestamp in selected):
+            selected.append(round(timestamp, 2))
+        if len(selected) >= limit:
+            break
+    return sorted(selected)
+
+
 def merge_moment_segments(segments: list[tuple[float, float]]) -> list[tuple[float, float]]:
     """Merge overlapping or touching moment windows."""
     if not segments:
@@ -2059,7 +2171,7 @@ def merge_moment_segments(segments: list[tuple[float, float]]) -> list[tuple[flo
     return [(round(start, 2), round(end, 2)) for start, end in merged]
 
 
-def clamp_centered_segment(center: float, duration: float, before_seconds: float = 7.0, after_seconds: float = 12.0) -> tuple[float, float]:
+def clamp_centered_segment(center: float, duration: float, before_seconds: float = 8.0, after_seconds: float = 14.0) -> tuple[float, float]:
     """Create one padded segment around a moment center."""
     safe_start = 2.0 if duration > 24 else 0.0
     safe_end = max(safe_start + 1.0, duration - 2.0) if duration > 8 else duration
@@ -2097,16 +2209,16 @@ def limit_segments_total_duration(segments: list[tuple[float, float]], max_total
     return [(round(start, 2), round(end, 2)) for start, end in limited if end > start]
 
 
-def select_best_moment_segments(duration_seconds: float, scene_timestamps: list[float] | None = None, max_total_seconds: int = 45) -> list[tuple[float, float]]:
+def select_best_moment_segments(duration_seconds: float, moment_timestamps: list[float] | None = None, max_total_seconds: int = 50) -> list[tuple[float, float]]:
     """Select natural football segments around moment centers."""
     duration = max(0.0, float(duration_seconds or 0))
-    max_total = max(1.0, float(max_total_seconds or 45))
+    max_total = max(1.0, float(max_total_seconds or 50))
     if duration <= 0:
         return []
 
     safe_start = 2.0 if duration > 24 else 0.0
     safe_end = max(safe_start + 1.0, duration - 2.0) if duration > 8 else duration
-    centers = [timestamp for timestamp in (scene_timestamps or []) if safe_start <= timestamp <= safe_end]
+    centers = [timestamp for timestamp in (moment_timestamps or []) if safe_start <= timestamp <= safe_end]
     if centers:
         target_centers = [duration * 0.35, duration * 0.70]
         selected_centers: list[float] = []
@@ -2188,7 +2300,7 @@ def _create_start_moments_clip(source_path: Path, output_path: Path, duration_se
     return None
 
 
-def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | None = None, max_total_seconds: int = 45) -> str | None:
+def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | None = None, max_total_seconds: int = 50) -> str | None:
     """Create a short horizontal best-moments MP4 before vertical conversion."""
     source_path = Path(video_path)
     story = story or {}
@@ -2199,23 +2311,31 @@ def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | Non
 
         duration = probe_video_duration_seconds(source_path)
         logger.info("Original TVNZ highlight duration: %s seconds", round(duration, 2) if duration else "unknown")
-        max_total = max(1, int(max_total_seconds or 45))
+        max_total = max(1, int(max_total_seconds or 50))
         if duration is not None and duration <= max_total:
             logger.info("Source is already short enough for Telegram moments: %s", source_path)
             story["moments_clip_path"] = str(source_path)
+            story["moments_duration_seconds"] = duration
             return str(source_path)
 
         shorts_dir = Path("shorts")
         shorts_dir.mkdir(parents=True, exist_ok=True)
         output_path = shorts_dir / f"{source_path.stem}_moments.mp4"
-        scene_timestamps = detect_scene_change_timestamps(source_path, duration or float(max_total * 3))
-        segments = select_best_moment_segments(duration or float(max_total * 3), scene_timestamps, max_total)
+        working_duration = duration or float(max_total * 3)
+        audio_timestamps = detect_audio_peak_timestamps(source_path, working_duration)
+        for timestamp in audio_timestamps[:2]:
+            logger.info("Selected audio peak timestamp: %s", timestamp)
+        moment_timestamps = audio_timestamps
+        if not moment_timestamps:
+            moment_timestamps = detect_scene_change_timestamps(source_path, working_duration)
+        segments = select_best_moment_segments(working_duration, moment_timestamps, max_total)
         for start, end in segments:
             logger.info("Selected moment segment: start=%s end=%s", start, end)
         try:
             if segments and _run_moments_concat_command(source_path, output_path, segments):
                 logger.info("Created best moments clip: %s", output_path)
                 story["moments_clip_path"] = str(output_path)
+                story["moments_duration_seconds"] = sum(end - start for start, end in segments)
                 return str(output_path)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
             logger.warning("Best moments concat failed. Falling back to a 35-second clip: %s", exc)
@@ -2223,6 +2343,7 @@ def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | Non
         fallback_path = _create_start_moments_clip(source_path, output_path, duration, max_total)
         if fallback_path:
             story["moments_clip_path"] = fallback_path
+            story["moments_duration_seconds"] = min(35.0, float(max_total))
         return fallback_path
     except Exception as exc:
         logger.error("Unexpected error creating best moments clip: %s", exc)
@@ -2244,7 +2365,9 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
         if not path.exists() or not path.is_file():
             logger.warning("Downloaded video file not found for Telegram delivery: %s", path)
             return False
-        if path.stat().st_size > TELEGRAM_VIDEO_FILE_LIMIT_BYTES:
+        file_size = path.stat().st_size
+        story["final_video_file_size_bytes"] = file_size
+        if file_size > TELEGRAM_VIDEO_FILE_LIMIT_BYTES:
             message = (
                 "Vídeo baixado no PC, mas muito grande para enviar pelo Telegram.\n"
                 f"Caminho local: {path}"
@@ -2416,9 +2539,12 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
         telegram_video_path = create_vertical_short(vertical_input_path, story) or moments_clip_path
         if telegram_video_path != vertical_input_path and not story.get("vertical_short_path"):
             story["vertical_short_path"] = str(telegram_video_path)
+        story["final_video_duration_seconds"] = story.get("moments_duration_seconds")
         telegram_path = Path(telegram_video_path)
         if telegram_path.exists():
-            logger.info("Final Telegram video file size: %s bytes", telegram_path.stat().st_size)
+            final_size = telegram_path.stat().st_size
+            story["final_video_file_size_bytes"] = final_size
+            logger.info("Final Telegram video file size: %s bytes", final_size)
         send_downloaded_video_to_telegram(telegram_video_path, story)
         story.pop("_telegram_config", None)
 

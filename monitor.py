@@ -82,6 +82,7 @@ def build_priority_youtube_queries() -> list[str]:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("football-monitor")
+SUBPROCESS_TEXT_KWARGS = {"encoding": "utf-8", "errors": "replace"}
 
 TRUSTED_YOUTUBE_CHANNEL_ORDER = [
     "fifa",
@@ -1796,7 +1797,12 @@ def build_downloaded_video_caption(story: dict[str, Any]) -> str:
     """Build a compact caption for a downloaded video sent to Telegram."""
     sources = ", ".join(str(source) for source in story.get("sources", []) if str(source))
     original_url = story.get("link") or next((link for link in story.get("links", []) if link), "")
-    short_file_name = Path(str(story.get("vertical_short_path") or story.get("downloaded_video_path") or "")).name
+    short_file_name = Path(str(
+        story.get("vertical_short_path")
+        or story.get("moments_clip_path")
+        or story.get("downloaded_video_path")
+        or ""
+    )).name
     lines = [
         f"Title: {story.get('title', '')}",
         f"Source: {sources or story.get('source', '') or story.get('official_source', '')}",
@@ -1956,7 +1962,7 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
         command = command_base + ["-filter_complex", filter_complex] + command_tail
         logger.info("Creating vertical short for Telegram: %s", source_path)
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
+            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180, **SUBPROCESS_TEXT_KWARGS)
         except subprocess.CalledProcessError as exc:
             if not font_path:
                 raise
@@ -1968,7 +1974,7 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
                 "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
             )
             command = command_base + ["-filter_complex", filter_complex] + command_tail
-            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180)
+            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180, **SUBPROCESS_TEXT_KWARGS)
         if result.stderr:
             logger.debug("ffmpeg stderr: %s", result.stderr)
         if output_path.exists() and output_path.is_file():
@@ -1989,6 +1995,189 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
         return None
     except Exception as exc:
         logger.error("Unexpected error creating vertical short: %s", exc)
+        return None
+
+
+def probe_video_duration_seconds(video_path: str | Path) -> float | None:
+    """Return video duration in seconds using ffprobe."""
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30, **SUBPROCESS_TEXT_KWARGS)
+        return float(str(result.stdout or "").strip())
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError, ValueError) as exc:
+        logger.warning("Could not probe video duration for %s: %s", video_path, exc)
+        return None
+
+
+def detect_scene_change_timestamps(video_path: str | Path, duration_seconds: float, limit: int = 20) -> list[float]:
+    """Try to find scene-change timestamps with ffmpeg, returning an empty list on failure."""
+    safe_start = 2.0 if duration_seconds > 5 else 0.0
+    safe_end = max(safe_start, duration_seconds - 3.0) if duration_seconds > 8 else duration_seconds
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i", str(video_path),
+        "-vf", r"select=gt(scene\,0.35),showinfo",
+        "-an",
+        "-f", "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=60, **SUBPROCESS_TEXT_KWARGS)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+
+    output = f"{result.stdout}\n{result.stderr}"
+    timestamps: list[float] = []
+    for match in re.finditer(r"pts_time:([0-9]+(?:\.[0-9]+)?)", output):
+        timestamp = float(match.group(1))
+        if safe_start <= timestamp <= safe_end:
+            timestamps.append(timestamp)
+        if len(timestamps) >= limit:
+            break
+    return timestamps
+
+
+def select_best_moment_segments(duration_seconds: float, scene_timestamps: list[float] | None = None, max_total_seconds: int = 35) -> list[tuple[float, float]]:
+    """Select short segments spread across a longer highlight video."""
+    duration = max(0.0, float(duration_seconds or 0))
+    max_total = max(1.0, float(max_total_seconds or 35))
+    safe_start = 2.0 if duration > 5 else 0.0
+    safe_end = max(safe_start + 1.0, duration - 3.0) if duration > 8 else duration
+    usable = max(1.0, safe_end - safe_start)
+    segment_count = 4 if usable >= 40 and max_total >= 28 else 3
+    segment_length = min(10.0, max(7.0, max_total / segment_count))
+    segment_length = min(segment_length, usable / segment_count if usable < segment_count * segment_length else segment_length)
+    segment_length = max(1.0, segment_length)
+
+    anchors = [timestamp for timestamp in (scene_timestamps or []) if safe_start <= timestamp <= safe_end]
+    if len(anchors) >= segment_count:
+        step = len(anchors) / segment_count
+        starts = [anchors[min(len(anchors) - 1, int(round(index * step)))] for index in range(segment_count)]
+    else:
+        if segment_count == 1:
+            starts = [safe_start]
+        else:
+            available_start_span = max(0.0, usable - segment_length)
+            starts = [safe_start + (available_start_span * index / (segment_count - 1)) for index in range(segment_count)]
+
+    segments: list[tuple[float, float]] = []
+    for start in starts:
+        bounded_start = min(max(safe_start, start), max(safe_start, safe_end - segment_length))
+        end = min(safe_end, bounded_start + segment_length)
+        if end > bounded_start:
+            segments.append((round(bounded_start, 2), round(end, 2)))
+
+    total_duration = sum(end - start for start, end in segments)
+    if total_duration > max_total:
+        scale = max_total / total_duration
+        segments = [(start, round(start + ((end - start) * scale), 2)) for start, end in segments]
+    return segments
+
+
+def _run_moments_concat_command(source_path: Path, output_path: Path, segments: list[tuple[float, float]]) -> bool:
+    filter_parts: list[str] = []
+    concat_inputs: list[str] = []
+    for index, (start, end) in enumerate(segments):
+        filter_parts.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{index}]")
+        filter_parts.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{index}]")
+        concat_inputs.append(f"[v{index}][a{index}]")
+    filter_complex = ";".join(filter_parts + [f"{''.join(concat_inputs)}concat=n={len(segments)}:v=1:a=1[v][a]"])
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", str(source_path),
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        "-map", "[a]",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "30",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180, **SUBPROCESS_TEXT_KWARGS)
+    if result.stderr:
+        logger.debug("ffmpeg moments stderr: %s", result.stderr)
+    return output_path.exists() and output_path.is_file()
+
+
+def _create_start_moments_clip(source_path: Path, output_path: Path, duration_seconds: float | None, max_total_seconds: int) -> str | None:
+    start_offset = 2.0 if not duration_seconds or duration_seconds > 5 else 0.0
+    clip_duration = min(30.0, float(max_total_seconds or 35))
+    if duration_seconds:
+        clip_duration = max(1.0, min(clip_duration, max(1.0, duration_seconds - start_offset)))
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(round(start_offset, 2)),
+        "-i", str(source_path),
+        "-t", str(round(clip_duration, 2)),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "30",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=120, **SUBPROCESS_TEXT_KWARGS)
+        if result.stderr:
+            logger.debug("ffmpeg fallback moments stderr: %s", result.stderr)
+        if output_path.exists() and output_path.is_file():
+            logger.info("Created fallback best moments clip: %s", output_path)
+            return str(output_path)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        logger.error("Fallback best moments clip failed for %s: %s", source_path, exc)
+    return None
+
+
+def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | None = None, max_total_seconds: int = 35) -> str | None:
+    """Create a short horizontal best-moments MP4 before vertical conversion."""
+    source_path = Path(video_path)
+    story = story or {}
+    try:
+        if not source_path.exists() or not source_path.is_file():
+            logger.warning("Cannot create best moments clip because source video was not found: %s", source_path)
+            return None
+
+        duration = probe_video_duration_seconds(source_path)
+        logger.info("Original TVNZ highlight duration: %s seconds", round(duration, 2) if duration else "unknown")
+        max_total = max(1, int(max_total_seconds or 35))
+        if duration is not None and duration <= max_total:
+            logger.info("Source is already short enough for Telegram moments: %s", source_path)
+            story["moments_clip_path"] = str(source_path)
+            return str(source_path)
+
+        shorts_dir = Path("shorts")
+        shorts_dir.mkdir(parents=True, exist_ok=True)
+        output_path = shorts_dir / f"{source_path.stem}_moments.mp4"
+        scene_timestamps = detect_scene_change_timestamps(source_path, duration or float(max_total * 3))
+        segments = select_best_moment_segments(duration or float(max_total * 3), scene_timestamps, max_total)
+        logger.info("Selected best moments segments: %s", segments)
+        try:
+            if segments and _run_moments_concat_command(source_path, output_path, segments):
+                logger.info("Created best moments clip: %s", output_path)
+                story["moments_clip_path"] = str(output_path)
+                return str(output_path)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            logger.warning("Best moments concat failed. Falling back to a 30-second clip: %s", exc)
+
+        fallback_path = _create_start_moments_clip(source_path, output_path, duration, max_total)
+        if fallback_path:
+            story["moments_clip_path"] = fallback_path
+        return fallback_path
+    except Exception as exc:
+        logger.error("Unexpected error creating best moments clip: %s", exc)
         return None
 
 
@@ -2099,7 +2288,7 @@ def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
     ]
     logger.info("Discovering recent TVNZ Sport videos from %s (limit=%s)", source_url, backfill_limit)
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30, **SUBPROCESS_TEXT_KWARGS)
     except subprocess.TimeoutExpired:
         logger.warning("TVNZ Sport video discovery timed out.")
         return []
@@ -2174,9 +2363,14 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
             "downloaded_video_path": downloaded_path,
             "_telegram_config": config,
         }
-        telegram_video_path = create_vertical_short(downloaded_path, story) or downloaded_path
-        if telegram_video_path != downloaded_path and not story.get("vertical_short_path"):
+        moments_clip_path = create_best_moments_clip(downloaded_path, story) or downloaded_path
+        vertical_input_path = moments_clip_path
+        telegram_video_path = create_vertical_short(vertical_input_path, story) or moments_clip_path
+        if telegram_video_path != vertical_input_path and not story.get("vertical_short_path"):
             story["vertical_short_path"] = str(telegram_video_path)
+        telegram_path = Path(telegram_video_path)
+        if telegram_path.exists():
+            logger.info("Final Telegram video file size: %s bytes", telegram_path.stat().st_size)
         send_downloaded_video_to_telegram(telegram_video_path, story)
         story.pop("_telegram_config", None)
 
@@ -2188,6 +2382,7 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
             "video_url": video_url,
             "video_id": video_id,
             "downloaded_video_path": downloaded_path,
+            "moments_clip_path": story.get("moments_clip_path", ""),
             "vertical_short_path": story.get("vertical_short_path", ""),
         })
         if video_id:
@@ -2554,7 +2749,7 @@ def download_youtube_video(video_url: str, output_path: Path, yt_dlp_bin: str = 
             video_url,
         ]
         logger.info("Executing yt-dlp command: %s", " ".join(command))
-        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=120)
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=120, **SUBPROCESS_TEXT_KWARGS)
         logger.info("yt-dlp stdout: %s", result.stdout)
         if result.stderr:
             logger.warning("yt-dlp stderr: %s", result.stderr)
@@ -2651,7 +2846,7 @@ def search_and_download_youtube_video(
             ]
             try:
                 metadata_result = subprocess.run(
-                    metadata_command, capture_output=True, text=True, check=True, timeout=20
+                    metadata_command, capture_output=True, text=True, check=True, timeout=20, **SUBPROCESS_TEXT_KWARGS
                 )
             except subprocess.TimeoutExpired:
                 logger.warning("Article video inspection timed out. Falling back to YouTube search.")
@@ -2738,7 +2933,7 @@ def search_and_download_youtube_video(
             ]
             logger.debug("Executing yt-dlp search command: %s", " ".join(search_command))
             search_result = subprocess.run(
-                search_command, capture_output=True, text=True, check=True, timeout=20
+                search_command, capture_output=True, text=True, check=True, timeout=20, **SUBPROCESS_TEXT_KWARGS
             )
             video_metadata.extend(
                 json.loads(line) for line in search_result.stdout.strip().split('\n') if line.strip()

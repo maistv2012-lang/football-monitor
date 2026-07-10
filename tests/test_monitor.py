@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from monitor import (
     GeoRestrictedVideoError,
@@ -27,6 +27,7 @@ from monitor import (
     build_x_telegram_message,
     calculate_viral_score,
     classify_story_content,
+    create_best_moments_clip,
     create_vertical_short,
     discover_tvnz_sport_videos,
     download_new_tvnz_sport_highlights,
@@ -47,6 +48,7 @@ from monitor import (
     send_downloaded_video_to_telegram,
     send_telegram_notification,
     should_send_notification,
+    select_best_moment_segments,
     validate_highlight_candidate,
     validate_youtube_download_candidate,
 )
@@ -686,6 +688,76 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("TVNZ Sport", metadata["description"])
         self.assertIn("clip_vertical.mp4", metadata["description"])
 
+    def test_create_best_moments_clip_long_video_creates_moments_file(self):
+        with TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                video_path = Path("downloads") / "tvnz.mp4"
+                video_path.parent.mkdir()
+                video_path.write_bytes(b"mp4")
+
+                def fake_run(command, **kwargs):
+                    if command[0] == "ffprobe":
+                        return type("Result", (), {"stdout": "120.0\n", "stderr": ""})()
+                    if command[0] == "ffmpeg" and "select=gt" in " ".join(command):
+                        return type("Result", (), {"stdout": "", "stderr": ""})()
+                    Path(command[-1]).write_bytes(b"moments")
+                    return type("Result", (), {"stdout": "", "stderr": ""})()
+
+                with patch("monitor.subprocess.run", side_effect=fake_run):
+                    output = create_best_moments_clip(video_path, {"title": "TVNZ highlights"})
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(output, str(Path("shorts") / "tvnz_moments.mp4"))
+
+    def test_create_best_moments_clip_short_video_uses_original_directly(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "short.mp4"
+            video_path.write_bytes(b"mp4")
+
+            with patch("monitor.probe_video_duration_seconds", return_value=28.0), \
+                 patch("monitor.subprocess.run") as run_mock:
+                output = create_best_moments_clip(video_path, {"title": "Short clip"})
+
+        self.assertEqual(output, str(video_path))
+        run_mock.assert_not_called()
+
+    def test_selected_moments_total_duration_is_limited(self):
+        segments = select_best_moment_segments(150.0, [5, 45, 90, 130], max_total_seconds=35)
+
+        total_duration = sum(end - start for start, end in segments)
+        self.assertLessEqual(total_duration, 35.0)
+        self.assertGreaterEqual(len(segments), 3)
+
+    def test_create_best_moments_clip_falls_back_to_evenly_spaced_segments(self):
+        with TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            os.chdir(temp_dir)
+            try:
+                video_path = Path("downloads") / "tvnz.mp4"
+                video_path.parent.mkdir()
+                video_path.write_bytes(b"mp4")
+                captured_filters: list[str] = []
+
+                def fake_run(command, **kwargs):
+                    if command[0] == "ffprobe":
+                        return type("Result", (), {"stdout": "100.0\n", "stderr": ""})()
+                    if command[0] == "ffmpeg" and "select=gt" in " ".join(command):
+                        raise subprocess.CalledProcessError(1, command, stderr="scene failed")
+                    captured_filters.append(" ".join(command))
+                    Path(command[-1]).write_bytes(b"moments")
+                    return type("Result", (), {"stdout": "", "stderr": ""})()
+
+                with patch("monitor.subprocess.run", side_effect=fake_run):
+                    output = create_best_moments_clip(video_path, {"title": "TVNZ highlights"})
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertEqual(output, str(Path("shorts") / "tvnz_moments.mp4"))
+        self.assertTrue(any("trim=start=2.0" in command for command in captured_filters))
+
     def test_tvnz_highlight_video_is_accepted(self):
         self.assertTrue(is_tvnz_highlight_video({
             "channel": "TVNZ Sport",
@@ -740,8 +812,10 @@ class MonitorTests(unittest.TestCase):
     def test_downloaded_tvnz_video_is_converted_and_sent_as_vertical(self):
         with TemporaryDirectory() as temp_dir:
             downloaded_path = str(Path(temp_dir) / "tvnz.mp4")
+            moments_path = str(Path(temp_dir) / "tvnz_moments.mp4")
             vertical_path = str(Path(temp_dir) / "tvnz_vertical.mp4")
             Path(downloaded_path).write_bytes(b"mp4")
+            Path(moments_path).write_bytes(b"moments")
             Path(vertical_path).write_bytes(b"short")
             alerts: list[dict] = []
             config = {
@@ -758,16 +832,51 @@ class MonitorTests(unittest.TestCase):
                 "webpage_url": "https://youtube.com/watch?v=tvnz1",
             }]), \
                  patch("monitor.download_youtube_video", return_value=downloaded_path), \
+                 patch("monitor.create_best_moments_clip", return_value=moments_path) as moments_mock, \
                  patch("monitor.create_vertical_short", return_value=vertical_path) as short_mock, \
                  patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_mock:
                 count = download_new_tvnz_sport_highlights(config, alerts)
 
         self.assertEqual(count, 1)
+        moments_mock.assert_called_once_with(downloaded_path, ANY)
         short_mock.assert_called_once()
+        self.assertEqual(short_mock.call_args.args[0], moments_path)
         send_mock.assert_called_once()
         self.assertEqual(send_mock.call_args.args[0], vertical_path)
+        self.assertNotEqual(send_mock.call_args.args[0], downloaded_path)
         self.assertEqual(alerts[0]["video_id"], "tvnz1")
         self.assertEqual(alerts[0]["video_url"], "https://youtube.com/watch?v=tvnz1")
+
+    def test_vertical_failure_sends_moments_clip_not_original(self):
+        with TemporaryDirectory() as temp_dir:
+            downloaded_path = str(Path(temp_dir) / "tvnz.mp4")
+            moments_path = str(Path(temp_dir) / "tvnz_moments.mp4")
+            Path(downloaded_path).write_bytes(b"mp4")
+            Path(moments_path).write_bytes(b"moments")
+            alerts: list[dict] = []
+            config = {
+                "downloads_dir": Path(temp_dir),
+                "yt_dlp_bin": "yt-dlp",
+                "telegram_bot_token": "TEST_TOKEN",
+                "telegram_chat_id": "123",
+            }
+
+            with patch("monitor.discover_tvnz_sport_videos", return_value=[{
+                "id": "tvnz1",
+                "title": "Portugal v Spain extended highlights",
+                "channel": "TVNZ Sport",
+                "webpage_url": "https://youtube.com/watch?v=tvnz1",
+            }]), \
+                 patch("monitor.download_youtube_video", return_value=downloaded_path), \
+                 patch("monitor.create_best_moments_clip", return_value=moments_path), \
+                 patch("monitor.create_vertical_short", return_value=None), \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_mock:
+                count = download_new_tvnz_sport_highlights(config, alerts)
+
+        self.assertEqual(count, 1)
+        send_mock.assert_called_once()
+        self.assertEqual(send_mock.call_args.args[0], moments_path)
+        self.assertNotEqual(send_mock.call_args.args[0], downloaded_path)
 
     def test_bbc_espn_alerts_do_not_trigger_broad_youtube_search(self):
         with TemporaryDirectory() as temp_dir:
@@ -818,8 +927,10 @@ class MonitorTests(unittest.TestCase):
     def test_process_cycle_sends_vertical_file_when_created(self):
         with TemporaryDirectory() as temp_dir:
             downloaded_path = str(Path(temp_dir) / "downloaded.mp4")
+            moments_path = str(Path(temp_dir) / "downloaded_moments.mp4")
             vertical_path = str(Path(temp_dir) / "vertical.mp4")
             Path(downloaded_path).write_bytes(b"mp4")
+            Path(moments_path).write_bytes(b"moments")
             Path(vertical_path).write_bytes(b"short")
             config = {
                 "state_file": Path(temp_dir) / "state.json",
@@ -856,6 +967,7 @@ class MonitorTests(unittest.TestCase):
                      "webpage_url": "https://youtu.be/tvnzvideo01",
                  }]), \
                  patch("monitor.download_youtube_video", return_value=downloaded_path), \
+                 patch("monitor.create_best_moments_clip", return_value=moments_path), \
                  patch("monitor.create_vertical_short", return_value=vertical_path), \
                  patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_video_mock:
                 process_cycle(config)
@@ -866,7 +978,9 @@ class MonitorTests(unittest.TestCase):
     def test_process_cycle_falls_back_to_original_when_vertical_creation_fails(self):
         with TemporaryDirectory() as temp_dir:
             downloaded_path = str(Path(temp_dir) / "downloaded.mp4")
+            moments_path = str(Path(temp_dir) / "downloaded_moments.mp4")
             Path(downloaded_path).write_bytes(b"mp4")
+            Path(moments_path).write_bytes(b"moments")
             config = {
                 "state_file": Path(temp_dir) / "state.json",
                 "alerts_file": Path(temp_dir) / "alerts.json",
@@ -902,12 +1016,13 @@ class MonitorTests(unittest.TestCase):
                      "webpage_url": "https://youtu.be/tvnzvideo01",
                  }]), \
                  patch("monitor.download_youtube_video", return_value=downloaded_path), \
+                 patch("monitor.create_best_moments_clip", return_value=moments_path), \
                  patch("monitor.create_vertical_short", return_value=None), \
                  patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_video_mock:
                 process_cycle(config)
 
         send_video_mock.assert_called_once()
-        self.assertEqual(send_video_mock.call_args.args[0], downloaded_path)
+        self.assertEqual(send_video_mock.call_args.args[0], moments_path)
 
     def test_trusted_youtube_uploader_requires_exact_channel_name(self):
         for channel_name in ("CazéTV", "CazeTV", "Cazé TV", "Caze TV", "@CazeTV", "⚽ CazéTV™"):

@@ -11,6 +11,7 @@ from unittest.mock import ANY, patch
 
 from monitor import (
     GeoRestrictedVideoError,
+    VideoDownloadBlockedError,
     _format_drawtext_font_path,
     attach_article_to_match,
     build_article_key,
@@ -39,6 +40,7 @@ from monitor import (
     discover_x_posts,
     find_short_font_path,
     group_articles,
+    handle_manual_only_video_source,
     is_cazetv_discussion_content,
     is_download_eligible_title,
     is_live_goal_event,
@@ -53,6 +55,7 @@ from monitor import (
     select_official_youtube_candidate,
     select_official_video_sources,
     send_downloaded_video_to_telegram,
+    send_manual_open_alert,
     send_telegram_notification,
     should_send_notification,
     select_best_moment_segments,
@@ -1014,26 +1017,78 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(video["channel"], "FIFA")
         run_mock.assert_not_called()
 
-    def test_geo_blocked_tvnz_triggers_official_feed_fallback(self):
+    def test_geo_blocked_tvnz_sends_manual_open_alert_without_retry(self):
         tvnz_video = {
             "id": "tvnz1", "title": "Portugal v Spain Match Highlights | FIFA World Cup",
             "channel": "TVNZ Sport", "webpage_url": "https://youtube.com/watch?v=tvnz1",
         }
-        fifa_video = {
-            "id": "fifa1", "title": tvnz_video["title"], "channel": "FIFA",
-            "webpage_url": "https://youtube.com/watch?v=fifa1",
-        }
         with patch.dict(os.environ, {"RUNNER_COUNTRY_OVERRIDE": "NZ"}, clear=True), \
              patch("monitor.discover_tvnz_sport_videos", return_value=[tvnz_video]), \
-             patch("monitor.download_youtube_video", side_effect=[GeoRestrictedVideoError(), None]) as download_mock, \
-             patch("monitor.discover_official_fallback_video", return_value=fifa_video) as fallback_mock:
+             patch("monitor.download_youtube_video", side_effect=GeoRestrictedVideoError()) as download_mock, \
+             patch("monitor.send_manual_open_alert", return_value=True) as manual_mock:
             count = download_new_tvnz_sport_highlights(
                 {"downloads_dir": Path("downloads"), "fifa_youtube_channel_id": "FIFA123"}, [],
             )
 
         self.assertEqual(count, 0)
-        self.assertEqual(download_mock.call_args_list[1].args[0], "https://youtube.com/watch?v=fifa1")
-        fallback_mock.assert_called_once()
+        download_mock.assert_called_once()
+        self.assertEqual(manual_mock.call_args.args[0]["status"], "geo-blocked")
+
+    def test_bot_block_sends_manual_open_alert_without_retry(self):
+        video = {
+            "id": "tvnz1", "title": "Portugal Match Highlights", "channel": "TVNZ Sport",
+            "webpage_url": "https://youtube.com/watch?v=tvnz1",
+        }
+        with patch.dict(os.environ, {"RUNNER_COUNTRY_OVERRIDE": "NZ"}, clear=True), \
+             patch("monitor.discover_tvnz_sport_videos", return_value=[video]), \
+             patch("monitor.download_youtube_video", side_effect=VideoDownloadBlockedError()) as download_mock, \
+             patch("monitor.send_manual_open_alert", return_value=True) as manual_mock:
+            count = download_new_tvnz_sport_highlights({"downloads_dir": Path("downloads")}, [])
+
+        self.assertEqual(count, 0)
+        download_mock.assert_called_once()
+        self.assertEqual(manual_mock.call_args.args[0]["status"], "YouTube bot verification")
+
+    def test_manual_social_platforms_send_alert_only(self):
+        cases = (
+            ("https://x.com/FIFA/status/1", "X/Twitter"),
+            ("https://www.tiktok.com/@fifa/video/2", "TikTok"),
+            ("https://www.instagram.com/reel/3", "Instagram"),
+        )
+        for url, platform in cases:
+            with self.subTest(platform=platform), \
+                 patch("monitor.send_manual_open_alert", return_value=True) as alert_mock:
+                sent = handle_manual_only_video_source(
+                    {"title": "Football highlight", "source": "FIFA", "url": url}, {},
+                )
+            self.assertTrue(sent)
+            self.assertEqual(alert_mock.call_args.args[0]["platform"], platform)
+
+    def test_manual_open_alert_has_inline_button_and_skips_duplicate_url(self):
+        response = type("Response", (), {"status_code": 200})()
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": Path(temp_dir) / "manual_links.json",
+            }
+            video = {
+                "id": "video1", "title": "Portugal Match Highlights", "source": "FIFA",
+                "url": "https://youtube.com/watch?v=video1", "status": "geo-blocked",
+            }
+            with patch("monitor.requests.post", return_value=response) as post_mock, \
+                 self.assertLogs("football-monitor", level="INFO") as captured:
+                first = send_manual_open_alert(video, config)
+                second = send_manual_open_alert(video, config)
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(post_mock.call_count, 1)
+        payload = post_mock.call_args.kwargs["json"]
+        self.assertEqual(payload["reply_markup"]["inline_keyboard"][0][0], {
+            "text": "ABRIR VÍDEO", "url": "https://youtube.com/watch?v=video1",
+        })
+        self.assertIn("Video found. Open manually using the link below.", payload["text"])
+        self.assertIn("Duplicate manual link skipped", "\n".join(captured.output))
 
     def test_unofficial_sources_are_not_in_region_registry(self):
         sources = select_official_video_sources("US", {"fifa_youtube_channel_id": "FIFA123"})

@@ -118,6 +118,12 @@ RUNNER_LOCATION_URL = "https://ipinfo.io/json"
 OFFICIAL_SOURCE_UNAVAILABLE_MESSAGE = (
     "Official highlight found, but no downloadable official source is available for this runner country."
 )
+MANUAL_LINKS_FILE = Path(__file__).resolve().with_name("manual_links.json")
+MANUAL_OPEN_MESSAGE = "Video found. Open manually using the link below."
+BOT_VERIFICATION_TERMS = (
+    "sign in to confirm you're not a bot", "sign in to confirm you are not a bot",
+    "confirm you’re not a bot", "bot verification", "cookies-from-browser",
+)
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -253,6 +259,10 @@ GEO_RESTRICTION_TERMS = (
 
 class GeoRestrictedVideoError(RuntimeError):
     """Raised when an official YouTube upload cannot be accessed in this region."""
+
+
+class VideoDownloadBlockedError(RuntimeError):
+    """Raised when an official download requires manual browser verification."""
 
 UNOFFICIAL_VIDEO_TERMS = {
     "ai generated", "ai-generated", "ai video", "compilation", "fan edit",
@@ -2421,6 +2431,157 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
         return False
 
 
+def video_platform_from_url(url: str) -> str:
+    normalized = str(url or "").casefold()
+    if "youtu.be" in normalized or "youtube.com" in normalized:
+        return "YouTube"
+    if "x.com" in normalized or "twitter.com" in normalized:
+        return "X/Twitter"
+    if "tiktok.com" in normalized:
+        return "TikTok"
+    if "instagram.com" in normalized:
+        return "Instagram"
+    return "Web"
+
+
+def load_manual_links(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    path = Path((config or {}).get("manual_links_file", MANUAL_LINKS_FILE))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def save_manual_links(links: list[dict[str, Any]], config: dict[str, Any] | None = None) -> None:
+    path = Path((config or {}).get("manual_links_file", MANUAL_LINKS_FILE))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(links[-50:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_manual_open_payload(video: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    url = str(video.get("url") or video.get("webpage_url") or video.get("video_url") or "").strip()
+    title = str(video.get("title") or "Football video").strip()
+    source = str(video.get("source") or video.get("channel") or video.get("uploader") or "Unknown").strip()
+    platform = str(video.get("platform") or video_platform_from_url(url)).strip()
+    status = str(video.get("status") or "manual open required").strip()
+    text = (
+        f"{MANUAL_OPEN_MESSAGE}\n\n"
+        f"Title: {title}\nSource: {source}\nPlatform: {platform}\n"
+        f"Original URL: {url}\nStatus: {status}"
+    )
+    return {
+        "chat_id": str(config.get("telegram_chat_id", "") or ""),
+        "text": text,
+        "disable_web_page_preview": False,
+        "reply_markup": {"inline_keyboard": [[{"text": "ABRIR VÍDEO", "url": url}]]},
+    }
+
+
+def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Persist and send a manual-only video link, suppressing duplicate alerts."""
+    url = str(video.get("url") or video.get("webpage_url") or video.get("video_url") or "").strip()
+    video_id = str(video.get("id") or video.get("video_id") or extract_youtube_video_id(url) or "").strip()
+    if not url:
+        return False
+    recent = load_manual_links(config)
+    if any(
+        str(item.get("url") or "").strip() == url
+        or bool(video_id and str(item.get("video_id") or "").strip() == video_id)
+        for item in recent
+    ):
+        logger.info("Duplicate manual link skipped: %s", url)
+        return False
+    token = str(config.get("telegram_bot_token", "") or "")
+    if not token or not config.get("telegram_chat_id"):
+        logger.warning("Telegram credentials are not configured. Manual link not sent: %s", url)
+        return False
+    payload = build_manual_open_payload(video, config)
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json=payload,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            return False
+    except requests.RequestException:
+        return False
+    recent.append({
+        "title": str(video.get("title") or "Football video"),
+        "source": str(video.get("source") or video.get("channel") or video.get("uploader") or "Unknown"),
+        "platform": str(video.get("platform") or video_platform_from_url(url)),
+        "url": url,
+        "video_id": video_id,
+        "status": str(video.get("status") or "manual open required"),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save_manual_links(recent, config)
+    logger.info("Manual open link sent: %s", url)
+    return True
+
+
+def handle_manual_only_video_source(video: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Route X, TikTok, Instagram, and unsupported sources to manual-open only."""
+    manual_video = dict(video)
+    url = str(manual_video.get("url") or manual_video.get("webpage_url") or "")
+    platform = video_platform_from_url(url)
+    manual_video["platform"] = platform
+    manual_video.setdefault("status", "manual source" if platform in {"X/Twitter", "TikTok", "Instagram"} else "unsupported source")
+    return send_manual_open_alert(manual_video, config)
+
+
+def handle_telegram_command(command: str, config: dict[str, Any]) -> bool:
+    command = str(command or "").split("@", 1)[0].strip().casefold()
+    if command == "/clear_links":
+        save_manual_links([], config)
+        message = "Recent manual video links cleared."
+    elif command == "/open_links":
+        links = load_manual_links(config)
+        message = "Recent manual-open video links:\n" + "\n".join(
+            f"- {item.get('title', 'Video')} ({item.get('source', 'Unknown')}): {item.get('url', '')}"
+            for item in links[-10:]
+        ) if links else "No recent manual-open video links."
+    else:
+        return False
+    token = str(config.get("telegram_bot_token", "") or "")
+    if not token or not config.get("telegram_chat_id"):
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": config["telegram_chat_id"], "text": message},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def process_telegram_commands(config: dict[str, Any]) -> None:
+    """Process manual-link commands once without blocking monitor execution."""
+    token = str(config.get("telegram_bot_token", "") or "")
+    if not token:
+        return
+    endpoint = f"https://api.telegram.org/bot{token}/getUpdates"
+    try:
+        response = requests.get(endpoint, params={"timeout": 0}, timeout=10)
+        if response.status_code != 200:
+            return
+        updates = response.json().get("result", [])
+        max_update_id = 0
+        for update in updates:
+            max_update_id = max(max_update_id, int(update.get("update_id") or 0))
+            message = update.get("message", {}) or {}
+            if str(message.get("chat", {}).get("id", "")) != str(config.get("telegram_chat_id", "")):
+                continue
+            handle_telegram_command(str(message.get("text") or ""), config)
+        if max_update_id:
+            requests.get(endpoint, params={"offset": max_update_id + 1, "timeout": 0}, timeout=10)
+    except (requests.RequestException, ValueError, TypeError):
+        logger.warning("Telegram command polling failed; monitoring will continue.")
+
+
 def _parse_positive_int(value: Any, default: int) -> int:
     try:
         return max(1, int(value or default))
@@ -2834,7 +2995,9 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
                 str(video.get("title") or ""), runner_country, config, {YOUTUBE_DOWNLOAD_CHANNEL},
             )
             if not fallback_video:
-                send_official_source_unavailable_alert(config)
+                send_manual_open_alert({
+                    **video, "url": video_url, "status": "unsupported source for runner country",
+                }, config)
                 continue
             download_video = fallback_video
             download_url = _video_url_from_metadata(fallback_video)
@@ -2842,21 +3005,20 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
             downloaded_path = download_youtube_video(download_url, downloads_dir, yt_dlp_bin)
         except GeoRestrictedVideoError:
             logger.warning("Official video download is geo-restricted: %s", download_url)
-            fallback_video = discover_official_fallback_video(
-                str(video.get("title") or ""), runner_country, config,
-                {str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL)},
-            )
-            if not fallback_video:
-                send_official_source_unavailable_alert(config)
-                continue
-            download_video = fallback_video
-            download_url = _video_url_from_metadata(fallback_video)
-            try:
-                downloaded_path = download_youtube_video(download_url, downloads_dir, yt_dlp_bin)
-            except GeoRestrictedVideoError:
-                send_official_source_unavailable_alert(config)
-                continue
+            send_manual_open_alert({
+                **download_video, "url": download_url, "status": "geo-blocked",
+            }, config)
+            continue
+        except VideoDownloadBlockedError:
+            logger.warning("Official video download requires bot verification: %s", download_url)
+            send_manual_open_alert({
+                **download_video, "url": download_url, "status": "YouTube bot verification",
+            }, config)
+            continue
         if not downloaded_path:
+            send_manual_open_alert({
+                **download_video, "url": download_url, "status": "download failed",
+            }, config)
             continue
 
         story = {
@@ -3152,7 +3314,12 @@ def process_cycle(config: dict[str, str]) -> int:
         if notification_sent:
             try:
                 for x_post in discover_x_posts(article, config)[:3]:
-                    send_x_discovery_notification(x_post, config)
+                    handle_manual_only_video_source({
+                        "title": x_post.get("text", "X football video"),
+                        "source": x_post.get("account_name", "X/Twitter"),
+                        "url": x_post.get("url", ""),
+                        "status": "manual source",
+                    }, config)
             except Exception:
                 logger.warning("X discovery failed unexpectedly; monitoring will continue.")
             if not debug_mode:
@@ -3295,6 +3462,8 @@ def download_youtube_video(video_url: str, output_path: Path, yt_dlp_bin: str = 
     except subprocess.CalledProcessError as exc:
         if is_geo_restriction_error(exc.stderr):
             raise GeoRestrictedVideoError(str(exc.stderr or "")) from None
+        if any(term in str(exc.stderr or "").casefold() for term in BOT_VERIFICATION_TERMS):
+            raise VideoDownloadBlockedError(str(exc.stderr or "")) from None
         logger.error("yt-dlp failed to download %s: %s (stderr: %s)", video_url, exc, exc.stderr)
         return None
     except subprocess.TimeoutExpired:
@@ -3602,6 +3771,7 @@ def main() -> int:
         return 0
 
     if "--once" in args:
+        process_telegram_commands(config)
         process_cycle(config)
         return 0
 

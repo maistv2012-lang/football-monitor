@@ -112,6 +112,7 @@ YOUTUBE_DOWNLOAD_CHANNEL = "TVNZ Sport"
 DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport/videos"
 FALLBACK_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport"
 TVNZ_YOUTUBE_CHANNEL_ID = "UCY8jpWswn6c3kpaHijtBUAg"
+FIFA_YOUTUBE_CHANNEL_ID = "UCpcTrCXblq78GZrTUTLWeBw"
 TVNZ_YOUTUBE_RSS_URL_TEMPLATE = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 RUNNER_LOCATION_URL = "https://ipinfo.io/json"
 OFFICIAL_SOURCE_UNAVAILABLE_MESSAGE = (
@@ -2489,11 +2490,11 @@ def get_official_video_source_registry(config: dict[str, Any]) -> list[dict[str,
         },
         {
             "name": "FIFA",
-            "countries": ["GLOBAL"],
+            "countries": ["GLOBAL", "US"],
             "channel_id": str(
                 config.get("fifa_youtube_channel_id")
                 or os.getenv("FIFA_YOUTUBE_CHANNEL_ID", "")
-                or ""
+                or FIFA_YOUTUBE_CHANNEL_ID
             ).strip(),
         },
     ]
@@ -2501,13 +2502,20 @@ def get_official_video_source_registry(config: dict[str, Any]) -> list[dict[str,
 
 def select_official_video_sources(country: str, config: dict[str, Any]) -> list[dict[str, Any]]:
     country = str(country or "").upper()
-    sources = [
-        source for source in get_official_video_source_registry(config)
-        if source.get("channel_id") and (
-            "GLOBAL" in source.get("countries", []) or country in source.get("countries", [])
-        )
-    ]
-    logger.info("Selected official video source group: %s", ", ".join(source["name"] for source in sources) or "none")
+    registry = [source for source in get_official_video_source_registry(config) if source.get("channel_id")]
+    country_sources = [source for source in registry if country and country in source.get("countries", [])]
+    global_sources = [source for source in registry if "GLOBAL" in source.get("countries", [])]
+    sources: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for source in country_sources + global_sources:
+        identity = channel_identity(source["name"])
+        if identity not in seen_names:
+            sources.append(source)
+            seen_names.add(identity)
+    source_names = ", ".join(source["name"] for source in sources) or "none"
+    group = "country-specific + GLOBAL" if country_sources and global_sources else "GLOBAL" if global_sources else "none"
+    logger.info("Selected official video source group: %s", group)
+    logger.info("Selected official sources: %s", source_names)
     return sources
 
 

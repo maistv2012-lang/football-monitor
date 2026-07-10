@@ -978,11 +978,24 @@ class MonitorTests(unittest.TestCase):
 
     def test_nz_runner_selects_tvnz_official_source(self):
         sources = select_official_video_sources("NZ", {})
-        self.assertEqual(sources[0]["name"], "TVNZ Sport")
+        self.assertEqual([source["name"] for source in sources], ["TVNZ Sport", "FIFA"])
 
     def test_non_nz_runner_does_not_select_tvnz(self):
-        sources = select_official_video_sources("US", {"fifa_youtube_channel_id": "FIFA123"})
+        sources = select_official_video_sources("US", {})
         self.assertEqual([source["name"] for source in sources], ["FIFA"])
+
+    def test_global_source_is_used_without_country_specific_source(self):
+        sources = select_official_video_sources("DE", {})
+        self.assertEqual([source["name"] for source in sources], ["FIFA"])
+
+    def test_fifa_registry_contains_confirmed_official_rss_source(self):
+        sources = select_official_video_sources("US", {})
+        fifa = next(source for source in sources if source["name"] == "FIFA")
+        self.assertEqual(fifa["channel_id"], "UCpcTrCXblq78GZrTUTLWeBw")
+        self.assertEqual(
+            build_youtube_feed_url(fifa["channel_id"]),
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCpcTrCXblq78GZrTUTLWeBw",
+        )
 
     def test_official_fallback_uses_whitelisted_feed_without_youtube_search(self):
         entries = [{

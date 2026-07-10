@@ -145,4 +145,7 @@ def load_config() -> dict[str, Any]:
         "yt_dlp_bin": os.getenv("YT_DLP_BIN", "yt-dlp"),
         "downloads_dir": DOWNLOADS_DIR,
         "yt_search_terms": YT_SEARCH_TERMS,
+        "tvnz_auto_download_enabled": os.getenv("TVNZ_AUTO_DOWNLOAD_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
+        "tvnz_youtube_channel_url": os.getenv("TVNZ_YOUTUBE_CHANNEL_URL", ""),
+        "tvnz_backfill_limit": os.getenv("TVNZ_BACKFILL_LIMIT", "5"),
     }

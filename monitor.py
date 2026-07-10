@@ -108,6 +108,32 @@ TRUSTED_YOUTUBE_CHANNEL_ORDER = [
 TRUSTED_YOUTUBE_CHANNELS = set(TRUSTED_YOUTUBE_CHANNEL_ORDER)
 DOWNLOAD_BLOCKED_CHANNELS = {"cazetv"}
 YOUTUBE_DOWNLOAD_CHANNEL = "TVNZ Sport"
+DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport/videos"
+TVNZ_BACKFILL_LIMIT_DEFAULT = 5
+TVNZ_HIGHLIGHT_KEYWORDS = (
+    "highlights",
+    "match highlights",
+    "extended highlights",
+    "goals",
+    "every goal",
+    "penalty",
+    "penalties",
+    "shootout",
+    "red card",
+    "var",
+    "world cup",
+    "fifa world cup",
+)
+TVNZ_REJECTED_VIDEO_TERMS = (
+    "interview",
+    "press conference",
+    "preview",
+    "reaction",
+    "podcast",
+    "live",
+    "full match",
+    "betting",
+)
 YOUTUBE_DOWNLOAD_TITLE_TERMS = ("match highlights", "extended highlights", "highlights")
 YOUTUBE_DOWNLOAD_REJECTED_TERMS = (
     "analysis", "reaction", "live", "podcast", "debate", "preview",
@@ -356,23 +382,39 @@ def is_trusted_youtube_uploader(metadata: dict[str, Any]) -> bool:
 def _contains_normalized_phrase(value: Any, phrase: str) -> bool:
     """Match a normalized word or phrase without substring false positives."""
     normalized = normalize_channel_name(value)
-    return bool(re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", normalized))
+    normalized_phrase = normalize_channel_name(phrase)
+    return bool(re.search(rf"(?<!\w){re.escape(normalized_phrase)}(?!\w)", normalized))
 
 
-def validate_youtube_download_candidate(metadata: dict[str, Any]) -> tuple[bool, str]:
-    """Allow downloads only for genuine TVNZ Sport match-highlight videos."""
+def is_tvnz_sport_video(metadata: dict[str, Any]) -> bool:
+    """Return True only for TVNZ Sport YouTube metadata."""
     uploader_names = {
         channel_identity(metadata.get("channel")),
         channel_identity(metadata.get("uploader")),
     }
-    if channel_identity(YOUTUBE_DOWNLOAD_CHANNEL) not in uploader_names:
+    return channel_identity(YOUTUBE_DOWNLOAD_CHANNEL) in uploader_names
+
+
+def is_tvnz_highlight_video(metadata: dict[str, Any]) -> bool:
+    """Return whether a TVNZ Sport video title should be auto-downloaded."""
+    if not is_tvnz_sport_video(metadata):
+        return False
+    title = metadata.get("title") or ""
+    if any(_contains_normalized_phrase(title, term) for term in TVNZ_REJECTED_VIDEO_TERMS):
+        return False
+    return any(_contains_normalized_phrase(title, term) for term in TVNZ_HIGHLIGHT_KEYWORDS)
+
+
+def validate_youtube_download_candidate(metadata: dict[str, Any]) -> tuple[bool, str]:
+    """Allow downloads only for genuine TVNZ Sport match-highlight videos."""
+    if not is_tvnz_sport_video(metadata):
         return False, "uploader is not TVNZ Sport"
 
     title = metadata.get("title") or ""
-    for term in YOUTUBE_DOWNLOAD_REJECTED_TERMS:
+    for term in TVNZ_REJECTED_VIDEO_TERMS:
         if _contains_normalized_phrase(title, term):
             return False, f"title contains rejected term: {term}"
-    if not any(_contains_normalized_phrase(title, term) for term in YOUTUBE_DOWNLOAD_TITLE_TERMS):
+    if not any(_contains_normalized_phrase(title, term) for term in TVNZ_HIGHLIGHT_KEYWORDS):
         return False, "title is not a match highlight"
     return True, "TVNZ Sport match highlight"
 
@@ -1188,13 +1230,7 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
         "futebol brasil",
     ]
 
-    video_search_queries = [
-        f"{original_title} official video",
-        f"{original_title} FIFA official",
-        f"{original_title} ESPN official",
-        f"{original_title} BBC Sport official",
-    ]
-    video_search_links = [build_video_search_url(query) for query in video_search_queries]
+    video_search_links: list[str] = []
 
     # Initialize video_links if it doesn't exist
     if "video_links" not in grouped_article or not isinstance(grouped_article["video_links"], list):
@@ -1206,11 +1242,7 @@ def build_portuguese_shorts_pack(grouped_article: dict[str, Any], config: dict[s
             grouped_article["video_links"].append(existing_video_url)
         grouped_article["video_url"] = existing_video_url
     else:
-        # If no explicit video URL is found, prioritize YouTube search
-        official_video_url = find_official_video_url(grouped_article)
-        if official_video_url and official_video_url not in grouped_article["video_links"]:
-            grouped_article["video_links"].append(official_video_url)
-        grouped_article["video_url"] = official_video_url
+        grouped_article["video_url"] = ""
 
     grouped_article["shorts_title"] = title_pt
     grouped_article["thumbnail_text"] = thumbnail_text_options
@@ -1440,6 +1472,12 @@ def build_search_links(grouped_article: dict[str, Any]) -> list[str]:
     return searches
 
 
+def automatic_video_status_line(grouped_article: dict[str, Any]) -> str:
+    """Return a Telegram line describing TVNZ-only automatic video status."""
+    status = str(grouped_article.get("automatic_video_status") or "").strip()
+    return f"*🎥 {status}*\n" if status else ""
+
+
 def build_content_discovery_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
     """Build a discovery-first Telegram alert for football Shorts production."""
     shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
@@ -1465,6 +1503,7 @@ def build_content_discovery_telegram_message(grouped_article: dict[str, Any], co
 
     article_links_block = "\n".join(f"- {link}" for link in article_links) if article_links else "- Não informado"
     video_links_block = "\n".join(f"- {link}" for link in video_links) if video_links else "- Não informado"
+    video_summary = " | ".join(video_links) if video_links else "aguardando TVNZ Sport"
     official_sources_block = ", ".join(official_sources) if official_sources else "Não informado"
     hashtags_block = " ".join(shorts_pack.get('hashtags', [])) or "#Futebol #ShortsFutebol"
     scripts = shorts_pack.get('narration_scripts', {}) or {}
@@ -1474,7 +1513,8 @@ def build_content_discovery_telegram_message(grouped_article: dict[str, Any], co
         f"📰 Notícias\n"
         f"✅ {official_sources_block}\n\n"
         f"🎥 Vídeos\n"
-        f"▶ {' | '.join(video_links) if video_links else 'Não informado'}\n\n"
+        f"▶ {video_summary}\n"
+        f"{automatic_video_status_line(grouped_article)}\n"
         f"🔥 Viral Score: {score_label}/100\n\n"
         f"🧠 Resumo da história: {summary}\n"
         f"📈 Por que está explodindo: {reason}\n\n"
@@ -1511,6 +1551,7 @@ def build_live_event_telegram_message(grouped_article: dict[str, Any], config: d
         f"*🥅 Goal scorer:* {scorer or 'Não informado'}\n"
         f"*🏆 Competition:* {competition or 'Não informado'}\n"
         f"*📺 Official source:* {official_source}\n"
+        f"{automatic_video_status_line(grouped_article)}"
         f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
         f"*📝 Short description:* {shorts_pack.get('description', '')}\n"
         f"*🎙 30-second script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
@@ -1536,6 +1577,7 @@ def build_generic_news_telegram_message(grouped_article: dict[str, Any], config:
         f"*Título:* {grouped_article.get('title', '')}\n"
         f"*Fonte:* {sources or grouped_article.get('source', 'Não informado')}\n"
         f"*Link original:* {original_url}\n"
+        f"{automatic_video_status_line(grouped_article)}"
         f"*Por que importa:* {why_it_matters}\n"
         f"*Ideia para Shorts:* {shorts_pack.get('shorts_title', '')}"
     ).strip()
@@ -1560,6 +1602,7 @@ def build_transfer_telegram_message(grouped_article: dict[str, Any], config: dic
         f"*Título:* {grouped_article.get('title', '')}\n"
         f"*Fonte:* {sources or grouped_article.get('source', 'Não informado')}\n"
         f"*Link original:* {original_url}\n"
+        f"{automatic_video_status_line(grouped_article)}"
         f"*Ideia para Shorts:* {shorts_pack.get('shorts_title', '')}"
     ).strip()
 
@@ -1567,7 +1610,6 @@ def build_transfer_telegram_message(grouped_article: dict[str, Any], config: dic
 def build_manual_telegram_message(grouped_article: dict[str, Any], config: dict[str, str]) -> str:
     """Build a Brazilian Portuguese Telegram alert for a manual breaking-news trigger."""
     shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
-    search_links = build_search_links(grouped_article)
     article_links = grouped_article.get("links") or [""]
     original_url = grouped_article.get("link") or article_links[0]
     return (
@@ -1576,8 +1618,7 @@ def build_manual_telegram_message(grouped_article: dict[str, Any], config: dict[
         f"*📺 Source:* {', '.join(grouped_article.get('sources', []))}\n"
         f"*🔗 Original URL:* {original_url}\n"
         f"*🎥 YouTube URL:* {grouped_article.get('video_url', '')}\n"
-        f"*🔎 YouTube search link:* {search_links[0]}\n"
-        f"*🔎 FIFA/ESPN/BBC/Google search links:* {' | '.join(search_links[1:])}\n"
+        f"{automatic_video_status_line(grouped_article)}"
         f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
         f"*🖼 Thumbnail text:* {', '.join(shorts_pack.get('thumbnail_text', []))}\n"
         f"*🎙 30s script:* {shorts_pack.get('narration_scripts', {}).get('30s', '')}\n"
@@ -1597,12 +1638,9 @@ def build_portuguese_telegram_message(grouped_article: dict[str, Any], config: d
     original_video_url = grouped_article.get("video_url") or grouped_article.get("link") or links or ""
     original_search_keywords = grouped_article.get("search_keywords") or []
     video_status = str(grouped_article.get("video_status", "") or "").strip().lower()
-    video_search_link = grouped_article.get("video_search_link") or ""
 
     shorts_pack = build_portuguese_shorts_pack(grouped_article, config)
     video_url = original_video_url or grouped_article.get("video_url") or shorts_pack.get('video_url', "")
-    if not video_search_link:
-        video_search_link = build_video_search_url(f"{title} CazéTV")
     search_keywords = original_search_keywords or grouped_article.get("search_keywords") or shorts_pack.get('search_keywords', [])
 
     warning_block = ""
@@ -1615,7 +1653,7 @@ def build_portuguese_telegram_message(grouped_article: dict[str, Any], config: d
         f"*📰 Título original:* {title}\n"
         f"*🔗 Link do vídeo:* {video_url}\n"
         f"{warning_block}\n"
-        f"*🔎 Link de busca do YouTube:* {video_search_link}\n"
+        f"{automatic_video_status_line(grouped_article)}"
         f"*🔍 Palavras-chave de busca:* {', '.join(search_keywords) if search_keywords else ', '.join(shorts_pack.get('search_keywords', []))}\n"
         f"*🎬 Shorts title:* {shorts_pack.get('shorts_title', '')}\n"
         f"*📝 Descrição:* {shorts_pack.get('description', '')}\n"
@@ -1682,14 +1720,12 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
             f"Criar cenas extras para um Shorts de futebol sobre {notification_title}. "
             "Estilo cinematográfico, cortes rápidos, reação de torcida, close em jogador, câmera dinâmica, iluminação forte, sensação de explosão."
         )
-        search_links = build_search_links(grouped_article)
         downloaded_video_path = grouped_article.get("downloaded_video_path", "")
         download_block = f"*💾 Vídeo baixado:* {downloaded_video_path}\n" if downloaded_video_path else ""
         article_links = grouped_article.get("links") or [""]
         original_url = grouped_article.get("link") or article_links[0]
         score = shorts_pack.get("score", 0)
         video_url = shorts_pack.get("video_url", "")
-        extra_search_links = " | ".join(search_links[1:])
         thumbnail_frame_idea = shorts_pack.get("thumbnail_frame_idea", "")
         heygen_narration = shorts_pack.get("heygen_narration", "")
         description = shorts_pack.get("description", "")
@@ -1708,8 +1744,7 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
             f"*📺 Source:* {sources}\n"
             f"*🔗 Original URL:* {original_url}\n"
             f"*🎥 Link do vídeo oficial:* {video_url}\n"
-            f"*🔎 YouTube search link:* {search_links[0]}\n"
-            f"*🔎 FIFA/ESPN/BBC/Google search links:* {extra_search_links}\n"
+            f"{automatic_video_status_line(grouped_article)}"
             f"{download_block}"
             f"*📰 Notícia:* {notification_title}\n"
             f"*🖼 Melhor thumbnail:* {thumbnail_frame_idea}\n"
@@ -2011,6 +2046,160 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
         return False
 
 
+def parse_tvnz_backfill_limit(value: Any) -> int:
+    """Parse the first-run TVNZ download cap."""
+    try:
+        return max(1, int(value or TVNZ_BACKFILL_LIMIT_DEFAULT))
+    except (TypeError, ValueError):
+        return TVNZ_BACKFILL_LIMIT_DEFAULT
+
+
+def get_tvnz_youtube_channel_url(config: dict[str, Any]) -> str:
+    """Return the configured TVNZ Sport YouTube source."""
+    configured_url = str(
+        config.get("tvnz_youtube_channel_url")
+        or os.getenv("TVNZ_YOUTUBE_CHANNEL_URL", "")
+        or ""
+    ).strip()
+    if configured_url:
+        return configured_url
+
+    feeds = get_feeds()
+    existing_tvnz_source = str(feeds.get(YOUTUBE_DOWNLOAD_CHANNEL, "") or "").strip()
+    if existing_tvnz_source:
+        return existing_tvnz_source
+
+    return DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL
+
+
+def _video_url_from_metadata(metadata: dict[str, Any]) -> str:
+    video_id = str(metadata.get("id") or metadata.get("video_id") or "").strip()
+    video_url = str(metadata.get("webpage_url") or metadata.get("url") or "").strip()
+    if video_url and video_url != video_id:
+        return video_url
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return video_url
+
+
+def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Discover recent TVNZ Sport videos only."""
+    yt_dlp_bin = str(config.get("yt_dlp_bin", YT_DLP_BIN))
+    source_url = get_tvnz_youtube_channel_url(config)
+    backfill_limit = parse_tvnz_backfill_limit(config.get("tvnz_backfill_limit", TVNZ_BACKFILL_LIMIT_DEFAULT))
+    command = [
+        yt_dlp_bin,
+        source_url,
+        "--dump-json",
+        "--flat-playlist",
+        "--playlist-end",
+        str(backfill_limit),
+        "--no-warnings",
+        "--quiet",
+    ]
+    logger.info("Discovering recent TVNZ Sport videos from %s (limit=%s)", source_url, backfill_limit)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        logger.warning("TVNZ Sport video discovery timed out.")
+        return []
+    except subprocess.CalledProcessError as exc:
+        logger.warning("TVNZ Sport video discovery failed: %s", str(exc.stderr or exc).strip())
+        return []
+    except FileNotFoundError:
+        logger.error("yt-dlp command not found. Cannot discover TVNZ Sport videos.")
+        return []
+
+    videos: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            metadata = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        metadata.setdefault("channel", YOUTUBE_DOWNLOAD_CHANNEL)
+        metadata.setdefault("uploader", YOUTUBE_DOWNLOAD_CHANNEL)
+        metadata["webpage_url"] = _video_url_from_metadata(metadata)
+        if is_tvnz_highlight_video(metadata):
+            videos.append(metadata)
+    return videos
+
+
+def downloaded_tvnz_video_keys(alerts: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
+    """Extract downloaded TVNZ video IDs and URLs from persisted alerts."""
+    video_ids = {str(alert.get("video_id", "")) for alert in alerts if alert.get("video_id")}
+    video_urls = {str(alert.get("video_url", "")) for alert in alerts if alert.get("video_url")}
+    for alert in alerts:
+        for link in alert.get("links", []) or []:
+            if link:
+                video_urls.add(str(link))
+    return video_ids, video_urls
+
+
+def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict[str, Any]]) -> int:
+    """Download, convert, and send every new matching TVNZ Sport highlight."""
+    downloaded_ids, downloaded_urls = downloaded_tvnz_video_keys(alerts)
+    downloads_dir = Path(config.get("downloads_dir", DOWNLOADS_DIR))
+    yt_dlp_bin = str(config.get("yt_dlp_bin", YT_DLP_BIN))
+    downloaded_count = 0
+
+    for video in discover_tvnz_sport_videos(config):
+        video_url = _video_url_from_metadata(video)
+        video_id = str(video.get("id") or extract_youtube_video_id(video_url) or "").strip()
+        duplicate_by_id = bool(video_id and video_id in downloaded_ids)
+        duplicate_by_url = bool(video_url and video_url in downloaded_urls)
+        if duplicate_by_id or duplicate_by_url:
+            logger.info("Skipping already downloaded TVNZ Sport video: %s", video.get("title", ""))
+            continue
+
+        try:
+            downloaded_path = download_youtube_video(video_url, downloads_dir, yt_dlp_bin)
+        except GeoRestrictedVideoError:
+            logger.warning("TVNZ Sport download is geo-restricted: %s", video_url)
+            continue
+        if not downloaded_path:
+            continue
+
+        story = {
+            "title": video.get("title", ""),
+            "sources": [YOUTUBE_DOWNLOAD_CHANNEL],
+            "source": YOUTUBE_DOWNLOAD_CHANNEL,
+            "official_source": YOUTUBE_DOWNLOAD_CHANNEL,
+            "link": video_url,
+            "links": [video_url],
+            "video_url": video_url,
+            "video_id": video_id,
+            "content_category": "MATCH_HIGHLIGHT",
+            "downloaded_video_path": downloaded_path,
+            "_telegram_config": config,
+        }
+        telegram_video_path = create_vertical_short(downloaded_path, story) or downloaded_path
+        if telegram_video_path != downloaded_path and not story.get("vertical_short_path"):
+            story["vertical_short_path"] = str(telegram_video_path)
+        send_downloaded_video_to_telegram(telegram_video_path, story)
+        story.pop("_telegram_config", None)
+
+        alerts.append({
+            "alert_type": "tvnz_download",
+            "title": story.get("title", ""),
+            "sources": [YOUTUBE_DOWNLOAD_CHANNEL],
+            "links": [video_url],
+            "video_url": video_url,
+            "video_id": video_id,
+            "downloaded_video_path": downloaded_path,
+            "vertical_short_path": story.get("vertical_short_path", ""),
+        })
+        if video_id:
+            downloaded_ids.add(video_id)
+        if video_url:
+            downloaded_urls.add(video_url)
+        downloaded_count += 1
+        logger.info("Downloaded TVNZ Sport highlight: %s", story.get("title", ""))
+
+    return downloaded_count
+
+
 def process_cycle(config: dict[str, str]) -> int:
     """Fetch feeds, filter relevant stories, group duplicates, score them, and notify on high viral potential."""
     debug_mode = bool(config.get("debug_mode", False))
@@ -2022,7 +2211,6 @@ def process_cycle(config: dict[str, str]) -> int:
     seen_this_cycle: set[str] = set()
     relevant_articles: list[dict[str, str]] = []
     persisted_seen_keys: set[str] = set()
-    downloaded_video_ids: set[str] = {alert.get("video_id", "") for alert in alerts if alert.get("video_id")}
 
     # New: Track notified stories for deduplication and limit
     notified_stories_in_cycle: list[dict[str, Any]] = []
@@ -2247,6 +2435,9 @@ def process_cycle(config: dict[str, str]) -> int:
             logger.info("Reached maximum number of notifications for this cycle (3). Skipping %s", article.get("title"))
             continue
 
+        if not any(channel_identity(source) == channel_identity(YOUTUBE_DOWNLOAD_CHANNEL) for source in article.get("sources", [])):
+            article["automatic_video_status"] = "Vídeo automático: aguardando TVNZ Sport"
+
         notification_sent = send_telegram_notification(article, config)
         if notification_sent:
             try:
@@ -2258,56 +2449,6 @@ def process_cycle(config: dict[str, str]) -> int:
                 for duplicate_key in article.get("duplicate_keys", []):
                     if duplicate_key:
                         persisted_seen_keys.add(str(duplicate_key))
-            # Prefer an article-provided YouTube URL; otherwise search trusted channels.
-            article_url = article.get("video_url") or article.get("link") or ""
-            preferred_url = article_url if is_youtube_link(article_url) else ""
-            article_source = article.get("official_source", "") or next(iter(article.get("sources", [])), "")
-            downloaded_path = None
-            video_id_for_download = "" if channel_identity(article_source) == channel_identity("CazéTV") else extract_youtube_video_id(preferred_url)
-            article["downloaded_video_path"] = "" # Initialize for consistency
-
-            if not article.get("should_download", False):
-                logger.info("Skipping YouTube download because content classification disallows it: %s", article.get("content_category", "UNKNOWN"))
-            elif video_id_for_download and video_id_for_download in downloaded_video_ids:
-                logger.info("Skipping download for %s because video ID %s already downloaded.", article.get("title"), video_id_for_download)
-            else:
-                attach_article_to_match(article, today_matches)
-                search_query = article.get("title", "") or "World Cup 2026 football highlights"
-                download_config = dict(config)
-                if article.get("match"):
-                    match_queries = build_match_day_queries(article["match"])
-                    if match_queries:
-                        search_query = match_queries[0]
-                        download_config["match_queries"] = match_queries
-                        logger.info("Matched today's game: %s vs %s", article["match"]["home_team"], article["match"]["away_team"])
-                        logger.info("Search query: %s", search_query)
-                else:
-                    logger.info("Using article title fallback.")
-                    logger.info("Search query: %s", search_query)
-                downloaded_path, actual_video_url = search_and_download_youtube_video(
-                    search_query,
-                    download_config,
-                    downloaded_video_ids,
-                    preferred_url=preferred_url,
-                    trusted_source=article_source,
-                    eligibility_title=article.get("title", ""),
-                )
-
-                if downloaded_path:
-                    article["downloaded_video_path"] = downloaded_path
-                    article["video_url"] = actual_video_url
-                    downloaded_video_id = extract_youtube_video_id(actual_video_url or "") or video_id_for_download
-                    if downloaded_video_id:
-                        article["video_id"] = downloaded_video_id
-                        downloaded_video_ids.add(downloaded_video_id)
-                    videos_downloaded += 1
-                    logger.info("Downloaded video to %s for %s", downloaded_path, article.get("title"))
-                    article["_telegram_config"] = config
-                    telegram_video_path = create_vertical_short(downloaded_path, article) or downloaded_path
-                    send_downloaded_video_to_telegram(telegram_video_path, article)
-                    article.pop("_telegram_config", None)
-                else:
-                    logger.info("No trusted official video downloaded for %s", article.get("title"))
 
             alerts.append({
                 "alert_key": alert_key,
@@ -2329,10 +2470,14 @@ def process_cycle(config: dict[str, str]) -> int:
                 "video_search_links": article.get("video_search_links", []),
                 "links": article.get("links", []),
                 "sources": article.get("sources", []),
-                "downloaded_video_path": downloaded_path,  # Store path to downloaded video
+                "downloaded_video_path": article.get("downloaded_video_path", ""),
+                "automatic_video_status": article.get("automatic_video_status", ""),
             })
             seen_alert_keys.add(alert_key)
             notified_stories_in_cycle.append(article) # Add to notified list for deduplication in current cycle
+
+    if bool(config.get("tvnz_auto_download_enabled", False)):
+        videos_downloaded += download_new_tvnz_sport_highlights(config, alerts)
 
     if not debug_mode:
         updated_seen = seen_articles | persisted_seen_keys

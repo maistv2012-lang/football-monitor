@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import unittest
@@ -27,6 +28,8 @@ from monitor import (
     calculate_viral_score,
     classify_story_content,
     create_vertical_short,
+    discover_tvnz_sport_videos,
+    download_new_tvnz_sport_highlights,
     download_youtube_video,
     discover_x_posts,
     find_short_font_path,
@@ -34,6 +37,7 @@ from monitor import (
     is_cazetv_discussion_content,
     is_download_eligible_title,
     is_live_goal_event,
+    is_tvnz_highlight_video,
     is_trusted_youtube_uploader,
     load_todays_fixtures,
     process_cycle,
@@ -682,6 +686,135 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("TVNZ Sport", metadata["description"])
         self.assertIn("clip_vertical.mp4", metadata["description"])
 
+    def test_tvnz_highlight_video_is_accepted(self):
+        self.assertTrue(is_tvnz_highlight_video({
+            "channel": "TVNZ Sport",
+            "title": "Portugal v Spain match highlights | FIFA World Cup",
+        }))
+
+    def test_tvnz_interview_preview_and_live_are_rejected(self):
+        for title in (
+            "Portugal preview before World Cup clash",
+            "Coach interview after match highlights",
+            "TVNZ Sport live build-up",
+        ):
+            with self.subTest(title=title):
+                self.assertFalse(is_tvnz_highlight_video({"channel": "TVNZ Sport", "title": title}))
+
+    def test_tvnz_backfill_limit_is_respected(self):
+        completed = type("Completed", (), {
+            "stdout": "\n".join([
+                json.dumps({"id": "tvnz1", "title": "Portugal match highlights", "channel": "TVNZ Sport"}),
+                json.dumps({"id": "tvnz2", "title": "France every goal", "channel": "TVNZ Sport"}),
+            ]),
+            "stderr": "",
+        })()
+        config = {
+            "yt_dlp_bin": "yt-dlp",
+            "tvnz_youtube_channel_url": "https://youtube.com/@TVNZSport/videos",
+            "tvnz_backfill_limit": 2,
+        }
+
+        with patch("monitor.subprocess.run", return_value=completed) as run_mock:
+            videos = discover_tvnz_sport_videos(config)
+
+        self.assertEqual([video["id"] for video in videos], ["tvnz1", "tvnz2"])
+        command = run_mock.call_args.args[0]
+        self.assertIn("--playlist-end", command)
+        self.assertEqual(command[command.index("--playlist-end") + 1], "2")
+
+    def test_duplicate_tvnz_video_is_not_downloaded_twice(self):
+        alerts = [{"alert_type": "tvnz_download", "video_id": "tvnz1", "video_url": "https://youtube.com/watch?v=tvnz1"}]
+        with patch("monitor.discover_tvnz_sport_videos", return_value=[{
+            "id": "tvnz1",
+            "title": "Portugal match highlights",
+            "channel": "TVNZ Sport",
+            "webpage_url": "https://youtube.com/watch?v=tvnz1",
+        }]), \
+             patch("monitor.download_youtube_video") as download_mock:
+            count = download_new_tvnz_sport_highlights({"downloads_dir": Path("downloads"), "yt_dlp_bin": "yt-dlp"}, alerts)
+
+        self.assertEqual(count, 0)
+        download_mock.assert_not_called()
+
+    def test_downloaded_tvnz_video_is_converted_and_sent_as_vertical(self):
+        with TemporaryDirectory() as temp_dir:
+            downloaded_path = str(Path(temp_dir) / "tvnz.mp4")
+            vertical_path = str(Path(temp_dir) / "tvnz_vertical.mp4")
+            Path(downloaded_path).write_bytes(b"mp4")
+            Path(vertical_path).write_bytes(b"short")
+            alerts: list[dict] = []
+            config = {
+                "downloads_dir": Path(temp_dir),
+                "yt_dlp_bin": "yt-dlp",
+                "telegram_bot_token": "TEST_TOKEN",
+                "telegram_chat_id": "123",
+            }
+
+            with patch("monitor.discover_tvnz_sport_videos", return_value=[{
+                "id": "tvnz1",
+                "title": "Portugal v Spain extended highlights",
+                "channel": "TVNZ Sport",
+                "webpage_url": "https://youtube.com/watch?v=tvnz1",
+            }]), \
+                 patch("monitor.download_youtube_video", return_value=downloaded_path), \
+                 patch("monitor.create_vertical_short", return_value=vertical_path) as short_mock, \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_mock:
+                count = download_new_tvnz_sport_highlights(config, alerts)
+
+        self.assertEqual(count, 1)
+        short_mock.assert_called_once()
+        send_mock.assert_called_once()
+        self.assertEqual(send_mock.call_args.args[0], vertical_path)
+        self.assertEqual(alerts[0]["video_id"], "tvnz1")
+        self.assertEqual(alerts[0]["video_url"], "https://youtube.com/watch?v=tvnz1")
+
+    def test_bbc_espn_alerts_do_not_trigger_broad_youtube_search(self):
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "state_file": Path(temp_dir) / "state.json",
+                "alerts_file": Path(temp_dir) / "alerts.json",
+                "debug_mode": False,
+                "telegram_bot_token": "TEST_TOKEN",
+                "telegram_chat_id": "123",
+                "tvnz_auto_download_enabled": False,
+            }
+            entries = [{
+                "title": "Messi scores dramatic goal for Argentina",
+                "summary": "A major football moment.",
+                "description": "A major football moment.",
+                "link": "https://espn.example.com/story",
+                "id": "espn-1",
+                "published": "2026-07-04T10:00:00Z",
+            }]
+
+            with patch("monitor.get_feeds", return_value={"ESPN FC": "https://example.com/feed"}), \
+                 patch("monitor.fetch_feed_entries", return_value=entries), \
+                 patch("monitor.load_seen_articles", return_value=set()), \
+                 patch("monitor.save_seen_articles"), \
+                 patch("monitor.load_alerts", return_value=[]), \
+                 patch("monitor.save_alerts"), \
+                 patch("monitor.load_todays_fixtures", return_value=[]), \
+                 patch("monitor.should_send_notification", return_value=True), \
+                 patch("monitor.send_telegram_notification", return_value=True), \
+                 patch("monitor.search_and_download_youtube_video") as search_mock:
+                process_cycle(config)
+
+        search_mock.assert_not_called()
+
+    def test_non_tvnz_message_shows_waiting_for_tvnz(self):
+        message = build_content_discovery_telegram_message({
+            "title": "Messi scores dramatic goal",
+            "summary": "Big moment.",
+            "sources": ["BBC Sport Football"],
+            "links": ["https://bbc.example.com/story"],
+            "viral_score": 82,
+            "automatic_video_status": "Vídeo automático: aguardando TVNZ Sport",
+        }, {})
+
+        self.assertIn("Vídeo automático: aguardando TVNZ Sport", message)
+        self.assertNotIn("youtube.com/results", message)
+
     def test_process_cycle_sends_vertical_file_when_created(self):
         with TemporaryDirectory() as temp_dir:
             downloaded_path = str(Path(temp_dir) / "downloaded.mp4")
@@ -694,6 +827,9 @@ class MonitorTests(unittest.TestCase):
                 "debug_mode": False,
                 "telegram_bot_token": "TEST_TOKEN",
                 "telegram_chat_id": "123",
+                "tvnz_auto_download_enabled": True,
+                "downloads_dir": Path(temp_dir),
+                "yt_dlp_bin": "yt-dlp",
             }
             entries = [{
                 "title": "Messi Argentina vs Egypt Match Highlights",
@@ -713,7 +849,13 @@ class MonitorTests(unittest.TestCase):
                  patch("monitor.load_todays_fixtures", return_value=[]), \
                  patch("monitor.should_send_notification", return_value=True), \
                  patch("monitor.send_telegram_notification", return_value=True), \
-                 patch("monitor.search_and_download_youtube_video", return_value=(downloaded_path, "https://youtu.be/tvnzvideo01")), \
+                 patch("monitor.discover_tvnz_sport_videos", return_value=[{
+                     "id": "tvnzvideo01",
+                     "title": "Messi Argentina vs Egypt match highlights",
+                     "channel": "TVNZ Sport",
+                     "webpage_url": "https://youtu.be/tvnzvideo01",
+                 }]), \
+                 patch("monitor.download_youtube_video", return_value=downloaded_path), \
                  patch("monitor.create_vertical_short", return_value=vertical_path), \
                  patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_video_mock:
                 process_cycle(config)
@@ -731,6 +873,9 @@ class MonitorTests(unittest.TestCase):
                 "debug_mode": False,
                 "telegram_bot_token": "TEST_TOKEN",
                 "telegram_chat_id": "123",
+                "tvnz_auto_download_enabled": True,
+                "downloads_dir": Path(temp_dir),
+                "yt_dlp_bin": "yt-dlp",
             }
             entries = [{
                 "title": "Messi Argentina vs Egypt Match Highlights",
@@ -750,7 +895,13 @@ class MonitorTests(unittest.TestCase):
                  patch("monitor.load_todays_fixtures", return_value=[]), \
                  patch("monitor.should_send_notification", return_value=True), \
                  patch("monitor.send_telegram_notification", return_value=True), \
-                 patch("monitor.search_and_download_youtube_video", return_value=(downloaded_path, "https://youtu.be/tvnzvideo01")), \
+                 patch("monitor.discover_tvnz_sport_videos", return_value=[{
+                     "id": "tvnzvideo01",
+                     "title": "Messi Argentina vs Egypt match highlights",
+                     "channel": "TVNZ Sport",
+                     "webpage_url": "https://youtu.be/tvnzvideo01",
+                 }]), \
+                 patch("monitor.download_youtube_video", return_value=downloaded_path), \
                  patch("monitor.create_vertical_short", return_value=None), \
                  patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_video_mock:
                 process_cycle(config)
@@ -789,11 +940,11 @@ class MonitorTests(unittest.TestCase):
         valid, _ = validate_youtube_download_candidate({
             "channel": "TVNZ Sport", "title": "Portugal v Spain goals",
         })
-        self.assertFalse(valid)
+        self.assertTrue(valid)
 
         rejected_terms = (
-            "analysis", "reaction", "live", "podcast", "debate", "preview",
-            "press conference", "opinion", "heroics", "greatest comeback", "daily",
+            "interview", "reaction", "live", "podcast", "preview",
+            "press conference", "full match", "betting",
         )
         for term in rejected_terms:
             with self.subTest(term=term):
@@ -1075,7 +1226,7 @@ class MonitorTests(unittest.TestCase):
 
         self.assertTrue(should_send_notification(grouped_article))
 
-    def test_blocked_youtube_links_add_warning_and_search_guidance(self):
+    def test_blocked_youtube_links_add_warning_without_generic_search_link(self):
         grouped_article = {
             "title": "Messi faz golaço de falta",
             "summary": "Vídeo viral do CazéTV",
@@ -1083,7 +1234,6 @@ class MonitorTests(unittest.TestCase):
             "links": ["https://www.youtube.com/watch?v=blocked123"],
             "video_url": "https://www.youtube.com/watch?v=blocked123",
             "video_status": "region_blocked",
-            "video_search_link": "https://www.youtube.com/results?search_query=Messi+faz+gola%C3%A7o+de+falta+Caz%C3%A9TV",
             "search_keywords": ["Messi golaço CazéTV", "official clip"],
             "score": 7.1,
             "reason": "Tema forte",
@@ -1092,7 +1242,7 @@ class MonitorTests(unittest.TestCase):
         message = build_portuguese_telegram_message(grouped_article, {})
 
         self.assertIn("⚠️ Este vídeo pode estar bloqueado na sua região.", message)
-        self.assertIn("https://www.youtube.com/results?search_query=Messi+faz+gola%C3%A7o+de+falta+Caz%C3%A9TV", message)
+        self.assertNotIn("youtube.com/results", message)
         self.assertIn("Messi golaço CazéTV", message)
         self.assertIn("official clip", message)
 
@@ -1205,7 +1355,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("description", article)
         self.assertIn("hashtags", article)
         self.assertIn("search_keywords", article)
-        self.assertTrue(article["video_search_links"])
+        self.assertEqual(article["video_search_links"], [])
 
     def test_build_portuguese_shorts_pack_creates_brazilian_portuguese_content(self):
         article = {

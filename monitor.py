@@ -110,6 +110,7 @@ TRUSTED_YOUTUBE_CHANNELS = set(TRUSTED_YOUTUBE_CHANNEL_ORDER)
 DOWNLOAD_BLOCKED_CHANNELS = {"cazetv"}
 YOUTUBE_DOWNLOAD_CHANNEL = "TVNZ Sport"
 DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport/videos"
+FALLBACK_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport"
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -2489,43 +2490,61 @@ def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
     yt_dlp_bin = str(config.get("yt_dlp_bin", YT_DLP_BIN))
     source_url = get_tvnz_youtube_channel_url(config)
     scan_limit = parse_tvnz_scan_limit(config)
-    command = [
-        yt_dlp_bin,
-        source_url,
-        "--dump-json",
-        "--flat-playlist",
-        "--playlist-end",
-        str(scan_limit),
-        "--no-warnings",
-        "--quiet",
-    ]
     logger.info("Discovering recent TVNZ Sport videos from %s (scan_limit=%s)", source_url, scan_limit)
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30, **SUBPROCESS_TEXT_KWARGS)
-    except subprocess.TimeoutExpired:
-        logger.warning("TVNZ Sport video discovery timed out.")
-        return []
-    except subprocess.CalledProcessError as exc:
-        logger.warning("TVNZ Sport video discovery failed: %s", str(exc.stderr or exc).strip())
-        return []
-    except FileNotFoundError:
-        logger.error("yt-dlp command not found. Cannot discover TVNZ Sport videos.")
-        return []
-
     scanned_videos: list[dict[str, Any]] = []
-    matched_videos: list[tuple[int, dict[str, Any]]] = []
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
+    urls_to_try = [source_url]
+    if source_url.rstrip("/") == DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL.rstrip("/"):
+        urls_to_try.append(FALLBACK_TVNZ_YOUTUBE_CHANNEL_URL)
+
+    for attempt_url in urls_to_try:
+        command = [
+            yt_dlp_bin,
+            attempt_url,
+            "--dump-json",
+            "--flat-playlist",
+            "--playlist-end",
+            str(scan_limit),
+            "--no-warnings",
+            "--quiet",
+        ]
+        logger.info("TVNZ Sport flat playlist command: %s", " ".join(command))
         try:
-            metadata = json.loads(line)
-        except json.JSONDecodeError:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False, timeout=30,
+                **SUBPROCESS_TEXT_KWARGS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("TVNZ Sport video discovery timed out for %s.", attempt_url)
             continue
+        except FileNotFoundError:
+            logger.error("yt-dlp command not found. Cannot discover TVNZ Sport videos.")
+            return []
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        logger.info("TVNZ Sport yt-dlp return code: %s", getattr(result, "returncode", 0))
+        attempt_videos: list[dict[str, Any]] = []
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                attempt_videos.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if attempt_videos:
+            scanned_videos = attempt_videos
+            break
+
+        logger.warning("TVNZ Sport scan returned zero videos; stdout (first 1000 chars): %s", stdout[:1000])
+        logger.warning("TVNZ Sport scan returned zero videos; stderr (first 1000 chars): %s", stderr[:1000])
+        if attempt_url != urls_to_try[-1]:
+            logger.info("TVNZ Sport videos page returned zero videos; trying fallback URL: %s", urls_to_try[-1])
+
+    matched_videos: list[tuple[int, dict[str, Any]]] = []
+    for original_index, metadata in enumerate(scanned_videos):
         metadata.setdefault("channel", YOUTUBE_DOWNLOAD_CHANNEL)
         metadata.setdefault("uploader", YOUTUBE_DOWNLOAD_CHANNEL)
         metadata["webpage_url"] = _video_url_from_metadata(metadata)
-        original_index = len(scanned_videos)
-        scanned_videos.append(metadata)
         if is_tvnz_highlight_video(metadata):
             matched_videos.append((original_index, metadata))
     matched_videos.sort(key=lambda item: _tvnz_newest_sort_value(item[1], item[0]), reverse=True)
@@ -2973,6 +2992,27 @@ def process_cycle(config: dict[str, str]) -> int:
     logger.info("Monitoring cycle finished. High-potential stories: %s", len(high_potential_articles))
     return len(high_potential_articles)
 
+def resolve_downloaded_video_path(video_url: str, output_path: Path, stdout_paths: list[str]) -> str | None:
+    """Resolve a yt-dlp download path without trusting corrupted stdout paths."""
+    downloads_dir = Path(output_path)
+    video_id = extract_youtube_video_id(video_url)
+    if video_id:
+        matches = [
+            path for path in downloads_dir.glob(f"*{video_id}*.mp4")
+            if path.exists() and path.is_file()
+        ]
+        if matches:
+            resolved_path = max(matches, key=lambda path: path.stat().st_mtime)
+            logger.info("Resolved downloaded file by video id: %s", resolved_path)
+            return str(resolved_path)
+
+    for path_text in reversed(stdout_paths):
+        stdout_path = Path(path_text)
+        if stdout_path.exists() and stdout_path.is_file():
+            return str(stdout_path)
+    return None
+
+
 def download_youtube_video(video_url: str, output_path: Path, yt_dlp_bin: str = YT_DLP_BIN) -> str | None:
     """Downloads a YouTube video using yt-dlp.
 
@@ -3002,7 +3042,7 @@ def download_youtube_video(video_url: str, output_path: Path, yt_dlp_bin: str = 
             logger.warning("yt-dlp stderr: %s", result.stderr)
 
         paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        return paths[-1] if paths else None
+        return resolve_downloaded_video_path(video_url, output_path, paths)
     except subprocess.CalledProcessError as exc:
         if is_geo_restriction_error(exc.stderr):
             raise GeoRestrictedVideoError(str(exc.stderr or "")) from None

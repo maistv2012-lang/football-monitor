@@ -24,9 +24,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m pip install -U yt-dlp
 
       - name: Run Football Monitor once
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TVNZ_SCAN_LIMIT: "30"
+          TVNZ_MAX_DOWNLOADS_PER_RUN: "5"
+          PYTHONIOENCODING: "utf-8"
         run: python monitor.py --once

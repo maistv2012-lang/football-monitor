@@ -42,6 +42,7 @@ from monitor import (
     is_tvnz_highlight_video,
     is_trusted_youtube_uploader,
     load_todays_fixtures,
+    parse_tvnz_max_downloads_per_run,
     process_cycle,
     prepare_telegram_message,
     search_and_download_youtube_video,
@@ -380,14 +381,54 @@ class MonitorTests(unittest.TestCase):
         )
 
     def test_youtube_download_subprocess_has_timeout(self):
-        completed = type("Completed", (), {"stdout": "downloads/video.mp4\n", "stderr": ""})()
-        with patch("monitor.subprocess.run", return_value=completed) as run_mock:
-            path = download_youtube_video(
-                "https://youtu.be/official001", Path("downloads"), "yt-dlp"
-            )
+        with TemporaryDirectory() as temp_dir:
+            downloads_dir = Path(temp_dir) / "downloads"
+            downloads_dir.mkdir()
+            video_path = downloads_dir / "video.mp4"
+            video_path.write_bytes(b"mp4")
+            completed = type("Completed", (), {"stdout": f"{video_path}\n", "stderr": ""})()
 
-        self.assertEqual(path, "downloads/video.mp4")
+            with patch("monitor.subprocess.run", return_value=completed) as run_mock:
+                path = download_youtube_video(
+                    "https://youtu.be/official001", downloads_dir, "yt-dlp"
+                )
+
+        self.assertEqual(path, str(video_path))
         self.assertEqual(run_mock.call_args.kwargs["timeout"], 120)
+
+    def test_downloaded_video_resolves_file_by_video_id_when_stdout_path_is_corrupted(self):
+        with TemporaryDirectory() as temp_dir:
+            downloads_dir = Path(temp_dir) / "downloads"
+            downloads_dir.mkdir()
+            local_video = downloads_dir / "Portugal-v-Spain-tvnzvideo01.mp4"
+            local_video.write_bytes(b"mp4")
+            corrupted_stdout = (
+                r"C:\Users\MANUJ\OneDrive\�rea de Trabalho\Football-monitor\downloads"
+                r"\Portugal-v-Spain-tvnzvideo01.mp4"
+            )
+            completed = type("Completed", (), {"stdout": f"{corrupted_stdout}\n", "stderr": ""})()
+
+            with patch("monitor.subprocess.run", return_value=completed):
+                path = download_youtube_video(
+                    "https://youtube.com/watch?v=tvnzvideo01", downloads_dir, "yt-dlp"
+                )
+
+        self.assertEqual(path, str(local_video))
+
+    def test_downloaded_video_uses_existing_stdout_path_when_no_video_id_match(self):
+        with TemporaryDirectory() as temp_dir:
+            downloads_dir = Path(temp_dir) / "downloads"
+            downloads_dir.mkdir()
+            stdout_video = downloads_dir / "plain-video.mp4"
+            stdout_video.write_bytes(b"mp4")
+            completed = type("Completed", (), {"stdout": f"{stdout_video}\n", "stderr": ""})()
+
+            with patch("monitor.subprocess.run", return_value=completed):
+                path = download_youtube_video(
+                    "https://youtube.com/watch?v=missingid01", downloads_dir, "yt-dlp"
+                )
+
+        self.assertEqual(path, str(stdout_video))
 
     def test_very_long_telegram_message_is_compacted_before_first_send(self):
         response = type("Response", (), {"status_code": 200, "text": ""})()
@@ -891,6 +932,41 @@ class MonitorTests(unittest.TestCase):
         command = run_mock.call_args.args[0]
         self.assertIn("https://www.youtube.com/@TVNZSport/videos", command)
         self.assertEqual(command[command.index("--playlist-end") + 1], "30")
+
+    def test_tvnz_max_downloads_per_run_defaults_to_five(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(parse_tvnz_max_downloads_per_run({}), 5)
+
+    def test_monitor_workflow_sets_tvnz_limits_and_utf8(self):
+        workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "monitor.yml").read_text(encoding="utf-8")
+        self.assertIn('TVNZ_SCAN_LIMIT: "30"', workflow)
+        self.assertIn('TVNZ_MAX_DOWNLOADS_PER_RUN: "5"', workflow)
+        self.assertIn('PYTHONIOENCODING: "utf-8"', workflow)
+        self.assertIn("python -m pip install -U yt-dlp", workflow)
+
+    def test_zero_tvnz_scan_logs_output_return_code_and_tries_fallback(self):
+        empty = type("Completed", (), {
+            "stdout": "primary stdout diagnostics",
+            "stderr": "primary stderr diagnostics",
+            "returncode": 1,
+        })()
+
+        with patch("monitor.get_feeds", return_value={}), \
+             patch.dict(os.environ, {}, clear=True), \
+             patch("monitor.subprocess.run", side_effect=[empty, empty]) as run_mock, \
+             self.assertLogs("football-monitor", level="INFO") as captured:
+            videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
+
+        self.assertEqual(videos, [])
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertIn("https://www.youtube.com/@TVNZSport/videos", run_mock.call_args_list[0].args[0])
+        self.assertIn("https://www.youtube.com/@TVNZSport", run_mock.call_args_list[1].args[0])
+        self.assertEqual(run_mock.call_args_list[0].kwargs["encoding"], "utf-8")
+        self.assertEqual(run_mock.call_args_list[0].kwargs["errors"], "replace")
+        logs = "\n".join(captured.output)
+        self.assertIn("primary stdout diagnostics", logs)
+        self.assertIn("primary stderr diagnostics", logs)
+        self.assertIn("return code: 1", logs)
 
     def test_tvnz_discovery_accepts_multiple_new_match_highlights(self):
         completed = type("Completed", (), {

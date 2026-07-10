@@ -2526,6 +2526,11 @@ def video_platform_from_url(url: str) -> str:
     return "Web"
 
 
+def is_instagram_video_url(url: Any) -> bool:
+    """Accept only Instagram reel, post, and TV URLs."""
+    return bool(re.search(r"https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/", str(url or ""), re.IGNORECASE))
+
+
 def load_manual_links(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     path = Path((config or {}).get("manual_links_file", MANUAL_LINKS_FILE))
     try:
@@ -2678,10 +2683,73 @@ def handle_manual_only_video_source(video: dict[str, Any], config: dict[str, Any
     platform = video_platform_from_url(url)
     manual_video["platform"] = platform
     manual_video.setdefault("status", "manual source" if platform in {"X/Twitter", "TikTok", "Instagram"} else "unsupported source")
+    if platform == "Instagram" and is_instagram_video_url(url) and config.get("instagram_auto_download") is True:
+        return process_instagram_video_source(manual_video, config)
     sent = send_manual_open_alert(manual_video, config)
     if sent and platform in {"X/Twitter", "TikTok", "Instagram"}:
         logger.info("Social manual alert sent: %s | %s", platform, url)
     return sent
+
+
+def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Try a public, cookie-free Instagram download and fall back to its original link."""
+    url = str(video.get("url") or video.get("webpage_url") or "").strip()
+    if not is_instagram_video_url(url):
+        return False
+    fallback_enabled = config.get("instagram_fallback_to_manual_link", True) is not False
+    manual_video = {
+        **video,
+        "url": url,
+        "platform": "Instagram",
+    }
+    if config.get("instagram_use_cookies", False):
+        logger.warning("Instagram cookies are not used by this monitor; attempting public extraction only.")
+    downloads_dir = Path(config.get("downloads_dir", DOWNLOADS_DIR)) / "instagram"
+    yt_dlp_bin = str(config.get("yt_dlp_bin", YT_DLP_BIN))
+    command = [
+        yt_dlp_bin,
+        "--no-playlist",
+        "-f", "best[ext=mp4]/best",
+        "--paths", str(downloads_dir),
+        "--output", "%(title)s-%(id)s.%(ext)s",
+        "--print", "after_move:filepath",
+        url,
+    ]
+    try:
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=True, timeout=120,
+            **SUBPROCESS_TEXT_KWARGS,
+        )
+        stdout_paths = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        downloaded_path = resolve_downloaded_video_path(url, downloads_dir, stdout_paths)
+        if not downloaded_path:
+            raise RuntimeError("yt-dlp did not return an existing Instagram file")
+        logger.info("Instagram download succeeded: %s", url)
+        story = {
+            "title": video.get("title", "Instagram football video"),
+            "source": video.get("source") or video.get("channel") or "Instagram",
+            "sources": [video.get("source") or video.get("channel") or "Instagram"],
+            "link": url,
+            "links": [url],
+            "video_url": url,
+            "platform": "Instagram",
+            "downloaded_video_path": downloaded_path,
+            "_telegram_config": config,
+        }
+        moments_path = create_best_moments_clip(downloaded_path, story) or downloaded_path
+        telegram_path = create_vertical_short(moments_path, story) or moments_path
+        sent = send_downloaded_video_to_telegram(telegram_path, story)
+        story.pop("_telegram_config", None)
+        if sent:
+            return True
+        raise RuntimeError("edited Instagram video could not be delivered to Telegram")
+    except Exception as exc:
+        logger.warning("Instagram download failed: %s (%s)", url, exc)
+        if not fallback_enabled:
+            return False
+        manual_video["status"] = "Instagram download failed"
+        return send_manual_open_alert(manual_video, config)
 
 
 def handle_telegram_command(command: str, config: dict[str, Any]) -> bool:

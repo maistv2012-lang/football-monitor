@@ -46,12 +46,14 @@ from monitor import (
     is_cazetv_discussion_content,
     is_download_eligible_title,
     is_live_goal_event,
+    is_instagram_video_url,
     is_tvnz_highlight_video,
     is_trusted_youtube_uploader,
     load_todays_fixtures,
     parse_tvnz_max_downloads_per_run,
     parse_tvnz_rss_entries,
     process_cycle,
+    process_instagram_video_source,
     prepare_telegram_message,
     search_and_download_youtube_video,
     select_official_youtube_candidate,
@@ -1123,6 +1125,65 @@ class MonitorTests(unittest.TestCase):
                 }, config)
         self.assertTrue(sent)
         self.assertIn("Send the video file to the bot if you want editing", post_mock.call_args.kwargs["json"]["text"])
+
+    def test_instagram_video_url_detection_accepts_supported_paths_only(self):
+        for url in (
+            "https://instagram.com/reel/abc/",
+            "https://www.instagram.com/p/abc/",
+            "https://instagram.com/tv/abc/",
+        ):
+            self.assertTrue(is_instagram_video_url(url))
+        self.assertFalse(is_instagram_video_url("https://instagram.com/example/"))
+
+    def test_instagram_download_success_uses_cookie_free_command_and_sends_edit(self):
+        with TemporaryDirectory() as temp_dir:
+            downloads_dir = Path(temp_dir) / "downloads"
+            instagram_dir = downloads_dir / "instagram"
+            instagram_dir.mkdir(parents=True)
+            downloaded = instagram_dir / "reel-video.mp4"
+            downloaded.write_bytes(b"mp4")
+            completed = type("Completed", (), {"stdout": f"{downloaded}\n", "stderr": ""})()
+            config = {"downloads_dir": downloads_dir, "yt_dlp_bin": "yt-dlp"}
+            video = {
+                "title": "Gol anulado pelo VAR", "source": "SporTV",
+                "url": "https://www.instagram.com/reel/abc/",
+            }
+            with patch("monitor.subprocess.run", return_value=completed) as run_mock, \
+                 patch("monitor.create_best_moments_clip", return_value="moments.mp4") as moments_mock, \
+                 patch("monitor.create_vertical_short", return_value="vertical.mp4") as vertical_mock, \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_mock, \
+                 self.assertLogs("football-monitor", level="INFO") as captured:
+                sent = process_instagram_video_source(video, config)
+
+        self.assertTrue(sent)
+        command = run_mock.call_args.args[0]
+        self.assertIn("--no-playlist", command)
+        self.assertEqual(command[command.index("-f") + 1], "best[ext=mp4]/best")
+        self.assertNotIn("--cookies", command)
+        self.assertNotIn("--cookies-from-browser", command)
+        self.assertIn(str(instagram_dir), command)
+        moments_mock.assert_called_once()
+        vertical_mock.assert_called_once()
+        send_mock.assert_called_once()
+        self.assertIn("Instagram download succeeded", "\n".join(captured.output))
+
+    def test_instagram_download_failure_falls_back_to_original_manual_link(self):
+        video = {
+            "title": "Pênalti não marcado", "source": "TNT Sports Brasil",
+            "url": "https://www.instagram.com/p/failed/",
+        }
+        with TemporaryDirectory() as temp_dir, \
+             patch("monitor.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["yt-dlp"])), \
+             patch("monitor.send_manual_open_alert", return_value=True) as manual_mock, \
+             self.assertLogs("football-monitor", level="WARNING") as captured:
+            sent = process_instagram_video_source(video, {
+                "downloads_dir": Path(temp_dir), "instagram_fallback_to_manual_link": True,
+            })
+
+        self.assertTrue(sent)
+        self.assertEqual(manual_mock.call_args.args[0]["url"], video["url"])
+        self.assertEqual(manual_mock.call_args.args[0]["status"], "Instagram download failed")
+        self.assertIn("Instagram download failed", "\n".join(captured.output))
 
     def test_brazilian_source_sends_manual_open_alert(self):
         with patch("monitor.send_manual_open_alert", return_value=True) as alert_mock:

@@ -30,6 +30,8 @@ from monitor import (
     create_best_moments_clip,
     create_vertical_short,
     detect_audio_peak_timestamps,
+    detect_runner_country,
+    discover_official_fallback_video,
     discover_tvnz_sport_videos,
     discover_tvnz_rss_videos,
     download_new_tvnz_sport_highlights,
@@ -49,6 +51,7 @@ from monitor import (
     prepare_telegram_message,
     search_and_download_youtube_video,
     select_official_youtube_candidate,
+    select_official_video_sources,
     send_downloaded_video_to_telegram,
     send_telegram_notification,
     should_send_notification,
@@ -953,6 +956,75 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(videos[0]["title"], "Portugal v Spain Match Highlights")
         self.assertEqual(videos[0]["webpage_url"], "https://www.youtube.com/watch?v=rssvideo01")
         self.assertEqual(videos[0]["published"], "2026-07-10T08:00:00+00:00")
+
+    def test_runner_country_detection_parses_country_and_logs_ip(self):
+        response = type("Response", (), {
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"ip": "203.0.113.10", "country": "us"},
+        })()
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True), \
+             patch("monitor.requests.get", return_value=response), \
+             self.assertLogs("football-monitor", level="INFO") as captured:
+            country = detect_runner_country()
+
+        self.assertEqual(country, "US")
+        self.assertIn("203.0.113.10", "\n".join(captured.output))
+
+    def test_runner_country_override_takes_priority(self):
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_COUNTRY_OVERRIDE": "nz"}, clear=True), \
+             patch("monitor.requests.get") as get_mock:
+            self.assertEqual(detect_runner_country(), "NZ")
+        get_mock.assert_not_called()
+
+    def test_nz_runner_selects_tvnz_official_source(self):
+        sources = select_official_video_sources("NZ", {})
+        self.assertEqual(sources[0]["name"], "TVNZ Sport")
+
+    def test_non_nz_runner_does_not_select_tvnz(self):
+        sources = select_official_video_sources("US", {"fifa_youtube_channel_id": "FIFA123"})
+        self.assertEqual([source["name"] for source in sources], ["FIFA"])
+
+    def test_official_fallback_uses_whitelisted_feed_without_youtube_search(self):
+        entries = [{
+            "yt_videoid": "fifa01",
+            "title": "Portugal v Spain Match Highlights | FIFA World Cup",
+            "link": "https://youtube.com/watch?v=fifa01",
+        }]
+        with patch("monitor.fetch_feed_entries", return_value=entries), \
+             patch("monitor.subprocess.run") as run_mock:
+            video = discover_official_fallback_video(
+                "Portugal v Spain Match Highlights | FIFA World Cup",
+                "US",
+                {"fifa_youtube_channel_id": "FIFA123"},
+            )
+
+        self.assertEqual(video["channel"], "FIFA")
+        run_mock.assert_not_called()
+
+    def test_geo_blocked_tvnz_triggers_official_feed_fallback(self):
+        tvnz_video = {
+            "id": "tvnz1", "title": "Portugal v Spain Match Highlights | FIFA World Cup",
+            "channel": "TVNZ Sport", "webpage_url": "https://youtube.com/watch?v=tvnz1",
+        }
+        fifa_video = {
+            "id": "fifa1", "title": tvnz_video["title"], "channel": "FIFA",
+            "webpage_url": "https://youtube.com/watch?v=fifa1",
+        }
+        with patch.dict(os.environ, {"RUNNER_COUNTRY_OVERRIDE": "NZ"}, clear=True), \
+             patch("monitor.discover_tvnz_sport_videos", return_value=[tvnz_video]), \
+             patch("monitor.download_youtube_video", side_effect=[GeoRestrictedVideoError(), None]) as download_mock, \
+             patch("monitor.discover_official_fallback_video", return_value=fifa_video) as fallback_mock:
+            count = download_new_tvnz_sport_highlights(
+                {"downloads_dir": Path("downloads"), "fifa_youtube_channel_id": "FIFA123"}, [],
+            )
+
+        self.assertEqual(count, 0)
+        self.assertEqual(download_mock.call_args_list[1].args[0], "https://youtube.com/watch?v=fifa1")
+        fallback_mock.assert_called_once()
+
+    def test_unofficial_sources_are_not_in_region_registry(self):
+        sources = select_official_video_sources("US", {"fifa_youtube_channel_id": "FIFA123"})
+        self.assertNotIn("Fan Football", [source["name"] for source in sources])
 
     def test_tvnz_rss_discovery_returns_multiple_matching_videos(self):
         entries = [

@@ -33,5 +33,7 @@ jobs:
           TVNZ_SCAN_LIMIT: "30"
           TVNZ_MAX_DOWNLOADS_PER_RUN: "5"
           TVNZ_YOUTUBE_CHANNEL_ID: "UCY8jpWswn6c3kpaHijtBUAg"
+          FIFA_YOUTUBE_CHANNEL_ID: ${{ vars.FIFA_YOUTUBE_CHANNEL_ID }}
+          RUNNER_COUNTRY_OVERRIDE: ${{ vars.RUNNER_COUNTRY_OVERRIDE }}
           PYTHONIOENCODING: "utf-8"
         run: python monitor.py --once

@@ -113,6 +113,10 @@ DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport/videos"
 FALLBACK_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport"
 TVNZ_YOUTUBE_CHANNEL_ID = "UCY8jpWswn6c3kpaHijtBUAg"
 TVNZ_YOUTUBE_RSS_URL_TEMPLATE = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+RUNNER_LOCATION_URL = "https://ipinfo.io/json"
+OFFICIAL_SOURCE_UNAVAILABLE_MESSAGE = (
+    "Official highlight found, but no downloadable official source is available for this runner country."
+)
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -2451,6 +2455,62 @@ def get_tvnz_youtube_channel_id(config: dict[str, Any]) -> str:
     ).strip()
 
 
+def detect_runner_country() -> str:
+    """Best-effort detection of the GitHub runner country, with an env override."""
+    override = str(os.getenv("RUNNER_COUNTRY_OVERRIDE", "") or "").strip().upper()
+    if override:
+        logger.info("Runner country: %s (RUNNER_COUNTRY_OVERRIDE)", override)
+        return override
+    if str(os.getenv("GITHUB_ACTIONS", "")).casefold() != "true":
+        logger.info("Runner country: unknown (not running in GitHub Actions)")
+        return ""
+    try:
+        response = requests.get(RUNNER_LOCATION_URL, headers={"User-Agent": USER_AGENT}, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        public_ip = str(payload.get("ip") or "").strip()
+        country = str(payload.get("country") or "").strip().upper()
+        if public_ip:
+            logger.info("Runner public IP: %s", public_ip)
+        logger.info("Runner country: %s", country or "unknown")
+        return country
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logger.warning("Runner country detection failed; continuing without it: %s", exc)
+        return ""
+
+
+def get_official_video_source_registry(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the only channels permitted for regional official-video discovery."""
+    return [
+        {
+            "name": "TVNZ Sport",
+            "countries": ["NZ"],
+            "channel_id": get_tvnz_youtube_channel_id(config),
+        },
+        {
+            "name": "FIFA",
+            "countries": ["GLOBAL"],
+            "channel_id": str(
+                config.get("fifa_youtube_channel_id")
+                or os.getenv("FIFA_YOUTUBE_CHANNEL_ID", "")
+                or ""
+            ).strip(),
+        },
+    ]
+
+
+def select_official_video_sources(country: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+    country = str(country or "").upper()
+    sources = [
+        source for source in get_official_video_source_registry(config)
+        if source.get("channel_id") and (
+            "GLOBAL" in source.get("countries", []) or country in source.get("countries", [])
+        )
+    ]
+    logger.info("Selected official video source group: %s", ", ".join(source["name"] for source in sources) or "none")
+    return sources
+
+
 def _tvnz_newest_sort_value(metadata: dict[str, Any], original_index: int) -> tuple[int, int]:
     """Sort newest first when yt-dlp provides dates, otherwise keep page order."""
     for key in ("timestamp", "release_timestamp", "modified_timestamp"):
@@ -2632,6 +2692,77 @@ def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
     return matched_videos
 
 
+OFFICIAL_MATCH_TITLE_TERMS = (
+    "match highlights", "fifa world cup", "round of 16", "quarter final",
+    "penalties", "shootout",
+)
+OFFICIAL_TITLE_STOP_WORDS = {
+    "match", "highlights", "fifa", "world", "cup", "round", "quarter",
+    "final", "penalties", "shootout", "the", "and", "vs", "v",
+}
+
+
+def official_fallback_title_matches(original_title: str, candidate_title: str) -> bool:
+    """Match an official fallback using event phrases and team/title terms."""
+    if any(_contains_normalized_phrase(candidate_title, term) for term in TVNZ_REJECTED_VIDEO_TERMS):
+        return False
+    if not any(_contains_normalized_phrase(candidate_title, term) for term in OFFICIAL_MATCH_TITLE_TERMS):
+        return False
+    original_terms = {
+        term for term in re.findall(r"[a-z0-9]+", normalize_channel_name(original_title))
+        if len(term) >= 3 and term not in OFFICIAL_TITLE_STOP_WORDS
+    }
+    candidate_terms = set(re.findall(r"[a-z0-9]+", normalize_channel_name(candidate_title)))
+    return not original_terms or len(original_terms & candidate_terms) >= min(2, len(original_terms))
+
+
+def discover_official_fallback_video(
+    title: str,
+    country: str,
+    config: dict[str, Any],
+    exclude_sources: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Find the same highlight only in region-eligible whitelisted channel feeds."""
+    excluded = {channel_identity(source) for source in (exclude_sources or set())}
+    scan_limit = parse_tvnz_scan_limit(config)
+    for source in select_official_video_sources(country, config):
+        if channel_identity(source["name"]) in excluded:
+            continue
+        feed_url = build_youtube_feed_url(str(source["channel_id"]))
+        logger.info("Discovering official fallback from %s RSS: %s", source["name"], feed_url)
+        try:
+            entries = fetch_feed_entries(feed_url)
+        except Exception as exc:
+            logger.warning("Official fallback feed failed for %s: %s", source["name"], exc)
+            continue
+        for video in parse_tvnz_rss_entries(entries, scan_limit):
+            video["channel"] = source["name"]
+            video["uploader"] = source["name"]
+            if official_fallback_title_matches(title, str(video.get("title") or "")):
+                logger.info("Official regional fallback found: %s | %s", source["name"], video.get("webpage_url", ""))
+                return video
+    return None
+
+
+def send_official_source_unavailable_alert(config: dict[str, Any]) -> bool:
+    """Notify Telegram that no whitelisted official source works in this region."""
+    token = str(config.get("telegram_bot_token", "") or "")
+    chat_id = str(config.get("telegram_chat_id", "") or "")
+    if not token or not chat_id:
+        logger.warning(OFFICIAL_SOURCE_UNAVAILABLE_MESSAGE)
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": OFFICIAL_SOURCE_UNAVAILABLE_MESSAGE},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        logger.warning("Failed to send unavailable official source alert to Telegram.")
+        return False
+
+
 def downloaded_tvnz_video_keys(alerts: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
     """Extract downloaded TVNZ video IDs and URLs from persisted alerts."""
     video_ids = {str(alert.get("video_id", "")) for alert in alerts if alert.get("video_id")}
@@ -2655,6 +2786,11 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
     already_processed_count = 0
     queued_ids = set(downloaded_ids)
     queued_urls = set(downloaded_urls)
+    runner_country = detect_runner_country()
+    if not runner_country and str(os.getenv("GITHUB_ACTIONS", "")).casefold() != "true":
+        runner_country = "NZ"  # Preserve the known-working local-PC behavior.
+    available_sources = select_official_video_sources(runner_country, config)
+    tvnz_available = any(channel_identity(source["name"]) == channel_identity(YOUTUBE_DOWNLOAD_CHANNEL) for source in available_sources)
 
     for video in matched_videos:
         video_url = _video_url_from_metadata(video)
@@ -2683,22 +2819,46 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
         logger.info("Selected TVNZ Sport video: %s | %s", video.get("title", ""), video_url)
 
     for video, video_url, video_id in selected_videos:
+        download_video = video
+        download_url = video_url
+        if not tvnz_available:
+            fallback_video = discover_official_fallback_video(
+                str(video.get("title") or ""), runner_country, config, {YOUTUBE_DOWNLOAD_CHANNEL},
+            )
+            if not fallback_video:
+                send_official_source_unavailable_alert(config)
+                continue
+            download_video = fallback_video
+            download_url = _video_url_from_metadata(fallback_video)
         try:
-            downloaded_path = download_youtube_video(video_url, downloads_dir, yt_dlp_bin)
+            downloaded_path = download_youtube_video(download_url, downloads_dir, yt_dlp_bin)
         except GeoRestrictedVideoError:
-            logger.warning("TVNZ Sport download is geo-restricted: %s", video_url)
-            continue
+            logger.warning("Official video download is geo-restricted: %s", download_url)
+            fallback_video = discover_official_fallback_video(
+                str(video.get("title") or ""), runner_country, config,
+                {str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL)},
+            )
+            if not fallback_video:
+                send_official_source_unavailable_alert(config)
+                continue
+            download_video = fallback_video
+            download_url = _video_url_from_metadata(fallback_video)
+            try:
+                downloaded_path = download_youtube_video(download_url, downloads_dir, yt_dlp_bin)
+            except GeoRestrictedVideoError:
+                send_official_source_unavailable_alert(config)
+                continue
         if not downloaded_path:
             continue
 
         story = {
             "title": video.get("title", ""),
-            "sources": [YOUTUBE_DOWNLOAD_CHANNEL],
-            "source": YOUTUBE_DOWNLOAD_CHANNEL,
-            "official_source": YOUTUBE_DOWNLOAD_CHANNEL,
-            "link": video_url,
-            "links": [video_url],
-            "video_url": video_url,
+            "sources": [str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL)],
+            "source": str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL),
+            "official_source": str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL),
+            "link": download_url,
+            "links": [download_url],
+            "video_url": download_url,
             "video_id": video_id,
             "content_category": "MATCH_HIGHLIGHT",
             "downloaded_video_path": downloaded_path,
@@ -2725,8 +2885,8 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
             "alert_type": "tvnz_download",
             "title": story.get("title", ""),
             "sources": [YOUTUBE_DOWNLOAD_CHANNEL],
-            "links": [video_url],
-            "video_url": video_url,
+            "links": [download_url],
+            "video_url": download_url,
             "video_id": video_id,
             "downloaded_video_path": downloaded_path,
             "moments_clip_path": story.get("moments_clip_path", ""),

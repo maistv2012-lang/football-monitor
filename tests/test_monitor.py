@@ -31,6 +31,7 @@ from monitor import (
     create_vertical_short,
     detect_audio_peak_timestamps,
     discover_tvnz_sport_videos,
+    discover_tvnz_rss_videos,
     download_new_tvnz_sport_highlights,
     download_youtube_video,
     discover_x_posts,
@@ -43,6 +44,7 @@ from monitor import (
     is_trusted_youtube_uploader,
     load_todays_fixtures,
     parse_tvnz_max_downloads_per_run,
+    parse_tvnz_rss_entries,
     process_cycle,
     prepare_telegram_message,
     search_and_download_youtube_video,
@@ -909,7 +911,8 @@ class MonitorTests(unittest.TestCase):
             "tvnz_backfill_limit": 2,
         }
 
-        with patch("monitor.subprocess.run", return_value=completed) as run_mock:
+        with patch("monitor.discover_tvnz_rss_videos", side_effect=RuntimeError("RSS unavailable")), \
+             patch("monitor.subprocess.run", return_value=completed) as run_mock:
             videos = discover_tvnz_sport_videos(config)
 
         self.assertEqual([video["id"] for video in videos], ["tvnz1", "tvnz2"])
@@ -925,6 +928,7 @@ class MonitorTests(unittest.TestCase):
 
         with patch("monitor.get_feeds", return_value={}), \
              patch.dict(os.environ, {}, clear=True), \
+             patch("monitor.discover_tvnz_rss_videos", side_effect=RuntimeError("RSS unavailable")), \
              patch("monitor.subprocess.run", return_value=completed) as run_mock:
             videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
 
@@ -937,11 +941,56 @@ class MonitorTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(parse_tvnz_max_downloads_per_run({}), 5)
 
+    def test_tvnz_rss_feed_entries_are_parsed(self):
+        videos = parse_tvnz_rss_entries([{
+            "yt_videoid": "rssvideo01",
+            "title": "Portugal v Spain Match Highlights",
+            "link": "https://www.youtube.com/watch?v=rssvideo01",
+            "published": "2026-07-10T08:00:00+00:00",
+        }], 30)
+
+        self.assertEqual(videos[0]["id"], "rssvideo01")
+        self.assertEqual(videos[0]["title"], "Portugal v Spain Match Highlights")
+        self.assertEqual(videos[0]["webpage_url"], "https://www.youtube.com/watch?v=rssvideo01")
+        self.assertEqual(videos[0]["published"], "2026-07-10T08:00:00+00:00")
+
+    def test_tvnz_rss_discovery_returns_multiple_matching_videos(self):
+        entries = [
+            {"yt_videoid": "rss1", "title": "Portugal Match Highlights", "link": "https://youtu.be/rss1"},
+            {"yt_videoid": "rss2", "title": "World Cup penalties shootout", "link": "https://youtu.be/rss2"},
+            {"yt_videoid": "rss3", "title": "Coach interview", "link": "https://youtu.be/rss3"},
+        ]
+        with patch("monitor.fetch_feed_entries", return_value=entries) as fetch_mock:
+            videos = discover_tvnz_sport_videos({})
+
+        self.assertEqual([video["id"] for video in videos], ["rss1", "rss2"])
+        self.assertEqual(
+            fetch_mock.call_args.args[0],
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCY8jpWswn6c3kpaHijtBUAg",
+        )
+
+    def test_tvnz_rss_scan_limit_is_applied_before_filtering(self):
+        entries = [
+            {"yt_videoid": "first", "title": "Coach interview", "link": "https://youtu.be/first"},
+            {"yt_videoid": "second", "title": "Match Highlights", "link": "https://youtu.be/second"},
+        ]
+        with patch("monitor.fetch_feed_entries", return_value=entries):
+            videos = discover_tvnz_rss_videos({"tvnz_scan_limit": 1})
+
+        self.assertEqual([video["id"] for video in videos], ["first"])
+
+    def test_between_two_goals_is_rejected(self):
+        self.assertFalse(is_tvnz_highlight_video({
+            "channel": "TVNZ Sport",
+            "title": "Between Two Goals | FIFA World Cup",
+        }))
+
     def test_monitor_workflow_sets_tvnz_limits_and_utf8(self):
         workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "monitor.yml").read_text(encoding="utf-8")
         self.assertIn('TVNZ_SCAN_LIMIT: "30"', workflow)
         self.assertIn('TVNZ_MAX_DOWNLOADS_PER_RUN: "5"', workflow)
         self.assertIn('PYTHONIOENCODING: "utf-8"', workflow)
+        self.assertIn('TVNZ_YOUTUBE_CHANNEL_ID: "UCY8jpWswn6c3kpaHijtBUAg"', workflow)
         self.assertIn("python -m pip install -U yt-dlp", workflow)
 
     def test_zero_tvnz_scan_logs_output_return_code_and_tries_fallback(self):
@@ -953,6 +1002,7 @@ class MonitorTests(unittest.TestCase):
 
         with patch("monitor.get_feeds", return_value={}), \
              patch.dict(os.environ, {}, clear=True), \
+             patch("monitor.discover_tvnz_rss_videos", side_effect=RuntimeError("RSS unavailable")), \
              patch("monitor.subprocess.run", side_effect=[empty, empty]) as run_mock, \
              self.assertLogs("football-monitor", level="INFO") as captured:
             videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
@@ -978,7 +1028,8 @@ class MonitorTests(unittest.TestCase):
             "stderr": "",
         })()
 
-        with patch("monitor.subprocess.run", return_value=completed):
+        with patch("monitor.discover_tvnz_rss_videos", side_effect=RuntimeError("RSS unavailable")), \
+             patch("monitor.subprocess.run", return_value=completed):
             videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
 
         self.assertEqual([video["id"] for video in videos], ["tvnz1", "tvnz2", "tvnz3"])
@@ -993,7 +1044,8 @@ class MonitorTests(unittest.TestCase):
             "stderr": "",
         })()
 
-        with patch("monitor.subprocess.run", return_value=completed):
+        with patch("monitor.discover_tvnz_rss_videos", side_effect=RuntimeError("RSS unavailable")), \
+             patch("monitor.subprocess.run", return_value=completed):
             videos = discover_tvnz_sport_videos({"yt_dlp_bin": "yt-dlp"})
 
         self.assertEqual([video["id"] for video in videos], ["new", "middle", "old"])
@@ -1021,6 +1073,20 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(count, 0)
         download_mock.assert_not_called()
+
+    def test_duplicate_video_ids_in_same_rss_batch_are_selected_once(self):
+        duplicate = {
+            "id": "tvnz1",
+            "title": "Portugal Match Highlights",
+            "channel": "TVNZ Sport",
+            "webpage_url": "https://youtube.com/watch?v=tvnz1",
+        }
+        with patch("monitor.discover_tvnz_sport_videos", return_value=[duplicate, dict(duplicate)]), \
+             patch("monitor.download_youtube_video", return_value=None) as download_mock:
+            count = download_new_tvnz_sport_highlights({"downloads_dir": Path("downloads")}, [])
+
+        self.assertEqual(count, 0)
+        download_mock.assert_called_once()
 
     def test_tvnz_max_downloads_per_run_is_respected(self):
         with TemporaryDirectory() as temp_dir:

@@ -111,6 +111,8 @@ DOWNLOAD_BLOCKED_CHANNELS = {"cazetv"}
 YOUTUBE_DOWNLOAD_CHANNEL = "TVNZ Sport"
 DEFAULT_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport/videos"
 FALLBACK_TVNZ_YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@TVNZSport"
+TVNZ_YOUTUBE_CHANNEL_ID = "UCY8jpWswn6c3kpaHijtBUAg"
+TVNZ_YOUTUBE_RSS_URL_TEMPLATE = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -141,6 +143,7 @@ TVNZ_REJECTED_VIDEO_TERMS = (
     "full match",
     "training",
     "betting",
+    "between two goals",
 )
 YOUTUBE_DOWNLOAD_TITLE_TERMS = ("match highlights", "extended highlights", "highlights")
 YOUTUBE_DOWNLOAD_REJECTED_TERMS = (
@@ -2439,6 +2442,15 @@ def parse_tvnz_max_downloads_per_run(config: dict[str, Any]) -> int:
     )
 
 
+def get_tvnz_youtube_channel_id(config: dict[str, Any]) -> str:
+    """Return the configured TVNZ Sport YouTube channel ID."""
+    return str(
+        config.get("tvnz_youtube_channel_id")
+        or os.getenv("TVNZ_YOUTUBE_CHANNEL_ID")
+        or TVNZ_YOUTUBE_CHANNEL_ID
+    ).strip()
+
+
 def _tvnz_newest_sort_value(metadata: dict[str, Any], original_index: int) -> tuple[int, int]:
     """Sort newest first when yt-dlp provides dates, otherwise keep page order."""
     for key in ("timestamp", "release_timestamp", "modified_timestamp"):
@@ -2485,8 +2497,52 @@ def _video_url_from_metadata(metadata: dict[str, Any]) -> str:
     return video_url
 
 
-def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Discover recent TVNZ Sport videos only."""
+def _rss_entry_value(entry: Any, key: str, default: Any = "") -> Any:
+    if isinstance(entry, dict):
+        return entry.get(key, default)
+    return getattr(entry, key, default)
+
+
+def parse_tvnz_rss_entries(entries: list[Any], scan_limit: int) -> list[dict[str, Any]]:
+    """Normalize YouTube RSS entries into TVNZ video metadata."""
+    videos: list[dict[str, Any]] = []
+    for entry in entries[:scan_limit]:
+        video_id = str(
+            _rss_entry_value(entry, "yt_videoid")
+            or _rss_entry_value(entry, "video_id")
+            or ""
+        ).strip()
+        link = str(_rss_entry_value(entry, "link") or "").strip()
+        if not video_id:
+            video_id = extract_youtube_video_id(link) or ""
+        if not link and video_id:
+            link = f"https://www.youtube.com/watch?v={video_id}"
+        videos.append({
+            "id": video_id,
+            "video_id": video_id,
+            "title": str(_rss_entry_value(entry, "title") or "").strip(),
+            "webpage_url": link,
+            "url": link,
+            "published": str(_rss_entry_value(entry, "published") or "").strip(),
+            "channel": YOUTUBE_DOWNLOAD_CHANNEL,
+            "uploader": YOUTUBE_DOWNLOAD_CHANNEL,
+        })
+    return videos
+
+
+def discover_tvnz_rss_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Discover TVNZ Sport videos from the official YouTube RSS feed."""
+    channel_id = get_tvnz_youtube_channel_id(config)
+    rss_url = TVNZ_YOUTUBE_RSS_URL_TEMPLATE.format(channel_id=channel_id)
+    scan_limit = parse_tvnz_scan_limit(config)
+    logger.info("TVNZ RSS URL: %s", rss_url)
+    entries = fetch_feed_entries(rss_url)
+    logger.info("TVNZ RSS entries found: %s", len(entries))
+    return parse_tvnz_rss_entries(entries, scan_limit)
+
+
+def _discover_tvnz_sport_videos_with_yt_dlp(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Fallback discovery using yt-dlp flat playlist extraction."""
     yt_dlp_bin = str(config.get("yt_dlp_bin", YT_DLP_BIN))
     source_url = get_tvnz_youtube_channel_url(config)
     scan_limit = parse_tvnz_scan_limit(config)
@@ -2557,6 +2613,25 @@ def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
     return videos
 
 
+def discover_tvnz_sport_videos(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Discover recent TVNZ Sport videos using RSS, then yt-dlp on failure."""
+    try:
+        scanned_videos = discover_tvnz_rss_videos(config)
+        if not scanned_videos:
+            raise ValueError("TVNZ RSS feed returned zero entries")
+    except Exception as exc:
+        logger.warning("TVNZ RSS discovery failed; falling back to yt-dlp: %s", exc)
+        return _discover_tvnz_sport_videos_with_yt_dlp(config)
+
+    matched_videos = [video for video in scanned_videos if is_tvnz_highlight_video(video)]
+    logger.info(
+        "TVNZ RSS scan summary: entries=%s matched_highlights=%s",
+        len(scanned_videos),
+        len(matched_videos),
+    )
+    return matched_videos
+
+
 def downloaded_tvnz_video_keys(alerts: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
     """Extract downloaded TVNZ video IDs and URLs from persisted alerts."""
     video_ids = {str(alert.get("video_id", "")) for alert in alerts if alert.get("video_id")}
@@ -2578,18 +2653,24 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
     matched_videos = discover_tvnz_sport_videos(config)
     selected_videos: list[tuple[dict[str, Any], str, str]] = []
     already_processed_count = 0
+    queued_ids = set(downloaded_ids)
+    queued_urls = set(downloaded_urls)
 
     for video in matched_videos:
         video_url = _video_url_from_metadata(video)
         video_id = str(video.get("id") or extract_youtube_video_id(video_url) or "").strip()
-        duplicate_by_id = bool(video_id and video_id in downloaded_ids)
-        duplicate_by_url = bool(video_url and video_url in downloaded_urls)
+        duplicate_by_id = bool(video_id and video_id in queued_ids)
+        duplicate_by_url = bool(video_url and video_url in queued_urls)
         if duplicate_by_id or duplicate_by_url:
             already_processed_count += 1
             continue
         if len(selected_videos) >= max_downloads:
             continue
         selected_videos.append((video, video_url, video_id))
+        if video_id:
+            queued_ids.add(video_id)
+        if video_url:
+            queued_urls.add(video_url)
 
     logger.info(
         "TVNZ Sport download plan: matched=%s already_processed=%s selected_for_download=%s max_per_run=%s",

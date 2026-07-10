@@ -168,6 +168,7 @@ PERSISTENT_STATE_FILES = {
 }
 PERSISTENT_STATE_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 RUN_DEDUPE_KEYS: set[str] = set()
+RESERVED_SEND_IDS: set[str] = set()
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -1145,6 +1146,7 @@ def reset_persistent_state_runtime() -> None:
     """Forget in-memory dedupe data while leaving persisted files intact."""
     PERSISTENT_STATE_CACHE.clear()
     RUN_DEDUPE_KEYS.clear()
+    RESERVED_SEND_IDS.clear()
 
 
 def persistent_state_contains(
@@ -1179,23 +1181,62 @@ def mark_persistent_state(
     }
     RUN_DEDUPE_KEYS.add(f"{category}:{media_id}")
     save_persistent_state(config)
-    label = "processed" if category == "sent_video_ids" else "downloaded" if category == "downloaded_video_ids" else "sent"
+    if category == "downloaded_video_ids":
+        label = "downloaded"
+    elif category.startswith("skipped_"):
+        label = "blocked"
+    else:
+        label = "sent"
     logger.info("Marked as %s: %s", label, media_id)
-
-
-def duplicate_sent_media(config: dict[str, Any], media_id: str) -> bool:
-    if not media_id:
-        return False
-    if any(f"{category}:{media_id}" in RUN_DEDUPE_KEYS for category in ("sent_alerts", "manual_open_links", "sent_video_ids")):
-        return True
-    return any(
-        persistent_state_contains(config, category, media_id)
-        for category in ("sent_alerts", "manual_open_links", "sent_video_ids")
-    )
 
 
 def log_duplicate(source: Any, title: Any, url: Any, media_id: str) -> None:
     logger.info("Duplicate skipped: %s | %s | %s | %s", source, title, url, media_id)
+
+
+def should_send_once(
+    item_id: str,
+    url: str,
+    title: str,
+    source: str,
+    kind: str,
+    config: dict[str, Any],
+) -> bool:
+    """Atomically reserve an unsent media ID for one Telegram attempt in this run."""
+    state_dir = _state_dir(config)
+    if state_dir is None or not item_id:
+        return True
+    reservation_key = f"{state_dir.resolve()}|{item_id}"
+    manual_ttl = float(config.get("manual_link_duplicate_ttl_hours", 48) or 48)
+    duplicate = (
+        reservation_key in RESERVED_SEND_IDS
+        or persistent_state_contains(config, "sent_alerts", item_id)
+        or persistent_state_contains(config, "sent_video_ids", item_id)
+        or persistent_state_contains(
+            config, "manual_open_links", item_id,
+            manual_ttl if kind == "manual_open" else None,
+        )
+    )
+    if duplicate:
+        logger.info("Duplicate skipped: %s | %s | %s | %s | %s", kind, source, title, url, item_id)
+        return False
+    RESERVED_SEND_IDS.add(reservation_key)
+    logger.info("Reserved in memory: %s", item_id)
+    return True
+
+
+def release_send_reservation(config: dict[str, Any], item_id: str) -> None:
+    state_dir = _state_dir(config)
+    if state_dir is not None and item_id:
+        RESERVED_SEND_IDS.discard(f"{state_dir.resolve()}|{item_id}")
+
+
+def mark_as_sent(
+    config: dict[str, Any], category: str, item_id: str,
+    source: str, title: str, url: str,
+) -> None:
+    """Commit one successful Telegram delivery to exactly one persistent category."""
+    mark_persistent_state(config, category, item_id, source, title, url)
 
 
 def build_video_search_url(query: str) -> str:
@@ -1917,12 +1958,12 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         or next(iter(grouped_article.get("sources") or []), "Unknown")
     )
     notification_id = normalize_media_id(notification_url)
-    if notification_id and duplicate_sent_media(config, notification_id):
-        log_duplicate(notification_source, notification_title, notification_url, notification_id)
-        return False
-
     if not token or not chat_id:
         logger.warning("Telegram credentials are not configured. Skipping notification for %s", notification_title)
+        return False
+    if notification_id and not should_send_once(
+        notification_id, notification_url, notification_title, notification_source, "alert", config,
+    ):
         return False
 
     source_for_classification = grouped_article.get("official_source", "") or next(
@@ -2028,18 +2069,21 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         if status_code != 200:
             response_body = str(response.text or "").replace(token, "[REDACTED]")
             logger.error("Telegram %s\nResponse:\n%s", status_code, response_body)
+            release_send_reservation(config, notification_id)
             return False
 
     except requests.exceptions.RequestException:
+        release_send_reservation(config, notification_id)
         logger.error("Telegram request failed before a valid response was received for %s", notification_title)
         return False
     except Exception:
+        release_send_reservation(config, notification_id)
         logger.error("Unexpected Telegram failure for %s", notification_title)
         return False
 
     logger.info("Telegram notification sent for %s", notification_title)
     if notification_id:
-        mark_persistent_state(
+        mark_as_sent(
             config, "sent_alerts", notification_id,
             notification_source, notification_title, notification_url,
         )
@@ -2614,16 +2658,16 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
     source = str(story.get("source") or next(iter(story.get("sources") or []), "Unknown"))
     media_url = str(story.get("video_url") or story.get("link") or Path(file_path).resolve())
     media_id = normalize_media_id(media_url)
-    if persistent_state_contains(dedupe_config, "sent_video_ids", media_id):
-        log_duplicate(source, title, media_url, media_id)
-        return False
     if not token or not chat_id:
         logger.warning("Telegram credentials are not configured. Skipping downloaded video delivery for %s", title)
+        return False
+    if not should_send_once(media_id, media_url, title, source, "video", dedupe_config):
         return False
 
     path = Path(file_path)
     try:
         if not path.exists() or not path.is_file():
+            release_send_reservation(dedupe_config, media_id)
             logger.warning("Downloaded video file not found for Telegram delivery: %s", path)
             return False
         file_size = path.stat().st_size
@@ -2640,7 +2684,9 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
             )
             if response.status_code != 200:
                 logger.error("Telegram %s\nResponse:\n%s", response.status_code, str(response.text or "").replace(token, "[REDACTED]"))
+                release_send_reservation(dedupe_config, media_id)
                 return False
+            mark_as_sent(dedupe_config, "sent_video_ids", media_id, source, title, media_url)
             return True
 
         caption = build_downloaded_video_caption(story).replace(token, "[REDACTED]")
@@ -2654,7 +2700,7 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
                 )
             if response.status_code == 200:
                 logger.info("Downloaded video sent to Telegram with %s for %s", method, title)
-                mark_persistent_state(
+                mark_as_sent(
                     dedupe_config, "sent_video_ids", media_id,
                     source, title, media_url,
                 )
@@ -2662,11 +2708,14 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
             logger.error("Telegram %s\nResponse:\n%s", response.status_code, str(response.text or "").replace(token, "[REDACTED]"))
             if method == "sendVideo":
                 logger.info("Telegram sendVideo failed. Retrying with sendDocument.")
+        release_send_reservation(dedupe_config, media_id)
         return False
     except requests.exceptions.RequestException:
+        release_send_reservation(dedupe_config, media_id)
         logger.error("Telegram downloaded video delivery failed for %s", title)
         return False
     except Exception:
+        release_send_reservation(dedupe_config, media_id)
         logger.error("Unexpected Telegram downloaded video delivery failure for %s", title)
         return False
 
@@ -2732,18 +2781,8 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
     if not url:
         return False
     media_id = normalize_media_id(url)
-    manual_ttl = float(config.get("manual_link_duplicate_ttl_hours", 48) or 48)
-    if (
-        f"manual_open_links:{media_id}" in RUN_DEDUPE_KEYS
-        or persistent_state_contains(config, "manual_open_links", media_id, manual_ttl)
-        or persistent_state_contains(config, "sent_alerts", media_id)
-        or persistent_state_contains(config, "sent_video_ids", media_id)
-    ):
-        logger.info("Manual link duplicate skipped: %s", url)
-        log_duplicate(video.get("source") or video.get("channel"), video.get("title"), url, media_id)
-        return False
     recent = load_manual_links(config)
-    if any(
+    if _state_dir(config) is None and any(
         str(item.get("url") or "").strip() == url
         or bool(video_id and str(item.get("video_id") or "").strip() == video_id)
         for item in recent
@@ -2754,6 +2793,10 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
     if not token or not config.get("telegram_chat_id"):
         logger.warning("Telegram credentials are not configured. Manual link not sent: %s", url)
         return False
+    source = str(video.get("source") or video.get("channel") or video.get("uploader") or "Unknown")
+    title = str(video.get("title") or "Football video")
+    if not should_send_once(media_id, url, title, source, "manual_open", config):
+        return False
     payload = build_manual_open_payload(video, config)
     try:
         response = requests.post(
@@ -2762,8 +2805,10 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         if response.status_code != 200:
+            release_send_reservation(config, media_id)
             return False
     except requests.RequestException:
+        release_send_reservation(config, media_id)
         return False
     recent.append({
         "title": str(video.get("title") or "Football video"),
@@ -2775,10 +2820,9 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     save_manual_links(recent, config)
-    mark_persistent_state(
+    mark_as_sent(
         config, "manual_open_links", media_id,
-        str(video.get("source") or video.get("channel") or video.get("uploader") or "Unknown"),
-        str(video.get("title") or "Football video"), url,
+        source, title, url,
     )
     logger.info("Manual open link sent: %s", url)
     return True
@@ -2797,13 +2841,9 @@ def send_controversy_alert(article: dict[str, Any], config: dict[str, Any]) -> b
     if not url:
         return False
     media_id = normalize_media_id(url)
-    if duplicate_sent_media(config, media_id):
-        logger.info("Duplicate controversy skipped: %s", url)
-        log_duplicate(source, title, url, media_id)
-        return False
     now = datetime.now(timezone.utc)
     recent = load_manual_links(config)
-    for item in recent:
+    for item in recent if _state_dir(config) is None else []:
         if str(item.get("url") or "") == url:
             logger.info("Duplicate controversy skipped: %s", url)
             return False
@@ -2824,6 +2864,8 @@ def send_controversy_alert(article: dict[str, Any], config: dict[str, Any]) -> b
     chat_id = str(config.get("telegram_chat_id", "") or "")
     if not token or not chat_id:
         return False
+    if not should_send_once(media_id, url, title, source, "controversy", config):
+        return False
     message = (
         "🚨 POLÊMICA NO FUTEBOL\n\n"
         f"Title: {title}\nSource: {source}\n"
@@ -2841,8 +2883,10 @@ def send_controversy_alert(article: dict[str, Any], config: dict[str, Any]) -> b
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         if response.status_code != 200:
+            release_send_reservation(config, media_id)
             return False
     except requests.RequestException:
+        release_send_reservation(config, media_id)
         return False
     recent.append({
         "kind": "controversy", "title": title, "source": source,
@@ -2851,7 +2895,7 @@ def send_controversy_alert(article: dict[str, Any], config: dict[str, Any]) -> b
         "created_at": now.isoformat(),
     })
     save_manual_links(recent, config)
-    mark_persistent_state(config, "sent_alerts", media_id, source, title, url)
+    mark_as_sent(config, "sent_alerts", media_id, source, title, url)
     logger.info("Manual open link sent: %s", url)
     return True
 
@@ -2977,11 +3021,6 @@ def process_local_video_file(
     telegram_path = create_vertical_short(moments_path, video_story) or moments_path
     sent = send_downloaded_video_to_telegram(telegram_path, video_story)
     video_story.pop("_telegram_config", None)
-    if sent:
-        mark_persistent_state(
-            config, "sent_video_ids", media_id,
-            str(video_story.get("source") or "Local MP4"), str(video_story.get("title") or ""), media_url,
-        )
     return sent
 
 
@@ -3029,6 +3068,7 @@ def handle_telegram_command(command: str, config: dict[str, Any]) -> bool:
                 for category in PERSISTENT_STATE_FILES:
                     state[category] = {}
                 RUN_DEDUPE_KEYS.clear()
+                RESERVED_SEND_IDS.clear()
                 save_persistent_state(config)
             message = "Persistent duplicate state cleared."
     else:
@@ -3577,12 +3617,6 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
         if not telegram_sent:
             logger.warning("Telegram delivery failed for TVNZ Sport video; leaving unprocessed for retry: %s", video_url)
             continue
-
-        mark_persistent_state(
-            config, "sent_video_ids", normalize_media_id(download_url),
-            str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL),
-            str(download_video.get("title") or ""), download_url,
-        )
 
         alerts.append({
             "alert_type": "tvnz_download",

@@ -53,6 +53,7 @@ from monitor import (
     is_trusted_youtube_uploader,
     load_todays_fixtures,
     main,
+    mark_as_sent,
     load_persistent_state,
     mark_persistent_state,
     normalize_media_id,
@@ -1239,6 +1240,69 @@ class MonitorTests(unittest.TestCase):
                 self.assertNotIn(normalize_media_id(url), state["manual_open_links"])
                 self.assertTrue(send_manual_open_alert(video, config))
                 self.assertIn(normalize_media_id(url), state["manual_open_links"])
+
+    def test_same_id_in_same_run_is_reserved_and_sent_once(self):
+        response = type("Response", (), {"status_code": 200})()
+        url = "https://youtube.com/watch?v=Lfo49ZbV4WU"
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": Path(temp_dir) / "manual.json",
+                "monitor_state_dir": Path(temp_dir) / ".monitor_state",
+            }
+            video = {"title": "Match Highlights", "source": "FIFA", "url": url}
+            reset_persistent_state_runtime()
+            with patch("monitor.requests.post", return_value=response) as post_mock, \
+                 patch("monitor.mark_as_sent", wraps=mark_as_sent) as mark_mock, \
+                 self.assertLogs("football-monitor", level="INFO") as captured:
+                self.assertTrue(send_manual_open_alert(video, config))
+                self.assertFalse(send_manual_open_alert(video, config))
+
+        self.assertEqual(post_mock.call_count, 1)
+        self.assertEqual(mark_mock.call_count, 1)
+        logs = "\n".join(captured.output)
+        self.assertIn("Reserved in memory: youtube:Lfo49ZbV4WU", logs)
+        self.assertIn("Duplicate skipped: manual_open | FIFA | Match Highlights", logs)
+
+    def test_manual_mark_happens_after_telegram_success(self):
+        response = type("Response", (), {"status_code": 200})()
+        url = "https://youtube.com/shorts/Lfo49ZbV4WU"
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": Path(temp_dir) / "manual.json",
+                "monitor_state_dir": Path(temp_dir) / ".monitor_state",
+            }
+            reset_persistent_state_runtime()
+            with patch("monitor.mark_as_sent", wraps=mark_as_sent) as mark_mock:
+                def telegram_send(*args, **kwargs):
+                    mark_mock.assert_not_called()
+                    return response
+
+                with patch("monitor.requests.post", side_effect=telegram_send):
+                    sent = send_manual_open_alert(
+                        {"title": "Short", "source": "FIFA", "url": url}, config,
+                    )
+        self.assertTrue(sent)
+        mark_mock.assert_called_once()
+
+    def test_mark_as_sent_is_not_called_when_telegram_fails(self):
+        failure = type("Response", (), {"status_code": 500})()
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": Path(temp_dir) / "manual.json",
+                "monitor_state_dir": Path(temp_dir) / ".monitor_state",
+            }
+            reset_persistent_state_runtime()
+            with patch("monitor.requests.post", return_value=failure), \
+                 patch("monitor.mark_as_sent") as mark_mock:
+                sent = send_manual_open_alert({
+                    "title": "Video", "source": "TVNZ Sport",
+                    "url": "https://youtube.com/watch?v=failure1234",
+                }, config)
+        self.assertFalse(sent)
+        mark_mock.assert_not_called()
 
     def test_controversy_phrases_have_high_priority(self):
         for title in (

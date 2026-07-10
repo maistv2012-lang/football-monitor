@@ -2018,7 +2018,7 @@ def probe_video_duration_seconds(video_path: str | Path) -> float | None:
 def detect_scene_change_timestamps(video_path: str | Path, duration_seconds: float, limit: int = 20) -> list[float]:
     """Try to find scene-change timestamps with ffmpeg, returning an empty list on failure."""
     safe_start = 2.0 if duration_seconds > 5 else 0.0
-    safe_end = max(safe_start, duration_seconds - 3.0) if duration_seconds > 8 else duration_seconds
+    safe_end = max(safe_start, duration_seconds - 2.0) if duration_seconds > 8 else duration_seconds
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -2044,41 +2044,85 @@ def detect_scene_change_timestamps(video_path: str | Path, duration_seconds: flo
     return timestamps
 
 
-def select_best_moment_segments(duration_seconds: float, scene_timestamps: list[float] | None = None, max_total_seconds: int = 35) -> list[tuple[float, float]]:
-    """Select short segments spread across a longer highlight video."""
-    duration = max(0.0, float(duration_seconds or 0))
-    max_total = max(1.0, float(max_total_seconds or 35))
-    safe_start = 2.0 if duration > 5 else 0.0
-    safe_end = max(safe_start + 1.0, duration - 3.0) if duration > 8 else duration
-    usable = max(1.0, safe_end - safe_start)
-    segment_count = 4 if usable >= 40 and max_total >= 28 else 3
-    segment_length = min(10.0, max(7.0, max_total / segment_count))
-    segment_length = min(segment_length, usable / segment_count if usable < segment_count * segment_length else segment_length)
-    segment_length = max(1.0, segment_length)
-
-    anchors = [timestamp for timestamp in (scene_timestamps or []) if safe_start <= timestamp <= safe_end]
-    if len(anchors) >= segment_count:
-        step = len(anchors) / segment_count
-        starts = [anchors[min(len(anchors) - 1, int(round(index * step)))] for index in range(segment_count)]
-    else:
-        if segment_count == 1:
-            starts = [safe_start]
+def merge_moment_segments(segments: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Merge overlapping or touching moment windows."""
+    if not segments:
+        return []
+    ordered = sorted(segments)
+    merged: list[tuple[float, float]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        previous_start, previous_end = merged[-1]
+        if start <= previous_end:
+            merged[-1] = (previous_start, max(previous_end, end))
         else:
-            available_start_span = max(0.0, usable - segment_length)
-            starts = [safe_start + (available_start_span * index / (segment_count - 1)) for index in range(segment_count)]
+            merged.append((start, end))
+    return [(round(start, 2), round(end, 2)) for start, end in merged]
 
-    segments: list[tuple[float, float]] = []
-    for start in starts:
-        bounded_start = min(max(safe_start, start), max(safe_start, safe_end - segment_length))
-        end = min(safe_end, bounded_start + segment_length)
-        if end > bounded_start:
-            segments.append((round(bounded_start, 2), round(end, 2)))
 
-    total_duration = sum(end - start for start, end in segments)
-    if total_duration > max_total:
-        scale = max_total / total_duration
-        segments = [(start, round(start + ((end - start) * scale), 2)) for start, end in segments]
-    return segments
+def clamp_centered_segment(center: float, duration: float, before_seconds: float = 7.0, after_seconds: float = 12.0) -> tuple[float, float]:
+    """Create one padded segment around a moment center."""
+    safe_start = 2.0 if duration > 24 else 0.0
+    safe_end = max(safe_start + 1.0, duration - 2.0) if duration > 8 else duration
+    target_length = before_seconds + after_seconds
+    start = center - before_seconds
+    end = center + after_seconds
+
+    if start < safe_start:
+        end += safe_start - start
+        start = safe_start
+    if end > safe_end:
+        start -= end - safe_end
+        end = safe_end
+    start = max(0.0, max(safe_start, start))
+    end = min(duration, max(start + 1.0, end))
+    if end - start > target_length:
+        end = start + target_length
+    return round(start, 2), round(end, 2)
+
+
+def limit_segments_total_duration(segments: list[tuple[float, float]], max_total_seconds: float) -> list[tuple[float, float]]:
+    """Trim segment ends if merged windows exceed the allowed total."""
+    limited: list[tuple[float, float]] = []
+    remaining = max(1.0, max_total_seconds)
+    for start, end in segments:
+        length = end - start
+        if remaining <= 0:
+            break
+        if length <= remaining:
+            limited.append((start, end))
+            remaining -= length
+        else:
+            limited.append((start, round(start + remaining, 2)))
+            break
+    return [(round(start, 2), round(end, 2)) for start, end in limited if end > start]
+
+
+def select_best_moment_segments(duration_seconds: float, scene_timestamps: list[float] | None = None, max_total_seconds: int = 45) -> list[tuple[float, float]]:
+    """Select natural football segments around moment centers."""
+    duration = max(0.0, float(duration_seconds or 0))
+    max_total = max(1.0, float(max_total_seconds or 45))
+    if duration <= 0:
+        return []
+
+    safe_start = 2.0 if duration > 24 else 0.0
+    safe_end = max(safe_start + 1.0, duration - 2.0) if duration > 8 else duration
+    centers = [timestamp for timestamp in (scene_timestamps or []) if safe_start <= timestamp <= safe_end]
+    if centers:
+        target_centers = [duration * 0.35, duration * 0.70]
+        selected_centers: list[float] = []
+        available_centers = list(centers)
+        for target_center in target_centers:
+            if not available_centers:
+                break
+            closest = min(available_centers, key=lambda timestamp: abs(timestamp - target_center))
+            selected_centers.append(closest)
+            available_centers.remove(closest)
+        centers = selected_centers
+    else:
+        centers = [duration * 0.35, duration * 0.70]
+
+    segments = merge_moment_segments([clamp_centered_segment(center, duration) for center in centers])
+    return limit_segments_total_duration(segments, max_total)
 
 
 def _run_moments_concat_command(source_path: Path, output_path: Path, segments: list[tuple[float, float]]) -> bool:
@@ -2111,9 +2155,12 @@ def _run_moments_concat_command(source_path: Path, output_path: Path, segments: 
 
 
 def _create_start_moments_clip(source_path: Path, output_path: Path, duration_seconds: float | None, max_total_seconds: int) -> str | None:
-    start_offset = 2.0 if not duration_seconds or duration_seconds > 5 else 0.0
-    clip_duration = min(30.0, float(max_total_seconds or 35))
+    clip_duration = min(35.0, float(max_total_seconds or 45))
+    start_offset = 2.0
     if duration_seconds:
+        start_offset = max(0.0, duration_seconds * 0.20)
+        if duration_seconds > 8:
+            start_offset = min(start_offset, max(0.0, duration_seconds - clip_duration - 2.0))
         clip_duration = max(1.0, min(clip_duration, max(1.0, duration_seconds - start_offset)))
     command = [
         "ffmpeg",
@@ -2141,7 +2188,7 @@ def _create_start_moments_clip(source_path: Path, output_path: Path, duration_se
     return None
 
 
-def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | None = None, max_total_seconds: int = 35) -> str | None:
+def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | None = None, max_total_seconds: int = 45) -> str | None:
     """Create a short horizontal best-moments MP4 before vertical conversion."""
     source_path = Path(video_path)
     story = story or {}
@@ -2152,7 +2199,7 @@ def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | Non
 
         duration = probe_video_duration_seconds(source_path)
         logger.info("Original TVNZ highlight duration: %s seconds", round(duration, 2) if duration else "unknown")
-        max_total = max(1, int(max_total_seconds or 35))
+        max_total = max(1, int(max_total_seconds or 45))
         if duration is not None and duration <= max_total:
             logger.info("Source is already short enough for Telegram moments: %s", source_path)
             story["moments_clip_path"] = str(source_path)
@@ -2163,14 +2210,15 @@ def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | Non
         output_path = shorts_dir / f"{source_path.stem}_moments.mp4"
         scene_timestamps = detect_scene_change_timestamps(source_path, duration or float(max_total * 3))
         segments = select_best_moment_segments(duration or float(max_total * 3), scene_timestamps, max_total)
-        logger.info("Selected best moments segments: %s", segments)
+        for start, end in segments:
+            logger.info("Selected moment segment: start=%s end=%s", start, end)
         try:
             if segments and _run_moments_concat_command(source_path, output_path, segments):
                 logger.info("Created best moments clip: %s", output_path)
                 story["moments_clip_path"] = str(output_path)
                 return str(output_path)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            logger.warning("Best moments concat failed. Falling back to a 30-second clip: %s", exc)
+            logger.warning("Best moments concat failed. Falling back to a 35-second clip: %s", exc)
 
         fallback_path = _create_start_moments_clip(source_path, output_path, duration, max_total)
         if fallback_path:

@@ -725,13 +725,23 @@ class MonitorTests(unittest.TestCase):
         run_mock.assert_not_called()
 
     def test_selected_moments_total_duration_is_limited(self):
-        segments = select_best_moment_segments(150.0, [5, 45, 90, 130], max_total_seconds=35)
+        segments = select_best_moment_segments(150.0, [5, 45, 90, 130], max_total_seconds=45)
 
         total_duration = sum(end - start for start, end in segments)
-        self.assertLessEqual(total_duration, 35.0)
-        self.assertGreaterEqual(len(segments), 3)
+        self.assertLessEqual(total_duration, 45.0)
+        self.assertLessEqual(len(segments), 2)
 
-    def test_create_best_moments_clip_falls_back_to_evenly_spaced_segments(self):
+    def test_selected_moments_include_padding_before_and_after_timestamp(self):
+        segments = select_best_moment_segments(120.0, [50.0], max_total_seconds=45)
+
+        self.assertEqual(segments, [(43.0, 62.0)])
+
+    def test_overlapping_moment_segments_are_merged(self):
+        segments = select_best_moment_segments(120.0, [50.0, 55.0], max_total_seconds=45)
+
+        self.assertEqual(segments, [(43.0, 67.0)])
+
+    def test_create_best_moments_clip_falls_back_to_natural_windows(self):
         with TemporaryDirectory() as temp_dir:
             old_cwd = Path.cwd()
             os.chdir(temp_dir)
@@ -756,7 +766,8 @@ class MonitorTests(unittest.TestCase):
                 os.chdir(old_cwd)
 
         self.assertEqual(output, str(Path("shorts") / "tvnz_moments.mp4"))
-        self.assertTrue(any("trim=start=2.0" in command for command in captured_filters))
+        self.assertTrue(any("trim=start=28.0:end=47.0" in command for command in captured_filters))
+        self.assertTrue(any("trim=start=63.0:end=82.0" in command for command in captured_filters))
 
     def test_tvnz_highlight_video_is_accepted(self):
         self.assertTrue(is_tvnz_highlight_video({

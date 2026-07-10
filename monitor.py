@@ -124,6 +124,39 @@ BOT_VERIFICATION_TERMS = (
     "sign in to confirm you're not a bot", "sign in to confirm you are not a bot",
     "confirm you’re not a bot", "bot verification", "cookies-from-browser",
 )
+CONTROVERSY_THRESHOLD = 70
+CONTROVERSY_KEYWORDS_PT = (
+    "polêmica", "lance polêmico", "arbitragem", "erro de arbitragem", "var", "pênalti",
+    "pênalti não marcado", "penalti não dado", "gol anulado", "impedimento",
+    "impedimento duvidoso", "mão na bola", "falta no lance do gol", "falta antes do gol",
+    "expulsão", "cartão vermelho", "entrada criminosa", "confusão", "briga", "reclamação",
+    "juiz", "árbitro", "roubo", "vergonhoso",
+)
+CONTROVERSY_KEYWORDS_EN = (
+    "controversy", "controversial", "var", "penalty not given", "penalty denied",
+    "disallowed goal", "offside", "handball", "red card", "referee mistake",
+    "foul before goal", "controversial tackle", "fight", "protest",
+)
+HIGH_CONTROVERSY_TERMS = (
+    "pênalti não marcado", "penalti não dado", "gol anulado", "falta antes do gol",
+    "penalty not given", "penalty denied", "disallowed goal", "red card", "cartão vermelho",
+    "referee mistake", "erro de arbitragem", "impedimento duvidoso", "controversial tackle",
+)
+BRAZILIAN_SPORTS_SOURCES = (
+    "Globo Esporte", "ge", "SporTV", "TNT Sports Brasil", "Gazeta Esportiva",
+    "Gazeta TV", "CazéTV", "ESPN Brasil",
+)
+BRAZILIAN_SOURCE_REGISTRY = [
+    {"name": name, "category": "brazilian_sports_source", "default_mode": "manual_open_alert"}
+    for name in BRAZILIAN_SPORTS_SOURCES
+]
+DEFAULT_MANUAL_SOCIAL_SOURCES = [
+    {"name": "Globo Esporte/ge Instagram", "url": "https://www.instagram.com/ge.globo/"},
+    {"name": "SporTV Instagram", "url": "https://www.instagram.com/sportv/"},
+    {"name": "TNT Sports Brasil Instagram", "url": "https://www.instagram.com/tntsportsbr/"},
+    {"name": "Gazeta Esportiva/Gazeta TV Instagram", "url": "https://www.instagram.com/gazetaesportiva/"},
+    {"name": "CazéTV Instagram", "url": "https://www.instagram.com/cazetv/"},
+]
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -1068,6 +1101,55 @@ def build_manual_grouped_article(headline: str) -> dict[str, Any]:
     shorts_pack = build_portuguese_shorts_pack(grouped_article, {})
     grouped_article.update(shorts_pack)
     return grouped_article
+
+
+def controversy_score_for_title(title: Any) -> int:
+    """Score controversial football wording from 0-100."""
+    normalized = normalize_channel_name(title)
+    matched = [
+        term for term in CONTROVERSY_KEYWORDS_PT + CONTROVERSY_KEYWORDS_EN
+        if _contains_normalized_phrase(normalized, term)
+    ]
+    if not matched:
+        return 0
+    score = 45 + min(30, (len(set(matched)) - 1) * 10)
+    if any(_contains_normalized_phrase(normalized, term) for term in HIGH_CONTROVERSY_TERMS):
+        score += 30
+    return min(100, score)
+
+
+def is_brazilian_sports_source(source: Any) -> bool:
+    identity = channel_identity(source)
+    return any(identity == channel_identity(name) for name in BRAZILIAN_SPORTS_SOURCES)
+
+
+def source_category(source: Any, url: str = "") -> str:
+    platform = video_platform_from_url(url)
+    if platform in {"X/Twitter", "TikTok", "Instagram"}:
+        return "social_manual_source"
+    if is_brazilian_sports_source(source):
+        return "brazilian_sports_source"
+    if channel_identity(source) in {channel_identity("TVNZ Sport"), channel_identity("FIFA")}:
+        return "official_video_source"
+    return "news_source"
+
+
+def apply_priority_scores(article: dict[str, Any]) -> dict[str, Any]:
+    """Attach controversy, viral, source, and final priority scores."""
+    controversy_score = controversy_score_for_title(article.get("title", ""))
+    viral_score = calculate_viral_score(article) if "viral_score" not in article else int(float(article.get("viral_score") or 0))
+    sources = article.get("sources") or [article.get("source", "")]
+    source_score = max(
+        (25 if is_brazilian_sports_source(source) else 20 if channel_identity(source) in {
+            channel_identity("TVNZ Sport"), channel_identity("FIFA")
+        } else 10 for source in sources if source),
+        default=0,
+    )
+    article["controversy_score"] = controversy_score
+    article["viral_score"] = viral_score
+    article["source_score"] = source_score
+    article["final_priority_score"] = min(100, round(controversy_score * 0.55 + viral_score * 0.3 + source_score * 0.15))
+    return article
 
 
 def calculate_viral_score(grouped_article: dict[str, Any]) -> int:
@@ -2470,6 +2552,8 @@ def build_manual_open_payload(video: dict[str, Any], config: dict[str, Any]) -> 
         f"Title: {title}\nSource: {source}\nPlatform: {platform}\n"
         f"Original URL: {url}\nStatus: {status}"
     )
+    if platform == "Instagram":
+        text += "\n\nOpen manually. Send the video file to the bot if you want editing."
     return {
         "chat_id": str(config.get("telegram_chat_id", "") or ""),
         "text": text,
@@ -2521,6 +2605,72 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
     return True
 
 
+def send_controversy_alert(article: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Send a high-priority controversy alert with 24-hour title/source deduplication."""
+    apply_priority_scores(article)
+    if article["controversy_score"] < CONTROVERSY_THRESHOLD:
+        return False
+    title = str(article.get("title") or "Football controversy").strip()
+    sources = article.get("sources") or [article.get("source") or "Unknown"]
+    source = str(next((item for item in sources if item), "Unknown"))
+    links = article.get("links") or []
+    url = str(article.get("link") or article.get("video_url") or (links[0] if links else "")).strip()
+    if not url:
+        return False
+    now = datetime.now(timezone.utc)
+    recent = load_manual_links(config)
+    for item in recent:
+        if str(item.get("url") or "") == url:
+            logger.info("Duplicate controversy skipped: %s", url)
+            return False
+        try:
+            created = datetime.fromisoformat(str(item.get("created_at") or ""))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if (
+            normalize_channel_name(item.get("title")) == normalize_channel_name(title)
+            and channel_identity(item.get("source")) == channel_identity(source)
+            and (now - created).total_seconds() < 86400
+        ):
+            logger.info("Duplicate controversy skipped: %s | %s", source, title)
+            return False
+    token = str(config.get("telegram_bot_token", "") or "")
+    chat_id = str(config.get("telegram_chat_id", "") or "")
+    if not token or not chat_id:
+        return False
+    message = (
+        "🚨 POLÊMICA NO FUTEBOL\n\n"
+        f"Title: {title}\nSource: {source}\n"
+        f"Why it matters: controversy score {article['controversy_score']}/100; priority {article['final_priority_score']}/100\n"
+        f"Link: {url}"
+    )
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "reply_markup": {"inline_keyboard": [[{"text": "ABRIR LANCE", "url": url}]]},
+    }
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage", json=payload,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            return False
+    except requests.RequestException:
+        return False
+    recent.append({
+        "kind": "controversy", "title": title, "source": source,
+        "platform": video_platform_from_url(url), "url": url,
+        "status": "high-priority controversy", "controversy_score": article["controversy_score"],
+        "created_at": now.isoformat(),
+    })
+    save_manual_links(recent, config)
+    logger.info("Manual open link sent: %s", url)
+    return True
+
+
 def handle_manual_only_video_source(video: dict[str, Any], config: dict[str, Any]) -> bool:
     """Route X, TikTok, Instagram, and unsupported sources to manual-open only."""
     manual_video = dict(video)
@@ -2528,7 +2678,10 @@ def handle_manual_only_video_source(video: dict[str, Any], config: dict[str, Any
     platform = video_platform_from_url(url)
     manual_video["platform"] = platform
     manual_video.setdefault("status", "manual source" if platform in {"X/Twitter", "TikTok", "Instagram"} else "unsupported source")
-    return send_manual_open_alert(manual_video, config)
+    sent = send_manual_open_alert(manual_video, config)
+    if sent and platform in {"X/Twitter", "TikTok", "Instagram"}:
+        logger.info("Social manual alert sent: %s | %s", platform, url)
+    return sent
 
 
 def handle_telegram_command(command: str, config: dict[str, Any]) -> bool:
@@ -2536,12 +2689,24 @@ def handle_telegram_command(command: str, config: dict[str, Any]) -> bool:
     if command == "/clear_links":
         save_manual_links([], config)
         message = "Recent manual video links cleared."
-    elif command == "/open_links":
+    elif command in {"/open_links", "/manual_links"}:
         links = load_manual_links(config)
         message = "Recent manual-open video links:\n" + "\n".join(
             f"- {item.get('title', 'Video')} ({item.get('source', 'Unknown')}): {item.get('url', '')}"
             for item in links[-10:]
         ) if links else "No recent manual-open video links."
+    elif command == "/controversies":
+        links = [item for item in load_manual_links(config) if item.get("kind") == "controversy"]
+        message = "Recent controversial links:\n" + "\n".join(
+            f"- {item.get('title', 'Controversy')}: {item.get('url', '')}" for item in links[-10:]
+        ) if links else "No recent controversial links."
+    elif command == "/sources":
+        enabled = [source["name"] for source in get_official_video_source_registry(config)]
+        if config.get("brazilian_sources_enabled", True):
+            enabled.extend(source["name"] for source in BRAZILIAN_SOURCE_REGISTRY)
+        if config.get("social_manual_alerts_enabled", True):
+            enabled.extend(source["name"] for source in (config.get("manual_social_sources") or DEFAULT_MANUAL_SOCIAL_SOURCES))
+        message = "Enabled sources:\n" + "\n".join(f"- {name}" for name in dict.fromkeys(enabled))
     else:
         return False
     token = str(config.get("telegram_bot_token", "") or "")
@@ -3230,6 +3395,12 @@ def process_cycle(config: dict[str, str]) -> int:
 
     for grouped_article in grouped_articles:
         scored_article = score_article_with_ai(grouped_article, config)
+        apply_priority_scores(scored_article)
+        if scored_article["controversy_score"]:
+            logger.info("Controversy detected: %s", scored_article.get("title", ""))
+            logger.info("Controversy score: %s", scored_article["controversy_score"])
+        if any(is_brazilian_sports_source(source) for source in scored_article.get("sources", [])):
+            logger.info("Brazilian source matched: %s", ", ".join(scored_article.get("sources", [])))
         content_decision = classify_story_content(
             scored_article.get("title", ""),
             scored_article.get("official_source", "") or next(iter(scored_article.get("sources", [])), ""),
@@ -3243,7 +3414,11 @@ def process_cycle(config: dict[str, str]) -> int:
         logger.info("Should alert: %s", content_decision["should_alert"])
         logger.info("Should download: %s", content_decision["should_download"])
         logger.info("Decision reason: %s", content_decision["reason"])
-        accepted = content_decision["should_alert"] and (should_send_notification(scored_article) or is_live_goal_event(scored_article))
+        accepted = content_decision["should_alert"] and (
+            scored_article["controversy_score"] >= CONTROVERSY_THRESHOLD
+            or should_send_notification(scored_article)
+            or is_live_goal_event(scored_article)
+        )
         if accepted:
             high_potential_articles.append(scored_article)
             logger.info("High viral potential story: %s (score=%s)", scored_article.get("title"), scored_article.get("score"))
@@ -3310,7 +3485,18 @@ def process_cycle(config: dict[str, str]) -> int:
         if not any(channel_identity(source) == channel_identity(YOUTUBE_DOWNLOAD_CHANNEL) for source in article.get("sources", [])):
             article["automatic_video_status"] = "Vídeo automático: aguardando TVNZ Sport"
 
-        notification_sent = send_telegram_notification(article, config)
+        if int(article.get("controversy_score") or 0) >= CONTROVERSY_THRESHOLD and config.get("monitor_controversies", True):
+            notification_sent = send_controversy_alert(article, config)
+        elif any(is_brazilian_sports_source(source) for source in article.get("sources", [])):
+            article_url = str(article.get("link") or next(iter(article.get("links", [])), ""))
+            notification_sent = send_manual_open_alert({
+                "title": article.get("title", ""),
+                "source": next((source for source in article.get("sources", []) if is_brazilian_sports_source(source)), "Brazilian sports source"),
+                "url": article_url,
+                "status": "manual open alert",
+            }, config)
+        else:
+            notification_sent = send_telegram_notification(article, config)
         if notification_sent:
             try:
                 for x_post in discover_x_posts(article, config)[:3]:

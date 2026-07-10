@@ -27,6 +27,7 @@ from monitor import (
     build_x_search_terms,
     build_x_telegram_message,
     calculate_viral_score,
+    controversy_score_for_title,
     classify_story_content,
     create_best_moments_clip,
     create_vertical_short,
@@ -41,6 +42,7 @@ from monitor import (
     find_short_font_path,
     group_articles,
     handle_manual_only_video_source,
+    handle_telegram_command,
     is_cazetv_discussion_content,
     is_download_eligible_title,
     is_live_goal_event,
@@ -56,6 +58,7 @@ from monitor import (
     select_official_video_sources,
     send_downloaded_video_to_telegram,
     send_manual_open_alert,
+    send_controversy_alert,
     send_telegram_notification,
     should_send_notification,
     select_best_moment_segments,
@@ -1089,6 +1092,84 @@ class MonitorTests(unittest.TestCase):
         })
         self.assertIn("Video found. Open manually using the link below.", payload["text"])
         self.assertIn("Duplicate manual link skipped", "\n".join(captured.output))
+
+    def test_controversy_phrases_have_high_priority(self):
+        for title in (
+            "Pênalti não marcado decide o jogo",
+            "Gol anulado pelo VAR causa polêmica",
+            "Falta antes do gol gera reclamação",
+            "Red card controversy in World Cup match",
+        ):
+            with self.subTest(title=title):
+                self.assertGreaterEqual(controversy_score_for_title(title), 70)
+
+    def test_normal_highlight_has_lower_controversy_priority(self):
+        self.assertLess(
+            controversy_score_for_title("Portugal v Spain Match Highlights"),
+            controversy_score_for_title("Pênalti não marcado em Portugal v Spain"),
+        )
+
+    def test_instagram_manual_alert_contains_editing_instruction(self):
+        response = type("Response", (), {"status_code": 200})()
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": Path(temp_dir) / "manual_links.json",
+            }
+            with patch("monitor.requests.post", return_value=response) as post_mock:
+                sent = handle_manual_only_video_source({
+                    "title": "VAR controversy", "source": "SporTV",
+                    "url": "https://instagram.com/reel/abc",
+                }, config)
+        self.assertTrue(sent)
+        self.assertIn("Send the video file to the bot if you want editing", post_mock.call_args.kwargs["json"]["text"])
+
+    def test_brazilian_source_sends_manual_open_alert(self):
+        with patch("monitor.send_manual_open_alert", return_value=True) as alert_mock:
+            sent = handle_manual_only_video_source({
+                "title": "Gol anulado pelo VAR", "source": "Globo Esporte",
+                "url": "https://ge.globo.com/futebol/noticia/var",
+                "status": "manual open alert",
+            }, {})
+        self.assertTrue(sent)
+        alert_mock.assert_called_once()
+
+    def test_duplicate_controversy_is_skipped(self):
+        response = type("Response", (), {"status_code": 200})()
+        article = {
+            "title": "Gol anulado pelo VAR", "source": "SporTV", "sources": ["SporTV"],
+            "link": "https://example.com/controversy-1", "links": ["https://example.com/controversy-1"],
+        }
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": Path(temp_dir) / "manual_links.json",
+            }
+            with patch("monitor.requests.post", return_value=response) as post_mock, \
+                 self.assertLogs("football-monitor", level="INFO") as captured:
+                first = send_controversy_alert(dict(article), config)
+                second = send_controversy_alert(dict(article), config)
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(post_mock.call_count, 1)
+        self.assertIn("Duplicate controversy skipped", "\n".join(captured.output))
+
+    def test_controversies_command_returns_recent_links(self):
+        response = type("Response", (), {"status_code": 200})()
+        with TemporaryDirectory() as temp_dir:
+            links_file = Path(temp_dir) / "manual_links.json"
+            links_file.write_text(json.dumps([{
+                "kind": "controversy", "title": "VAR controversy",
+                "url": "https://example.com/var",
+            }]), encoding="utf-8")
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": links_file,
+            }
+            with patch("monitor.requests.post", return_value=response) as post_mock:
+                handled = handle_telegram_command("/controversies", config)
+        self.assertTrue(handled)
+        self.assertIn("https://example.com/var", post_mock.call_args.kwargs["json"]["text"])
 
     def test_unofficial_sources_are_not_in_region_registry(self):
         sources = select_official_video_sources("US", {"fifa_youtube_channel_id": "FIFA123"})

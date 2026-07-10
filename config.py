@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +135,13 @@ def normalize_text(value: Any) -> str:
 def load_config() -> dict[str, Any]:
     raw_debug_mode = os.getenv("FOOTBALL_MONITOR_DEBUG", "0").strip().lower()
     debug_mode = raw_debug_mode in {"1", "true", "yes", "on"}
+    enabled = lambda name, default="true": os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        manual_social_sources = json.loads(os.getenv("MANUAL_SOCIAL_SOURCES_JSON", "[]"))
+        if not isinstance(manual_social_sources, list):
+            manual_social_sources = []
+    except json.JSONDecodeError:
+        manual_social_sources = []
     return {
         "telegram_bot_token": os.getenv(TELEGRAM_BOT_TOKEN_ENV, ""),
         "telegram_chat_id": os.getenv(TELEGRAM_CHAT_ID_ENV, ""),
@@ -148,4 +156,12 @@ def load_config() -> dict[str, Any]:
         "tvnz_auto_download_enabled": os.getenv("TVNZ_AUTO_DOWNLOAD_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
         "tvnz_youtube_channel_url": os.getenv("TVNZ_YOUTUBE_CHANNEL_URL", ""),
         "tvnz_backfill_limit": os.getenv("TVNZ_BACKFILL_LIMIT", "5"),
+        "monitor_controversies": enabled("MONITOR_CONTROVERSIES"),
+        "controversy_first": enabled("CONTROVERSY_FIRST"),
+        "brazilian_sources_enabled": enabled("BRAZILIAN_SOURCES_ENABLED"),
+        "social_manual_alerts_enabled": enabled("SOCIAL_MANUAL_ALERTS_ENABLED"),
+        "instagram_auto_download": enabled("INSTAGRAM_AUTO_DOWNLOAD", "false"),
+        "tiktok_auto_download": enabled("TIKTOK_AUTO_DOWNLOAD", "false"),
+        "x_auto_download": enabled("X_AUTO_DOWNLOAD", "false"),
+        "manual_social_sources": manual_social_sources,
     }

@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from monitor import (
     calculate_viral_score,
     controversy_score_for_title,
     classify_story_content,
+    clear_official_rss_cache,
     create_best_moments_clip,
     create_vertical_short,
     detect_audio_peak_timestamps,
@@ -50,10 +52,12 @@ from monitor import (
     is_tvnz_highlight_video,
     is_trusted_youtube_uploader,
     load_todays_fixtures,
+    main,
     parse_tvnz_max_downloads_per_run,
     parse_tvnz_rss_entries,
     process_cycle,
     process_instagram_video_source,
+    process_local_video_file,
     prepare_telegram_message,
     search_and_download_youtube_video,
     select_official_youtube_candidate,
@@ -1022,6 +1026,41 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(video["channel"], "FIFA")
         run_mock.assert_not_called()
 
+    def test_fifa_rss_is_fetched_once_and_repeated_fallback_uses_cache(self):
+        entries = [
+            {
+                "yt_videoid": "fifa01",
+                "title": "Portugal v Spain Match Highlights | FIFA World Cup",
+                "link": "https://youtube.com/watch?v=fifa01",
+            },
+            {
+                "yt_videoid": "fifa02",
+                "title": "Brazil v Argentina Match Highlights | FIFA World Cup",
+                "link": "https://youtube.com/watch?v=fifa02",
+            },
+        ]
+        clear_official_rss_cache()
+        try:
+            with patch("monitor.fetch_feed_entries", return_value=entries) as fetch_mock, \
+                 self.assertLogs("football-monitor", level="INFO") as captured:
+                first = discover_official_fallback_video(
+                    "Portugal v Spain Match Highlights | FIFA World Cup", "US", {},
+                )
+                second = discover_official_fallback_video(
+                    "Brazil v Argentina Match Highlights | FIFA World Cup", "US", {},
+                )
+        finally:
+            clear_official_rss_cache()
+
+        self.assertEqual(first["id"], "fifa01")
+        self.assertEqual(second["id"], "fifa02")
+        fetch_mock.assert_called_once_with(
+            "https://www.youtube.com/feeds/videos.xml?channel_id=UCpcTrCXblq78GZrTUTLWeBw"
+        )
+        logs = "\n".join(captured.output)
+        self.assertIn("Official RSS fetched: FIFA", logs)
+        self.assertIn("Official RSS cache hit: FIFA", logs)
+
     def test_geo_blocked_tvnz_sends_manual_open_alert_without_retry(self):
         tvnz_video = {
             "id": "tvnz1", "title": "Portugal v Spain Match Highlights | FIFA World Cup",
@@ -1184,6 +1223,60 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(manual_mock.call_args.args[0]["url"], video["url"])
         self.assertEqual(manual_mock.call_args.args[0]["status"], "Instagram download failed")
         self.assertIn("Instagram download failed", "\n".join(captured.output))
+
+    def test_process_url_cli_routes_instagram_success_to_editor_pipeline(self):
+        url = "https://www.instagram.com/reel/DV7DOkEEhHh/"
+        with patch("monitor.load_config", return_value={"instagram_auto_download": True}), \
+             patch("monitor.process_instagram_video_source", return_value=True) as process_mock, \
+             patch.object(sys, "argv", ["monitor.py", "--process-url", url]):
+            result = main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(process_mock.call_args.args[0]["url"], url)
+
+    def test_process_url_cli_instagram_failure_sends_manual_link(self):
+        url = "https://www.instagram.com/reel/DV7DOkEEhHh/"
+        config = {
+            "instagram_auto_download": True,
+            "instagram_fallback_to_manual_link": True,
+            "downloads_dir": Path("downloads"),
+        }
+        with patch("monitor.load_config", return_value=config), \
+             patch("monitor.subprocess.run", side_effect=subprocess.CalledProcessError(1, ["yt-dlp"])), \
+             patch("monitor.send_manual_open_alert", return_value=True) as manual_mock, \
+             patch.object(sys, "argv", ["monitor.py", "--process-url", url]):
+            result = main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(manual_mock.call_args.args[0]["url"], url)
+
+    def test_process_file_cli_processes_existing_mp4(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "football-moment.mp4"
+            video_path.write_bytes(b"mp4")
+            with patch("monitor.load_config", return_value={}), \
+                 patch("monitor.process_local_video_file", return_value=True) as process_mock, \
+                 patch.object(sys, "argv", ["monitor.py", "--process-file", str(video_path)]):
+                result = main()
+
+        self.assertEqual(result, 0)
+        process_mock.assert_called_once_with(str(video_path), {})
+
+    def test_process_local_mp4_runs_moments_vertical_and_telegram(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "football-moment.mp4"
+            video_path.write_bytes(b"mp4")
+            with patch("monitor.build_portuguese_shorts_pack", side_effect=lambda story, config: story) as pack_mock, \
+                 patch("monitor.create_best_moments_clip", return_value="moments.mp4") as moments_mock, \
+                 patch("monitor.create_vertical_short", return_value="vertical.mp4") as vertical_mock, \
+                 patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_mock:
+                sent = process_local_video_file(video_path, {})
+
+        self.assertTrue(sent)
+        pack_mock.assert_called_once()
+        moments_mock.assert_called_once()
+        vertical_mock.assert_called_once_with("moments.mp4", ANY)
+        send_mock.assert_called_once_with("vertical.mp4", ANY)
 
     def test_brazilian_source_sends_manual_open_alert(self):
         with patch("monitor.send_manual_open_alert", return_value=True) as alert_mock:

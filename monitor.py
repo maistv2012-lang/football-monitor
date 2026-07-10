@@ -157,6 +157,7 @@ DEFAULT_MANUAL_SOCIAL_SOURCES = [
     {"name": "Gazeta Esportiva/Gazeta TV Instagram", "url": "https://www.instagram.com/gazetaesportiva/"},
     {"name": "CazéTV Instagram", "url": "https://www.instagram.com/cazetv/"},
 ]
+OFFICIAL_RSS_ENTRIES_CACHE: dict[str, list[Any]] = {}
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -2737,11 +2738,7 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
             "downloaded_video_path": downloaded_path,
             "_telegram_config": config,
         }
-        moments_path = create_best_moments_clip(downloaded_path, story) or downloaded_path
-        telegram_path = create_vertical_short(moments_path, story) or moments_path
-        sent = send_downloaded_video_to_telegram(telegram_path, story)
-        story.pop("_telegram_config", None)
-        if sent:
+        if process_local_video_file(downloaded_path, config, story):
             return True
         raise RuntimeError("edited Instagram video could not be delivered to Telegram")
     except Exception as exc:
@@ -2750,6 +2747,30 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
             return False
         manual_video["status"] = "Instagram download failed"
         return send_manual_open_alert(manual_video, config)
+
+
+def process_local_video_file(
+    file_path: str | Path,
+    config: dict[str, Any],
+    story: dict[str, Any] | None = None,
+) -> bool:
+    """Process an existing MP4 through moments, vertical editing, and Telegram."""
+    source_path = Path(file_path)
+    if not source_path.exists() or not source_path.is_file() or source_path.suffix.casefold() != ".mp4":
+        logger.error("Local MP4 does not exist or is unsupported: %s", source_path)
+        return False
+    video_story = dict(story or {})
+    video_story.setdefault("title", source_path.stem.replace("_", " ").replace("-", " ").strip() or "Football video")
+    video_story.setdefault("source", "Local MP4")
+    video_story.setdefault("sources", [video_story["source"]])
+    video_story["downloaded_video_path"] = str(source_path)
+    video_story["_telegram_config"] = config
+    build_portuguese_shorts_pack(video_story, config)
+    moments_path = create_best_moments_clip(source_path, video_story) or str(source_path)
+    telegram_path = create_vertical_short(moments_path, video_story) or moments_path
+    sent = send_downloaded_video_to_telegram(telegram_path, video_story)
+    video_story.pop("_telegram_config", None)
+    return sent
 
 
 def handle_telegram_command(command: str, config: dict[str, Any]) -> bool:
@@ -3132,11 +3153,17 @@ def discover_official_fallback_video(
             continue
         feed_url = build_youtube_feed_url(str(source["channel_id"]))
         logger.info("Discovering official fallback from %s RSS: %s", source["name"], feed_url)
-        try:
-            entries = fetch_feed_entries(feed_url)
-        except Exception as exc:
-            logger.warning("Official fallback feed failed for %s: %s", source["name"], exc)
-            continue
+        if feed_url in OFFICIAL_RSS_ENTRIES_CACHE:
+            entries = OFFICIAL_RSS_ENTRIES_CACHE[feed_url]
+            logger.info("Official RSS cache hit: %s", source["name"])
+        else:
+            try:
+                entries = fetch_feed_entries(feed_url)
+            except Exception as exc:
+                logger.warning("Official fallback feed failed for %s: %s", source["name"], exc)
+                continue
+            OFFICIAL_RSS_ENTRIES_CACHE[feed_url] = entries
+            logger.info("Official RSS fetched: %s", source["name"])
         for video in parse_tvnz_rss_entries(entries, scan_limit):
             video["channel"] = source["name"]
             video["uploader"] = source["name"]
@@ -3144,6 +3171,11 @@ def discover_official_fallback_video(
                 logger.info("Official regional fallback found: %s | %s", source["name"], video.get("webpage_url", ""))
                 return video
     return None
+
+
+def clear_official_rss_cache() -> None:
+    """Reset per-process official RSS entries, primarily at run startup."""
+    OFFICIAL_RSS_ENTRIES_CACHE.clear()
 
 
 def send_official_source_unavailable_alert(config: dict[str, Any]) -> bool:
@@ -4004,6 +4036,7 @@ def run_forever() -> None:
 def main() -> int:
     """CLI entry point."""
     load_dotenv()
+    clear_official_rss_cache()
     config = load_config()
 
     # Safe debug info: indicate whether Telegram credentials are configured (do not log values)
@@ -4023,6 +4056,28 @@ def main() -> int:
         save_seen_articles(state_file, set())
         print(f"Seen cache reset: {state_file}")
         return 0
+
+    process_url_index = args.index("--process-url") + 1 if "--process-url" in args else None
+    if process_url_index is not None:
+        if process_url_index >= len(args):
+            logger.error("--process-url requires a URL")
+            return 1
+        process_url = args[process_url_index].strip()
+        if not is_instagram_video_url(process_url):
+            logger.error("--process-url currently supports Instagram reel, post, and TV URLs only: %s", process_url)
+            return 1
+        return 0 if process_instagram_video_source({
+            "title": "Instagram football video",
+            "source": "Instagram",
+            "url": process_url,
+        }, config) else 1
+
+    process_file_index = args.index("--process-file") + 1 if "--process-file" in args else None
+    if process_file_index is not None:
+        if process_file_index >= len(args):
+            logger.error("--process-file requires a local MP4 path")
+            return 1
+        return 0 if process_local_video_file(args[process_file_index], config) else 1
 
     if "--once" in args:
         process_telegram_commands(config)

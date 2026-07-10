@@ -8,6 +8,7 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parent
 STATE_FILE = ROOT_DIR / ".seen_articles.json"
 ALERTS_FILE = ROOT_DIR / "alerts.json"
+MONITOR_STATE_DIR = ROOT_DIR / ".monitor_state"
 
 # New: Folder for downloaded videos
 DOWNLOADS_DIR = ROOT_DIR / "downloads"
@@ -166,4 +167,8 @@ def load_config() -> dict[str, Any]:
         "tiktok_auto_download": enabled("TIKTOK_AUTO_DOWNLOAD", "false"),
         "x_auto_download": enabled("X_AUTO_DOWNLOAD", "false"),
         "manual_social_sources": manual_social_sources,
+        "monitor_state_dir": MONITOR_STATE_DIR,
+        "manual_link_duplicate_ttl_hours": float(os.getenv("MANUAL_LINK_DUPLICATE_TTL_HOURS", "48")),
+        "blocked_video_retry_ttl_hours": float(os.getenv("BLOCKED_VIDEO_RETRY_TTL_HOURS", "24")),
+        "allow_clear_dedupe": enabled("ALLOW_CLEAR_DEDUPE", "false"),
     }

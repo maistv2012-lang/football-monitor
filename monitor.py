@@ -158,6 +158,16 @@ DEFAULT_MANUAL_SOCIAL_SOURCES = [
     {"name": "CazéTV Instagram", "url": "https://www.instagram.com/cazetv/"},
 ]
 OFFICIAL_RSS_ENTRIES_CACHE: dict[str, list[Any]] = {}
+PERSISTENT_STATE_FILES = {
+    "sent_alerts": "sent_alerts.json",
+    "sent_video_ids": "sent_video_ids.json",
+    "downloaded_video_ids": "downloaded_video_ids.json",
+    "manual_open_links": "manual_open_links.json",
+    "skipped_geo_blocked": "skipped_geo_blocked.json",
+    "skipped_bot_blocked": "skipped_bot_blocked.json",
+}
+PERSISTENT_STATE_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
+RUN_DEDUPE_KEYS: set[str] = set()
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -1071,6 +1081,123 @@ def save_alerts(alerts_file: Path, alerts: list[dict[str, Any]]) -> None:
     alerts_file.write_text(json.dumps(alerts, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def normalize_media_id(url: Any) -> str:
+    """Return a stable cross-run identity for supported video/social URLs."""
+    value = str(url or "").strip()
+    if not value:
+        return ""
+    patterns = (
+        ("youtube", r"(?:youtube\.com/watch\?(?:[^#\s]*&)?v=|youtu\.be/)([A-Za-z0-9_-]+)"),
+        ("youtube", r"youtube\.com/shorts/([A-Za-z0-9_-]+)"),
+        ("instagram", r"instagram\.com/(?:reel|p|tv)/([^/?#]+)"),
+        ("tiktok", r"tiktok\.com/(?:@[^/]+/)?video/(\d+)"),
+        ("x", r"(?:x|twitter)\.com/[^/]+/status/(\d+)"),
+    )
+    for platform, pattern in patterns:
+        match = re.search(pattern, value, re.IGNORECASE)
+        if match:
+            return f"{platform}:{match.group(1)}"
+    normalized = value.casefold().split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    return f"url:{normalized}"
+
+
+def _state_dir(config: dict[str, Any]) -> Path | None:
+    configured = config.get("monitor_state_dir")
+    return Path(configured) if configured else None
+
+
+def load_persistent_state(config: dict[str, Any], force_reload: bool = False) -> dict[str, dict[str, Any]] | None:
+    state_dir = _state_dir(config)
+    if state_dir is None:
+        return None
+    cache_key = str(state_dir.resolve())
+    if cache_key in PERSISTENT_STATE_CACHE and not force_reload:
+        return PERSISTENT_STATE_CACHE[cache_key]
+    state: dict[str, dict[str, Any]] = {}
+    for category, filename in PERSISTENT_STATE_FILES.items():
+        path = state_dir / filename
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                payload = {str(item): {"timestamp": ""} for item in payload}
+            state[category] = payload if isinstance(payload, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            state[category] = {}
+    PERSISTENT_STATE_CACHE[cache_key] = state
+    logger.info("Persistent state loaded: %s", state_dir)
+    return state
+
+
+def save_persistent_state(config: dict[str, Any]) -> None:
+    state_dir = _state_dir(config)
+    state = load_persistent_state(config)
+    if state_dir is None or state is None:
+        return
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for category, filename in PERSISTENT_STATE_FILES.items():
+        (state_dir / filename).write_text(
+            json.dumps(state.get(category, {}), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    logger.info("Persistent state saved: %s", state_dir)
+
+
+def reset_persistent_state_runtime() -> None:
+    """Forget in-memory dedupe data while leaving persisted files intact."""
+    PERSISTENT_STATE_CACHE.clear()
+    RUN_DEDUPE_KEYS.clear()
+
+
+def persistent_state_contains(
+    config: dict[str, Any], category: str, media_id: str, ttl_hours: float | None = None,
+) -> bool:
+    state = load_persistent_state(config)
+    if state is None or not media_id:
+        return False
+    record = state.get(category, {}).get(media_id)
+    if record is None:
+        return False
+    if ttl_hours is None:
+        return True
+    try:
+        timestamp = datetime.fromisoformat(str(record.get("timestamp") or ""))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - timestamp).total_seconds() < ttl_hours * 3600
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def mark_persistent_state(
+    config: dict[str, Any], category: str, media_id: str, source: str = "", title: str = "", url: str = "",
+) -> None:
+    state = load_persistent_state(config)
+    if state is None or not media_id:
+        return
+    state.setdefault(category, {})[media_id] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": source, "title": title, "url": url,
+    }
+    RUN_DEDUPE_KEYS.add(f"{category}:{media_id}")
+    save_persistent_state(config)
+    label = "processed" if category == "sent_video_ids" else "downloaded" if category == "downloaded_video_ids" else "sent"
+    logger.info("Marked as %s: %s", label, media_id)
+
+
+def duplicate_sent_media(config: dict[str, Any], media_id: str) -> bool:
+    if not media_id:
+        return False
+    if any(f"{category}:{media_id}" in RUN_DEDUPE_KEYS for category in ("sent_alerts", "manual_open_links", "sent_video_ids")):
+        return True
+    return any(
+        persistent_state_contains(config, category, media_id)
+        for category in ("sent_alerts", "manual_open_links", "sent_video_ids")
+    )
+
+
+def log_duplicate(source: Any, title: Any, url: Any, media_id: str) -> None:
+    logger.info("Duplicate skipped: %s | %s | %s | %s", source, title, url, media_id)
+
+
 def build_video_search_url(query: str) -> str:
     """Create a YouTube search link for a video if no official video is found."""
     return f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
@@ -1780,6 +1907,19 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
     token = config.get("telegram_bot_token", "")
     chat_id = config.get("telegram_chat_id", "")
     notification_title = str(grouped_article.get("title", "") or "").strip()
+    notification_links = grouped_article.get("links") or []
+    notification_url = str(
+        grouped_article.get("video_url") or grouped_article.get("link")
+        or (notification_links[0] if notification_links else "") or ""
+    ).strip()
+    notification_source = str(
+        grouped_article.get("source")
+        or next(iter(grouped_article.get("sources") or []), "Unknown")
+    )
+    notification_id = normalize_media_id(notification_url)
+    if notification_id and duplicate_sent_media(config, notification_id):
+        log_duplicate(notification_source, notification_title, notification_url, notification_id)
+        return False
 
     if not token or not chat_id:
         logger.warning("Telegram credentials are not configured. Skipping notification for %s", notification_title)
@@ -1898,6 +2038,11 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
         return False
 
     logger.info("Telegram notification sent for %s", notification_title)
+    if notification_id:
+        mark_persistent_state(
+            config, "sent_alerts", notification_id,
+            notification_source, notification_title, notification_url,
+        )
     return True
 
 
@@ -2460,10 +2605,18 @@ def create_best_moments_clip(video_path: str | Path, story: dict[str, Any] | Non
 
 def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, Any]) -> bool:
     """Send a downloaded MP4 to Telegram, falling back safely when upload fails or is too large."""
-    telegram_config = story.get("_telegram_config") if isinstance(story.get("_telegram_config"), dict) else load_config()
+    explicit_config = story.get("_telegram_config") if isinstance(story.get("_telegram_config"), dict) else None
+    telegram_config = explicit_config if explicit_config is not None else load_config()
+    dedupe_config = explicit_config or {}
     token = str(telegram_config.get("telegram_bot_token", "") or "")
     chat_id = str(telegram_config.get("telegram_chat_id", "") or "")
     title = str(story.get("title", "") or "").strip()
+    source = str(story.get("source") or next(iter(story.get("sources") or []), "Unknown"))
+    media_url = str(story.get("video_url") or story.get("link") or Path(file_path).resolve())
+    media_id = normalize_media_id(media_url)
+    if persistent_state_contains(dedupe_config, "sent_video_ids", media_id):
+        log_duplicate(source, title, media_url, media_id)
+        return False
     if not token or not chat_id:
         logger.warning("Telegram credentials are not configured. Skipping downloaded video delivery for %s", title)
         return False
@@ -2501,6 +2654,10 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
                 )
             if response.status_code == 200:
                 logger.info("Downloaded video sent to Telegram with %s for %s", method, title)
+                mark_persistent_state(
+                    dedupe_config, "sent_video_ids", media_id,
+                    source, title, media_url,
+                )
                 return True
             logger.error("Telegram %s\nResponse:\n%s", response.status_code, str(response.text or "").replace(token, "[REDACTED]"))
             if method == "sendVideo":
@@ -2574,6 +2731,17 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
     video_id = str(video.get("id") or video.get("video_id") or extract_youtube_video_id(url) or "").strip()
     if not url:
         return False
+    media_id = normalize_media_id(url)
+    manual_ttl = float(config.get("manual_link_duplicate_ttl_hours", 48) or 48)
+    if (
+        f"manual_open_links:{media_id}" in RUN_DEDUPE_KEYS
+        or persistent_state_contains(config, "manual_open_links", media_id, manual_ttl)
+        or persistent_state_contains(config, "sent_alerts", media_id)
+        or persistent_state_contains(config, "sent_video_ids", media_id)
+    ):
+        logger.info("Manual link duplicate skipped: %s", url)
+        log_duplicate(video.get("source") or video.get("channel"), video.get("title"), url, media_id)
+        return False
     recent = load_manual_links(config)
     if any(
         str(item.get("url") or "").strip() == url
@@ -2607,6 +2775,11 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     save_manual_links(recent, config)
+    mark_persistent_state(
+        config, "manual_open_links", media_id,
+        str(video.get("source") or video.get("channel") or video.get("uploader") or "Unknown"),
+        str(video.get("title") or "Football video"), url,
+    )
     logger.info("Manual open link sent: %s", url)
     return True
 
@@ -2622,6 +2795,11 @@ def send_controversy_alert(article: dict[str, Any], config: dict[str, Any]) -> b
     links = article.get("links") or []
     url = str(article.get("link") or article.get("video_url") or (links[0] if links else "")).strip()
     if not url:
+        return False
+    media_id = normalize_media_id(url)
+    if duplicate_sent_media(config, media_id):
+        logger.info("Duplicate controversy skipped: %s", url)
+        log_duplicate(source, title, url, media_id)
         return False
     now = datetime.now(timezone.utc)
     recent = load_manual_links(config)
@@ -2673,6 +2851,7 @@ def send_controversy_alert(article: dict[str, Any], config: dict[str, Any]) -> b
         "created_at": now.isoformat(),
     })
     save_manual_links(recent, config)
+    mark_persistent_state(config, "sent_alerts", media_id, source, title, url)
     logger.info("Manual open link sent: %s", url)
     return True
 
@@ -2703,6 +2882,20 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
         "url": url,
         "platform": "Instagram",
     }
+    media_id = normalize_media_id(url)
+    blocked_ttl = float(config.get("blocked_video_retry_ttl_hours", 24) or 24)
+    if (
+        persistent_state_contains(config, "downloaded_video_ids", media_id)
+        or persistent_state_contains(config, "sent_video_ids", media_id)
+    ):
+        log_duplicate(video.get("source", "Instagram"), video.get("title", ""), url, media_id)
+        return False
+    if (
+        persistent_state_contains(config, "skipped_geo_blocked", media_id, blocked_ttl)
+        or persistent_state_contains(config, "skipped_bot_blocked", media_id, blocked_ttl)
+    ):
+        log_duplicate(video.get("source", "Instagram"), video.get("title", ""), url, media_id)
+        return send_manual_open_alert({**manual_video, "status": "blocked; retry deferred"}, config)
     if config.get("instagram_use_cookies", False):
         logger.warning("Instagram cookies are not used by this monitor; attempting public extraction only.")
     downloads_dir = Path(config.get("downloads_dir", DOWNLOADS_DIR)) / "instagram"
@@ -2727,6 +2920,10 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
         if not downloaded_path:
             raise RuntimeError("yt-dlp did not return an existing Instagram file")
         logger.info("Instagram download succeeded: %s", url)
+        mark_persistent_state(
+            config, "downloaded_video_ids", media_id,
+            str(video.get("source") or "Instagram"), str(video.get("title") or ""), url,
+        )
         story = {
             "title": video.get("title", "Instagram football video"),
             "source": video.get("source") or video.get("channel") or "Instagram",
@@ -2743,6 +2940,11 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
         raise RuntimeError("edited Instagram video could not be delivered to Telegram")
     except Exception as exc:
         logger.warning("Instagram download failed: %s (%s)", url, exc)
+        error_text = str(getattr(exc, "stderr", "") or exc).casefold()
+        if is_geo_restriction_error(error_text):
+            mark_persistent_state(config, "skipped_geo_blocked", media_id, "Instagram", str(video.get("title") or ""), url)
+        elif any(term in error_text for term in BOT_VERIFICATION_TERMS):
+            mark_persistent_state(config, "skipped_bot_blocked", media_id, "Instagram", str(video.get("title") or ""), url)
         if not fallback_enabled:
             return False
         manual_video["status"] = "Instagram download failed"
@@ -2765,11 +2967,21 @@ def process_local_video_file(
     video_story.setdefault("sources", [video_story["source"]])
     video_story["downloaded_video_path"] = str(source_path)
     video_story["_telegram_config"] = config
+    media_url = str(video_story.get("video_url") or video_story.get("link") or source_path.resolve())
+    media_id = normalize_media_id(media_url)
+    if persistent_state_contains(config, "sent_video_ids", media_id):
+        log_duplicate(video_story.get("source"), video_story.get("title"), media_url, media_id)
+        return False
     build_portuguese_shorts_pack(video_story, config)
     moments_path = create_best_moments_clip(source_path, video_story) or str(source_path)
     telegram_path = create_vertical_short(moments_path, video_story) or moments_path
     sent = send_downloaded_video_to_telegram(telegram_path, video_story)
     video_story.pop("_telegram_config", None)
+    if sent:
+        mark_persistent_state(
+            config, "sent_video_ids", media_id,
+            str(video_story.get("source") or "Local MP4"), str(video_story.get("title") or ""), media_url,
+        )
     return sent
 
 
@@ -2796,6 +3008,29 @@ def handle_telegram_command(command: str, config: dict[str, Any]) -> bool:
         if config.get("social_manual_alerts_enabled", True):
             enabled.extend(source["name"] for source in (config.get("manual_social_sources") or DEFAULT_MANUAL_SOCIAL_SOURCES))
         message = "Enabled sources:\n" + "\n".join(f"- {name}" for name in dict.fromkeys(enabled))
+    elif command == "/dedupe_status":
+        state = load_persistent_state(config) or {category: {} for category in PERSISTENT_STATE_FILES}
+        message = (
+            "Persistent dedupe status:\n"
+            f"- sent alerts: {len(state.get('sent_alerts', {}))}\n"
+            f"- sent videos: {len(state.get('sent_video_ids', {}))}\n"
+            f"- manual links: {len(state.get('manual_open_links', {}))}\n"
+            f"- downloaded videos: {len(state.get('downloaded_video_ids', {}))}\n"
+            f"- skipped geo blocked: {len(state.get('skipped_geo_blocked', {}))}\n"
+            f"- skipped bot blocked: {len(state.get('skipped_bot_blocked', {}))}"
+        )
+    elif command == "/clear_dedupe":
+        is_local = str(os.getenv("GITHUB_ACTIONS", "")).casefold() != "true"
+        if not is_local and not config.get("allow_clear_dedupe", False):
+            message = "Dedupe state was not cleared. Set ALLOW_CLEAR_DEDUPE=true to enable this command."
+        else:
+            state = load_persistent_state(config)
+            if state is not None:
+                for category in PERSISTENT_STATE_FILES:
+                    state[category] = {}
+                RUN_DEDUPE_KEYS.clear()
+                save_persistent_state(config)
+            message = "Persistent duplicate state cleared."
     else:
         return False
     token = str(config.get("telegram_bot_token", "") or "")
@@ -3229,6 +3464,18 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
     for video in matched_videos:
         video_url = _video_url_from_metadata(video)
         video_id = str(video.get("id") or extract_youtube_video_id(video_url) or "").strip()
+        media_id = normalize_media_id(video_url)
+        blocked_ttl = float(config.get("blocked_video_retry_ttl_hours", 24) or 24)
+        persistent_duplicate = (
+            persistent_state_contains(config, "downloaded_video_ids", media_id)
+            or persistent_state_contains(config, "sent_video_ids", media_id)
+            or persistent_state_contains(config, "skipped_geo_blocked", media_id, blocked_ttl)
+            or persistent_state_contains(config, "skipped_bot_blocked", media_id, blocked_ttl)
+        )
+        if persistent_duplicate:
+            already_processed_count += 1
+            log_duplicate(YOUTUBE_DOWNLOAD_CHANNEL, video.get("title"), video_url, media_id)
+            continue
         duplicate_by_id = bool(video_id and video_id in queued_ids)
         duplicate_by_url = bool(video_url and video_url in queued_urls)
         if duplicate_by_id or duplicate_by_url:
@@ -3270,12 +3517,22 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
             downloaded_path = download_youtube_video(download_url, downloads_dir, yt_dlp_bin)
         except GeoRestrictedVideoError:
             logger.warning("Official video download is geo-restricted: %s", download_url)
+            mark_persistent_state(
+                config, "skipped_geo_blocked", normalize_media_id(download_url),
+                str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL),
+                str(download_video.get("title") or ""), download_url,
+            )
             send_manual_open_alert({
                 **download_video, "url": download_url, "status": "geo-blocked",
             }, config)
             continue
         except VideoDownloadBlockedError:
             logger.warning("Official video download requires bot verification: %s", download_url)
+            mark_persistent_state(
+                config, "skipped_bot_blocked", normalize_media_id(download_url),
+                str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL),
+                str(download_video.get("title") or ""), download_url,
+            )
             send_manual_open_alert({
                 **download_video, "url": download_url, "status": "YouTube bot verification",
             }, config)
@@ -3285,6 +3542,11 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
                 **download_video, "url": download_url, "status": "download failed",
             }, config)
             continue
+        mark_persistent_state(
+            config, "downloaded_video_ids", normalize_media_id(download_url),
+            str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL),
+            str(download_video.get("title") or ""), download_url,
+        )
 
         story = {
             "title": video.get("title", ""),
@@ -3315,6 +3577,12 @@ def download_new_tvnz_sport_highlights(config: dict[str, Any], alerts: list[dict
         if not telegram_sent:
             logger.warning("Telegram delivery failed for TVNZ Sport video; leaving unprocessed for retry: %s", video_url)
             continue
+
+        mark_persistent_state(
+            config, "sent_video_ids", normalize_media_id(download_url),
+            str(download_video.get("channel") or YOUTUBE_DOWNLOAD_CHANNEL),
+            str(download_video.get("title") or ""), download_url,
+        )
 
         alerts.append({
             "alert_type": "tvnz_download",
@@ -4038,6 +4306,8 @@ def main() -> int:
     load_dotenv()
     clear_official_rss_cache()
     config = load_config()
+    reset_persistent_state_runtime()
+    load_persistent_state(config, force_reload=True)
 
     # Safe debug info: indicate whether Telegram credentials are configured (do not log values)
     bot_cfg = bool(config.get("telegram_bot_token"))

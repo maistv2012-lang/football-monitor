@@ -53,11 +53,15 @@ from monitor import (
     is_trusted_youtube_uploader,
     load_todays_fixtures,
     main,
+    load_persistent_state,
+    mark_persistent_state,
+    normalize_media_id,
     parse_tvnz_max_downloads_per_run,
     parse_tvnz_rss_entries,
     process_cycle,
     process_instagram_video_source,
     process_local_video_file,
+    reset_persistent_state_runtime,
     prepare_telegram_message,
     search_and_download_youtube_video,
     select_official_youtube_candidate,
@@ -1093,6 +1097,34 @@ class MonitorTests(unittest.TestCase):
         download_mock.assert_called_once()
         self.assertEqual(manual_mock.call_args.args[0]["status"], "YouTube bot verification")
 
+    def test_geo_and_bot_blocked_videos_are_not_retried_before_ttl(self):
+        cases = (
+            (GeoRestrictedVideoError(), "skipped_geo_blocked"),
+            (VideoDownloadBlockedError(), "skipped_bot_blocked"),
+        )
+        video = {
+            "id": "abcdefghijk", "title": "Portugal Match Highlights", "channel": "TVNZ Sport",
+            "webpage_url": "https://youtube.com/watch?v=abcdefghijk",
+        }
+        for index, (error, category) in enumerate(cases):
+            with self.subTest(category=category), TemporaryDirectory() as temp_dir:
+                config = {
+                    "downloads_dir": Path(temp_dir) / "downloads",
+                    "monitor_state_dir": Path(temp_dir) / ".monitor_state",
+                    "blocked_video_retry_ttl_hours": 24,
+                }
+                reset_persistent_state_runtime()
+                with patch.dict(os.environ, {"RUNNER_COUNTRY_OVERRIDE": "NZ"}, clear=True), \
+                     patch("monitor.discover_tvnz_sport_videos", return_value=[video]), \
+                     patch("monitor.download_youtube_video", side_effect=error) as download_mock, \
+                     patch("monitor.send_manual_open_alert", return_value=True):
+                    download_new_tvnz_sport_highlights(config, [])
+                    reset_persistent_state_runtime()
+                    download_new_tvnz_sport_highlights(config, [])
+                download_mock.assert_called_once()
+                state = load_persistent_state(config, force_reload=True)
+                self.assertIn(normalize_media_id(video["webpage_url"]), state[category])
+
     def test_manual_social_platforms_send_alert_only(self):
         cases = (
             ("https://x.com/FIFA/status/1", "X/Twitter"),
@@ -1133,6 +1165,80 @@ class MonitorTests(unittest.TestCase):
         })
         self.assertIn("Video found. Open manually using the link below.", payload["text"])
         self.assertIn("Duplicate manual link skipped", "\n".join(captured.output))
+
+    def test_persistent_manual_dedupe_normalizes_youtube_shorts_and_instagram(self):
+        urls = (
+            "https://www.youtube.com/watch?v=abcdefghijk",
+            "https://www.youtube.com/shorts/shorts12345",
+            "https://www.instagram.com/reel/DV7DOkEEhHh/",
+        )
+        response = type("Response", (), {"status_code": 200})()
+        with TemporaryDirectory() as temp_dir:
+            for index, url in enumerate(urls):
+                with self.subTest(url=url):
+                    state_dir = Path(temp_dir) / f"state-{index}"
+                    config = {
+                        "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                        "manual_links_file": Path(temp_dir) / f"manual-{index}.json",
+                        "monitor_state_dir": state_dir,
+                        "manual_link_duplicate_ttl_hours": 48,
+                    }
+                    video = {"title": "Football video", "source": "Official", "url": url}
+                    reset_persistent_state_runtime()
+                    with patch("monitor.requests.post", return_value=response) as post_mock:
+                        self.assertTrue(send_manual_open_alert(video, config))
+                        reset_persistent_state_runtime()  # Simulate a fresh Actions process.
+                        self.assertFalse(send_manual_open_alert(video, config))
+                    self.assertEqual(post_mock.call_count, 1)
+
+    def test_normalized_platform_ids(self):
+        self.assertEqual(normalize_media_id("https://youtube.com/watch?v=abcdefghijk"), "youtube:abcdefghijk")
+        self.assertEqual(normalize_media_id("https://youtube.com/shorts/shorts12345"), "youtube:shorts12345")
+        self.assertEqual(normalize_media_id("https://instagram.com/reel/DV7DOkEEhHh/"), "instagram:DV7DOkEEhHh")
+        self.assertEqual(normalize_media_id("https://tiktok.com/@fifa/video/12345"), "tiktok:12345")
+        self.assertEqual(normalize_media_id("https://x.com/FIFA/status/98765"), "x:98765")
+
+    def test_downloaded_instagram_video_is_not_downloaded_again(self):
+        url = "https://www.instagram.com/reel/DV7DOkEEhHh/"
+        with TemporaryDirectory() as temp_dir:
+            config = {"monitor_state_dir": Path(temp_dir) / ".monitor_state", "downloads_dir": Path(temp_dir)}
+            mark_persistent_state(config, "downloaded_video_ids", normalize_media_id(url), "Instagram", "Video", url)
+            reset_persistent_state_runtime()
+            with patch("monitor.subprocess.run") as run_mock:
+                result = process_instagram_video_source({"title": "Video", "source": "Instagram", "url": url}, config)
+        self.assertFalse(result)
+        run_mock.assert_not_called()
+
+    def test_sent_local_video_is_not_sent_again(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "video.mp4"
+            video_path.write_bytes(b"mp4")
+            config = {"monitor_state_dir": Path(temp_dir) / ".monitor_state"}
+            media_id = normalize_media_id(str(video_path.resolve()))
+            mark_persistent_state(config, "sent_video_ids", media_id, "Local MP4", "Video", str(video_path))
+            reset_persistent_state_runtime()
+            with patch("monitor.send_downloaded_video_to_telegram") as send_mock:
+                result = process_local_video_file(video_path, config)
+        self.assertFalse(result)
+        send_mock.assert_not_called()
+
+    def test_manual_state_is_saved_only_after_telegram_success(self):
+        failure = type("Response", (), {"status_code": 400})()
+        success = type("Response", (), {"status_code": 200})()
+        url = "https://x.com/FIFA/status/12345"
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "telegram_bot_token": "TOKEN", "telegram_chat_id": "123",
+                "manual_links_file": Path(temp_dir) / "manual.json",
+                "monitor_state_dir": Path(temp_dir) / ".monitor_state",
+            }
+            video = {"title": "VAR", "source": "FIFA", "url": url}
+            with patch("monitor.requests.post", side_effect=[failure, success]):
+                self.assertFalse(send_manual_open_alert(video, config))
+                state = load_persistent_state(config)
+                self.assertNotIn(normalize_media_id(url), state["manual_open_links"])
+                self.assertTrue(send_manual_open_alert(video, config))
+                self.assertIn(normalize_media_id(url), state["manual_open_links"])
 
     def test_controversy_phrases_have_high_priority(self):
         for title in (
@@ -1367,6 +1473,10 @@ class MonitorTests(unittest.TestCase):
         self.assertIn('PYTHONIOENCODING: "utf-8"', workflow)
         self.assertIn('TVNZ_YOUTUBE_CHANNEL_ID: "UCY8jpWswn6c3kpaHijtBUAg"', workflow)
         self.assertIn("python -m pip install -U yt-dlp", workflow)
+        self.assertIn("uses: actions/cache@v4", workflow)
+        self.assertIn("path: .monitor_state", workflow)
+        self.assertIn("key: monitor-state-${{ github.run_id }}", workflow)
+        self.assertIn("monitor-state-", workflow)
 
     def test_zero_tvnz_scan_logs_output_return_code_and_tries_fallback(self):
         empty = type("Completed", (), {

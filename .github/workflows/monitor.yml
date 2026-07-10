@@ -12,6 +12,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Restore and save monitor state
+        uses: actions/cache@v4
+        with:
+          path: .monitor_state
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: |
+            monitor-state-
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:

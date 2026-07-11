@@ -60,6 +60,7 @@ from monitor import (
     main,
     mark_as_sent,
     load_persistent_state,
+    load_telegram_editor_sessions,
     mark_persistent_state,
     normalize_media_id,
     parse_tvnz_max_downloads_per_run,
@@ -92,6 +93,35 @@ from monitor import save_seen_articles
 
 
 class MonitorTests(unittest.TestCase):
+    def test_editor_session_persists_across_poll_once_runs(self):
+        with TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            session_file = state_dir / "telegram_editor_sessions.json"
+            session_file.write_text(json.dumps({"7:9": {
+                "chat_id": 7, "user_id": 9, "status": "editing", "effects": ["zoom"],
+                "zoom": 1.35, "duration": 10, "focus": "center",
+            }}), encoding="utf-8")
+            TELEGRAM_EDITOR_SESSIONS.clear()
+            sessions = load_telegram_editor_sessions({"monitor_state_dir": state_dir}, force_reload=True)
+        self.assertIn("7:9", sessions)
+        self.assertEqual(sessions["7:9"]["effects"], {"zoom"})
+        TELEGRAM_EDITOR_SESSIONS.clear()
+
+    def test_telegram_poll_once_processes_callback_query(self):
+        webhook = type("Response", (), {"status_code": 200, "json": lambda self: {"result": {"url": ""}}})()
+        updates = type("Response", (), {
+            "status_code": 200, "raise_for_status": lambda self: None,
+            "json": lambda self: {"result": [{"update_id": 52, "callback_query": {
+                "id": "cb", "data": "editor:set:zoom:1.35", "from": {"id": 9},
+                "message": {"chat": {"id": 7}},
+            }}]},
+        })()
+        with TemporaryDirectory() as temp_dir, \
+             patch("monitor.requests.get", side_effect=[webhook, updates]), \
+             patch("monitor.handle_editor_callback", return_value=True) as callback_mock:
+            telegram_poll_once({"telegram_bot_token": "TOKEN", "telegram_chat_id": "7", "monitor_state_dir": Path(temp_dir)})
+        callback_mock.assert_called_once()
+
     def test_telegram_poll_once_saves_offset_and_exits(self):
         webhook = type("Response", (), {
             "status_code": 200, "json": lambda self: {"result": {"url": ""}},

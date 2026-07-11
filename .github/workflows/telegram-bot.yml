@@ -25,6 +25,14 @@ jobs:
             telegram-monitor-state-
             monitor-state-
 
+      - name: Restore Telegram source videos
+        uses: actions/cache/restore@v4
+        with:
+          path: downloads/telegram
+          key: telegram-source-videos-${{ github.run_id }}
+          restore-keys: |
+            telegram-source-videos-
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -51,3 +59,10 @@ jobs:
         with:
           path: .monitor_state
           key: telegram-monitor-state-${{ github.run_id }}
+
+      - name: Save Telegram source videos
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: downloads/telegram
+          key: telegram-source-videos-${{ github.run_id }}

@@ -3582,6 +3582,7 @@ def process_telegram_commands(config: dict[str, Any]) -> None:
 
 TELEGRAM_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv"}
 TELEGRAM_UPDATE_OFFSET_FILE = "telegram_update_offset.json"
+TELEGRAM_EDITOR_SESSIONS_FILE = "telegram_editor_sessions.json"
 
 
 def load_telegram_update_offset(config: dict[str, Any]) -> int:
@@ -3607,6 +3608,45 @@ def save_telegram_update_offset(config: dict[str, Any], offset: int) -> None:
     logger.info("Telegram offset saved: %s", offset)
 
 
+def load_telegram_editor_sessions(config: dict[str, Any], force_reload: bool = False) -> dict[str, dict[str, Any]]:
+    """Restore interactive editor sessions so callbacks survive separate cloud runs."""
+    if TELEGRAM_EDITOR_SESSIONS and not force_reload:
+        return TELEGRAM_EDITOR_SESSIONS
+    state_dir = _state_dir(config)
+    if state_dir is None:
+        return TELEGRAM_EDITOR_SESSIONS
+    try:
+        payload = json.loads((state_dir / TELEGRAM_EDITOR_SESSIONS_FILE).read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            TELEGRAM_EDITOR_SESSIONS.clear()
+            for key, session in payload.items():
+                if isinstance(session, dict):
+                    session["effects"] = set(session.get("effects") or [])
+                    TELEGRAM_EDITOR_SESSIONS[str(key)] = session
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        pass
+    return TELEGRAM_EDITOR_SESSIONS
+
+
+def save_telegram_editor_sessions(
+    config: dict[str, Any], completed_session: tuple[str, dict[str, Any]] | None = None,
+) -> None:
+    state_dir = _state_dir(config)
+    if state_dir is None:
+        return
+    payload = dict(TELEGRAM_EDITOR_SESSIONS)
+    if completed_session is not None:
+        payload[completed_session[0]] = completed_session[1]
+    serializable = {
+        key: {**session, "effects": sorted(session.get("effects") or [])}
+        for key, session in payload.items()
+    }
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / TELEGRAM_EDITOR_SESSIONS_FILE).write_text(
+        json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 def _editor_session_key(chat_id: Any, user_id: Any) -> str:
     return f"{chat_id}:{user_id}"
 
@@ -3614,18 +3654,18 @@ def _editor_session_key(chat_id: Any, user_id: Any) -> str:
 def build_editor_menu_payload(session: dict[str, Any]) -> dict[str, Any]:
     effects = ", ".join(sorted(session.get("effects", []))) or "none"
     text = (
-        "🎬 Editor de Short\nEscolha as opções abaixo:\n\n"
-        "Current settings:\n"
-        f"Duration: {session.get('duration', 10)}s\n"
+        "🎬 Editor de Short\n\n"
+        f"Duração: {session.get('duration', 10)}s\n"
         f"Zoom: {float(session.get('zoom', 1.35)):.2f}x\n"
-        f"Focus: {session.get('focus', 'center')}\n"
-        f"Player name: {session.get('player_name') or '-'}\n"
-        f"Ticker: {session.get('ticker_text') or '-'}\n"
-        f"Effects: {effects}"
+        f"Foco: {session.get('focus', 'center')}\n"
+        f"Nome jogador: {session.get('player_name') or '-'}\n"
+        f"Texto passando: {session.get('ticker_text') or '-'}\n"
+        f"Texto piscante: {session.get('blink_text') or '-'}\n"
+        f"Efeitos: {effects}"
     )
     keyboard = [
         [{"text": "🔍 Zoom", "callback_data": "editor:zoom"}, {"text": "🎯 Foco", "callback_data": "editor:focus"}],
-        [{"text": "🏷 Nome do jogador", "callback_data": "editor:player"}, {"text": "📝 Texto passando", "callback_data": "editor:ticker"}],
+        [{"text": "🏷 Nome jogador", "callback_data": "editor:player"}, {"text": "📝 Texto passando", "callback_data": "editor:ticker"}],
         [{"text": "✨ Texto piscante", "callback_data": "editor:blink"}],
         [{"text": "🧊 Freeze", "callback_data": "editor:toggle:freeze"}, {"text": "🔁 Replay", "callback_data": "editor:toggle:replay"}],
         [{"text": "⏱ Duração", "callback_data": "editor:duration"}],
@@ -3643,6 +3683,8 @@ def _send_editor_menu(config: dict[str, Any], chat_id: Any, session: dict[str, A
         payload["message_id"] = message_id
     try:
         response = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if response.status_code == 200:
+            logger.info("Editor menu sent")
         return response.status_code == 200
     except requests.RequestException:
         return False
@@ -3660,6 +3702,7 @@ def _editor_choice_keyboard(kind: str) -> list[list[dict[str, str]]]:
 def handle_editor_text_message(message: dict[str, Any], config: dict[str, Any]) -> bool:
     chat_id = message.get("chat", {}).get("id")
     user_id = message.get("from", {}).get("id")
+    load_telegram_editor_sessions(config)
     session = TELEGRAM_EDITOR_SESSIONS.get(_editor_session_key(chat_id, user_id))
     if not session or not session.get("waiting_for"):
         return False
@@ -3694,7 +3737,10 @@ def handle_editor_text_message(message: dict[str, Any], config: dict[str, Any]) 
         except ValueError:
             _send_telegram_text(str(config.get("telegram_bot_token") or ""), chat_id, "Valores inválidos. Exemplo: 0.35 0.70")
             session["waiting_for"] = "manual_focus"
+            save_telegram_editor_sessions(config)
             return True
+    logger.info("Text input saved: %s", waiting)
+    save_telegram_editor_sessions(config)
     _send_editor_menu(config, chat_id, session)
     return True
 
@@ -3707,15 +3753,17 @@ def handle_editor_callback(callback: dict[str, Any], config: dict[str, Any]) -> 
     chat_id = message.get("chat", {}).get("id")
     user_id = callback.get("from", {}).get("id")
     key = _editor_session_key(chat_id, user_id)
+    load_telegram_editor_sessions(config)
     session = TELEGRAM_EDITOR_SESSIONS.get(key)
     token = str(config.get("telegram_bot_token") or "")
+    logger.info("Callback received: %s", data)
     logger.info("Button clicked: %s", data)
     if callback.get("id"):
         try:
             requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", json={"callback_query_id": callback["id"]}, timeout=10)
         except requests.RequestException:
             pass
-    if not session:
+    if not session or session.get("status", "editing") != "editing":
         _send_telegram_text(token, chat_id, "Sessão do editor expirada. Envie o vídeo novamente.")
         return True
     parts = data.split(":")
@@ -3747,22 +3795,28 @@ def handle_editor_callback(callback: dict[str, Any], config: dict[str, Any]) -> 
             if value == "manual":
                 session["waiting_for"] = "manual_focus"
                 logger.info("Waiting for text input: manual_focus")
+                save_telegram_editor_sessions(config)
                 _send_telegram_text(token, chat_id, "Digite focus_x e focus_y. Exemplo: 0.35 0.70")
                 return True
             session["focus"] = value
             session["focus_x"], session["focus_y"] = presets[value]
             logger.info("Focus saved: %s", value)
+            logger.info("Focus selected: %s", value)
         elif kind == "blink_position":
             session["blink_position"] = value
         elif kind == "blink_style":
             session["blink_style"] = value
+        if kind == "zoom":
+            logger.info("Zoom selected: %s", value)
+        save_telegram_editor_sessions(config)
         _send_editor_menu(config, chat_id, session)
         return True
     if action in {"player", "ticker", "blink"}:
         waiting = {"player": "player_name", "ticker": "ticker_text", "blink": "blink_text"}[action]
-        prompt = {"player": "Digite o nome do jogador:", "ticker": "Digite a frase que vai passar no vídeo:", "blink": "Digite o texto piscante que você quer colocar no vídeo:"}[action]
+        prompt = {"player": "Digite o nome do jogador:", "ticker": "Digite a frase que vai passar no vídeo:", "blink": "Digite o texto piscante:"}[action]
         session["waiting_for"] = waiting
         logger.info("Waiting for text input: %s", waiting)
+        save_telegram_editor_sessions(config)
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": prompt, "reply_markup": {"force_reply": True}}, timeout=REQUEST_TIMEOUT_SECONDS,
@@ -3770,16 +3824,19 @@ def handle_editor_callback(callback: dict[str, Any], config: dict[str, Any]) -> 
         return True
     if action == "blink_caps":
         session["caps"] = not session.get("caps", True)
+        save_telegram_editor_sessions(config)
         _send_editor_menu(config, chat_id, session)
         return True
     if action == "toggle" and len(parts) >= 3:
         effect = parts[2]
         session["effects"].remove(effect) if effect in session["effects"] else session["effects"].add(effect)
+        save_telegram_editor_sessions(config)
         _send_editor_menu(config, chat_id, session)
         return True
     if action == "cancel":
         TELEGRAM_EDITOR_SESSIONS.pop(key, None)
-        logger.info("Session cleared: %s", key)
+        save_telegram_editor_sessions(config)
+        logger.info("Editor session cancelled: %s", key)
         _send_telegram_text(token, chat_id, "Editor cancelado.")
         return True
     if action == "generate":
@@ -3802,10 +3859,13 @@ def handle_editor_callback(callback: dict[str, Any], config: dict[str, Any]) -> 
             "cta_text": session.get("cta", "COMENTA AÍ 👇"),
             "telegram_caption": "✅ Short pronto", "_telegram_config": {**config, "telegram_chat_id": chat_id},
         }
-        success = process_local_video_file(session["downloaded_file_path"], story["_telegram_config"], story)
+        local_video_path = session.get("local_video_path") or session.get("downloaded_file_path")
+        success = process_local_video_file(local_video_path, story["_telegram_config"], story)
         if success:
+            session["status"] = "completed"
+            save_telegram_editor_sessions(config, (key, dict(session)))
             TELEGRAM_EDITOR_SESSIONS.pop(key, None)
-            logger.info("Session cleared: %s", key)
+            logger.info("Editor session completed: %s", key)
         return True
     return True
 
@@ -3905,16 +3965,20 @@ def process_telegram_video_message(message: dict[str, Any], config: dict[str, An
             user_id = message.get("from", {}).get("id")
             session_key = _editor_session_key(chat_id, user_id)
             TELEGRAM_EDITOR_SESSIONS[session_key] = {
+                "chat_id": chat_id, "user_id": user_id, "message_id": message.get("message_id"),
                 "file_id": attachment["file_id"], "file_unique_id": unique_id,
-                "downloaded_file_path": str(target), "duration": 10,
+                "local_video_path": str(target), "downloaded_file_path": str(target), "duration": 10,
                 "effects": {"zoom", "headline", "watermark"}, "zoom": 1.35,
                 "focus": "center", "focus_x": 0.50, "focus_y": 0.60,
                 "player_name": "", "ticker_text": "", "title": "", "cta": "COMENTA AÍ 👇",
                 "blink_text": "", "caps": True, "blink_position": "middle", "blink_style": "blink", "blink_start": 0, "blink_end": 5,
                 "force": False,
+                "arrow": False, "created_at": datetime.now(timezone.utc).isoformat(), "status": "editing",
             }
             logger.info("Editor session created: %s", session_key)
-            return _send_editor_menu(config, chat_id, TELEGRAM_EDITOR_SESSIONS[session_key])
+            save_telegram_editor_sessions(config)
+            sent = _send_telegram_text(token, chat_id, "🎬 Vídeo recebido. O que você quer fazer?")
+            return _send_editor_menu(config, chat_id, TELEGRAM_EDITOR_SESSIONS[session_key]) and sent
         if preview_mode:
             preview_path = target_dir / f"{unique_id}_focus_preview.jpg"
             font_path = find_short_font_path()
@@ -3991,6 +4055,7 @@ def telegram_poll(config: dict[str, Any]) -> None:
         logger.error("TELEGRAM_BOT_TOKEN is required for --telegram-poll")
         return
     endpoint = f"https://api.telegram.org/bot{token}/getUpdates"
+    load_telegram_editor_sessions(config, force_reload=True)
     offset = 0
     while True:
         try:
@@ -4023,6 +4088,7 @@ def telegram_poll_once(config: dict[str, Any]) -> None:
         logger.error("TELEGRAM_BOT_TOKEN is required for --telegram-poll-once")
         return
     load_persistent_state(config)
+    load_telegram_editor_sessions(config, force_reload=True)
     api = f"https://api.telegram.org/bot{token}"
     try:
         webhook = requests.get(f"{api}/getWebhookInfo", timeout=10)

@@ -2123,7 +2123,10 @@ def build_downloaded_video_caption(story: dict[str, Any]) -> str:
     if metadata_file_name:
         lines.append(f"Metadata: {metadata_file_name}")
     if original_url:
-        lines.append(f"Original URL: {original_url}")
+        if story.get("platform") == "Instagram" or "instagram.com" in str(original_url).casefold():
+            lines.append(f"Link original: {original_url}")
+        else:
+            lines.append(f"Original URL: {original_url}")
     return "\n".join(lines)[:1024]
 
 
@@ -2657,7 +2660,7 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
     title = str(story.get("title", "") or "").strip()
     source = str(story.get("source") or next(iter(story.get("sources") or []), "Unknown"))
     media_url = str(story.get("video_url") or story.get("link") or Path(file_path).resolve())
-    media_id = normalize_media_id(media_url)
+    media_id = str(story.get("dedupe_id") or normalize_media_id(media_url))
     if not token or not chat_id:
         logger.warning("Telegram credentials are not configured. Skipping downloaded video delivery for %s", title)
         return False
@@ -2759,18 +2762,24 @@ def build_manual_open_payload(video: dict[str, Any], config: dict[str, Any]) -> 
     source = str(video.get("source") or video.get("channel") or video.get("uploader") or "Unknown").strip()
     platform = str(video.get("platform") or video_platform_from_url(url)).strip()
     status = str(video.get("status") or "manual open required").strip()
-    text = (
-        f"{MANUAL_OPEN_MESSAGE}\n\n"
-        f"Title: {title}\nSource: {source}\nPlatform: {platform}\n"
-        f"Original URL: {url}\nStatus: {status}"
-    )
     if platform == "Instagram":
-        text += "\n\nOpen manually. Send the video file to the bot if you want editing."
+        text = (
+            "🚨 INSTAGRAM ENCONTRADO\n\n"
+            f"Título: {title}\nFonte: Instagram\nStatus: abrir manualmente\n\nLink: {url}"
+        )
+        button_text = "ABRIR INSTAGRAM"
+    else:
+        text = (
+            f"{MANUAL_OPEN_MESSAGE}\n\n"
+            f"Title: {title}\nSource: {source}\nPlatform: {platform}\n"
+            f"Original URL: {url}\nStatus: {status}"
+        )
+        button_text = "ABRIR VÍDEO"
     return {
         "chat_id": str(config.get("telegram_chat_id", "") or ""),
         "text": text,
         "disable_web_page_preview": False,
-        "reply_markup": {"inline_keyboard": [[{"text": "ABRIR VÍDEO", "url": url}]]},
+        "reply_markup": {"inline_keyboard": [[{"text": button_text, "url": url}]]},
     }
 
 
@@ -2796,6 +2805,8 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
     source = str(video.get("source") or video.get("channel") or video.get("uploader") or "Unknown")
     title = str(video.get("title") or "Football video")
     if not should_send_once(media_id, url, title, source, "manual_open", config):
+        if video_platform_from_url(url) == "Instagram":
+            logger.info("Instagram duplicate skipped: %s", url)
         return False
     payload = build_manual_open_payload(video, config)
     try:
@@ -2825,6 +2836,8 @@ def send_manual_open_alert(video: dict[str, Any], config: dict[str, Any]) -> boo
         source, title, url,
     )
     logger.info("Manual open link sent: %s", url)
+    if video_platform_from_url(url) == "Instagram":
+        logger.info("Instagram manual link sent: %s", url)
     return True
 
 
@@ -2916,30 +2929,32 @@ def handle_manual_only_video_source(video: dict[str, Any], config: dict[str, Any
 
 
 def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]) -> bool:
-    """Try a public, cookie-free Instagram download and fall back to its original link."""
+    """Send the original Instagram link, then optionally process a public download."""
     url = str(video.get("url") or video.get("webpage_url") or "").strip()
     if not is_instagram_video_url(url):
         return False
-    fallback_enabled = config.get("instagram_fallback_to_manual_link", True) is not False
     manual_video = {
         **video,
         "url": url,
         "platform": "Instagram",
     }
     media_id = normalize_media_id(url)
+    manual_sent = send_manual_open_alert(manual_video, config)
+    if config.get("instagram_auto_download", True) is not True:
+        return manual_sent
     blocked_ttl = float(config.get("blocked_video_retry_ttl_hours", 24) or 24)
     if (
         persistent_state_contains(config, "downloaded_video_ids", media_id)
         or persistent_state_contains(config, "sent_video_ids", media_id)
     ):
         log_duplicate(video.get("source", "Instagram"), video.get("title", ""), url, media_id)
-        return False
+        return manual_sent
     if (
         persistent_state_contains(config, "skipped_geo_blocked", media_id, blocked_ttl)
         or persistent_state_contains(config, "skipped_bot_blocked", media_id, blocked_ttl)
     ):
         log_duplicate(video.get("source", "Instagram"), video.get("title", ""), url, media_id)
-        return send_manual_open_alert({**manual_video, "status": "blocked; retry deferred"}, config)
+        return manual_sent
     if config.get("instagram_use_cookies", False):
         logger.warning("Instagram cookies are not used by this monitor; attempting public extraction only.")
     downloads_dir = Path(config.get("downloads_dir", DOWNLOADS_DIR)) / "instagram"
@@ -2955,6 +2970,7 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
     ]
     try:
         downloads_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Instagram download attempted: %s", url)
         result = subprocess.run(
             command, capture_output=True, text=True, check=True, timeout=120,
             **SUBPROCESS_TEXT_KWARGS,
@@ -2976,6 +2992,7 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
             "links": [url],
             "video_url": url,
             "platform": "Instagram",
+            "dedupe_id": f"instagram-edit:{media_id.split(':', 1)[-1]}",
             "downloaded_video_path": downloaded_path,
             "_telegram_config": config,
         }
@@ -2989,10 +3006,7 @@ def process_instagram_video_source(video: dict[str, Any], config: dict[str, Any]
             mark_persistent_state(config, "skipped_geo_blocked", media_id, "Instagram", str(video.get("title") or ""), url)
         elif any(term in error_text for term in BOT_VERIFICATION_TERMS):
             mark_persistent_state(config, "skipped_bot_blocked", media_id, "Instagram", str(video.get("title") or ""), url)
-        if not fallback_enabled:
-            return False
-        manual_video["status"] = "Instagram download failed"
-        return send_manual_open_alert(manual_video, config)
+        return manual_sent
 
 
 def process_local_video_file(
@@ -3012,7 +3026,7 @@ def process_local_video_file(
     video_story["downloaded_video_path"] = str(source_path)
     video_story["_telegram_config"] = config
     media_url = str(video_story.get("video_url") or video_story.get("link") or source_path.resolve())
-    media_id = normalize_media_id(media_url)
+    media_id = str(video_story.get("dedupe_id") or normalize_media_id(media_url))
     if persistent_state_contains(config, "sent_video_ids", media_id):
         log_duplicate(video_story.get("source"), video_story.get("title"), media_url, media_id)
         return False

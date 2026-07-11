@@ -21,6 +21,7 @@ from monitor import (
     build_match_highlight_queries,
     build_match_day_queries,
     build_manual_grouped_article,
+    build_downloaded_video_caption,
     build_short_metadata,
     build_portuguese_shorts_pack,
     build_portuguese_telegram_message,
@@ -1320,7 +1321,7 @@ class MonitorTests(unittest.TestCase):
             controversy_score_for_title("Pênalti não marcado em Portugal v Spain"),
         )
 
-    def test_instagram_manual_alert_contains_editing_instruction(self):
+    def test_instagram_manual_alert_uses_review_format_and_button(self):
         response = type("Response", (), {"status_code": 200})()
         with TemporaryDirectory() as temp_dir:
             config = {
@@ -1333,7 +1334,10 @@ class MonitorTests(unittest.TestCase):
                     "url": "https://instagram.com/reel/abc",
                 }, config)
         self.assertTrue(sent)
-        self.assertIn("Send the video file to the bot if you want editing", post_mock.call_args.kwargs["json"]["text"])
+        payload = post_mock.call_args.kwargs["json"]
+        self.assertIn("🚨 INSTAGRAM ENCONTRADO", payload["text"])
+        self.assertIn("Fonte: Instagram", payload["text"])
+        self.assertEqual(payload["reply_markup"]["inline_keyboard"][0][0]["text"], "ABRIR INSTAGRAM")
 
     def test_instagram_video_url_detection_accepts_supported_paths_only(self):
         for url in (
@@ -1358,6 +1362,7 @@ class MonitorTests(unittest.TestCase):
                 "url": "https://www.instagram.com/reel/abc/",
             }
             with patch("monitor.subprocess.run", return_value=completed) as run_mock, \
+                 patch("monitor.send_manual_open_alert", return_value=True) as manual_mock, \
                  patch("monitor.create_best_moments_clip", return_value="moments.mp4") as moments_mock, \
                  patch("monitor.create_vertical_short", return_value="vertical.mp4") as vertical_mock, \
                  patch("monitor.send_downloaded_video_to_telegram", return_value=True) as send_mock, \
@@ -1374,6 +1379,9 @@ class MonitorTests(unittest.TestCase):
         moments_mock.assert_called_once()
         vertical_mock.assert_called_once()
         send_mock.assert_called_once()
+        manual_mock.assert_called_once()
+        edited_story = send_mock.call_args.args[1]
+        self.assertIn(f"Link original: {video['url']}", build_downloaded_video_caption(edited_story))
         self.assertIn("Instagram download succeeded", "\n".join(captured.output))
 
     def test_instagram_download_failure_falls_back_to_original_manual_link(self):
@@ -1390,8 +1398,8 @@ class MonitorTests(unittest.TestCase):
             })
 
         self.assertTrue(sent)
+        manual_mock.assert_called_once()
         self.assertEqual(manual_mock.call_args.args[0]["url"], video["url"])
-        self.assertEqual(manual_mock.call_args.args[0]["status"], "Instagram download failed")
         self.assertIn("Instagram download failed", "\n".join(captured.output))
 
     def test_process_url_cli_routes_instagram_success_to_editor_pipeline(self):
@@ -1418,6 +1426,7 @@ class MonitorTests(unittest.TestCase):
             result = main()
 
         self.assertEqual(result, 0)
+        manual_mock.assert_called_once()
         self.assertEqual(manual_mock.call_args.args[0]["url"], url)
 
     def test_process_file_cli_processes_existing_mp4(self):

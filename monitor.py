@@ -165,10 +165,12 @@ PERSISTENT_STATE_FILES = {
     "manual_open_links": "manual_open_links.json",
     "skipped_geo_blocked": "skipped_geo_blocked.json",
     "skipped_bot_blocked": "skipped_bot_blocked.json",
+    "processed_telegram_shorts": "processed_telegram_shorts.json",
 }
 PERSISTENT_STATE_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 RUN_DEDUPE_KEYS: set[str] = set()
 RESERVED_SEND_IDS: set[str] = set()
+TELEGRAM_EDITOR_SESSIONS: dict[str, dict[str, Any]] = {}
 TVNZ_SCAN_LIMIT_DEFAULT = 30
 TVNZ_MAX_DOWNLOADS_PER_RUN_DEFAULT = 5
 TVNZ_HIGHLIGHT_KEYWORDS = (
@@ -1124,6 +1126,21 @@ def load_persistent_state(config: dict[str, Any], force_reload: bool = False) ->
             state[category] = payload if isinstance(payload, dict) else {}
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             state[category] = {}
+    legacy_telegram_keys = [
+        key for key in state.get("sent_video_ids", {})
+        if str(key).startswith(("telegram:", "telegram_short:"))
+    ]
+    if legacy_telegram_keys:
+        for key in legacy_telegram_keys:
+            state["sent_video_ids"].pop(key, None)
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / PERSISTENT_STATE_FILES["sent_video_ids"]).write_text(
+                json.dumps(state["sent_video_ids"], ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            logger.info("Removed %s legacy Telegram entries from sent_video_ids.json", len(legacy_telegram_keys))
+        except OSError:
+            logger.warning("Could not clean legacy Telegram entries from sent_video_ids.json")
     PERSISTENT_STATE_CACHE[cache_key] = state
     logger.info("Persistent state loaded: %s", state_dir)
     return state
@@ -2092,6 +2109,8 @@ def send_telegram_notification(grouped_article: dict[str, Any], config: dict[str
 
 def build_downloaded_video_caption(story: dict[str, Any]) -> str:
     """Build a compact caption for a downloaded video sent to Telegram."""
+    if story.get("telegram_caption"):
+        return str(story["telegram_caption"])[:1024]
     sources = ", ".join(str(source) for source in story.get("sources", []) if str(source))
     original_url = story.get("link") or next((link for link in story.get("links", []) if link), "")
     short_file_name = Path(str(
@@ -2199,7 +2218,7 @@ def _format_drawtext_font_path(font_path: str | Path) -> str:
     return normalized
 
 
-def _drawtext_filter(text: str, x: str, y: str, fontsize: int, font_path: str | Path, boxcolor: str = "black@0.55") -> str:
+def _drawtext_filter(text: str, x: str, y: str, fontsize: int, font_path: str | Path, boxcolor: str = "black@0.55", enable: str = "") -> str:
     return (
         "drawtext="
         f"fontfile='{_format_drawtext_font_path(font_path)}':"
@@ -2208,7 +2227,257 @@ def _drawtext_filter(text: str, x: str, y: str, fontsize: int, font_path: str | 
         f"fontsize={fontsize}:fontcolor=white:"
         "borderw=2:bordercolor=black@0.45:"
         f"box=1:boxcolor={boxcolor}:boxborderw=28"
+        + (f":enable='{enable}'" if enable else "")
     )
+
+
+TELEGRAM_SHORT_EFFECTS = {
+    "zoom", "headline", "cta", "freeze", "replay",
+    "ticker", "slide_text", "impact_words", "pulse_text", "player_tag", "blink_text",
+}
+DEFAULT_TELEGRAM_SHORT_EFFECTS = ["zoom", "headline", "cta"]
+
+
+def parse_telegram_short_request(caption: str) -> dict[str, Any]:
+    """Parse `/short duration=N effects=a,b title=...` caption options."""
+    text = str(caption or "").strip()
+    duration_match = re.search(r"(?:^|\s)duration=(\d+)", text, re.IGNORECASE)
+    effects_match = re.search(r"(?:^|\s)effects=([^\s]+)", text, re.IGNORECASE)
+    zoom_match = re.search(r"(?:^|\s)zoom=([^\s]+)", text, re.IGNORECASE)
+    focus_match = re.search(r"(?:^|\s)focus=([^\s]+)", text, re.IGNORECASE)
+    focus_x_match = re.search(r"(?:^|\s)focus_x=([^\s]+)", text, re.IGNORECASE)
+    focus_y_match = re.search(r"(?:^|\s)focus_y=([^\s]+)", text, re.IGNORECASE)
+    quality_match = re.search(r"(?:^|\s)quality=([^\s]+)", text, re.IGNORECASE)
+    title_match = re.search(
+        r"(?:^|\s)title=(.+?)(?=\s+(?:duration|effects|zoom|focus|focus_x|focus_y|quality|cta|force|reprocess|ticker|phrase|words|textspeed|textpos|blink_text|caps|blink_position|blink_style|blink_start|blink_end)=|$)",
+        text, re.IGNORECASE,
+    )
+    cta_match = re.search(r"(?:^|\s)cta=([^\s]+)", text, re.IGNORECASE)
+    force_match = re.search(r"(?:^|\s)(?:force|reprocess)=(true|1|yes|on)(?:\s|$)", text, re.IGNORECASE)
+    def option_value(name: str) -> str:
+        match = re.search(rf'(?:^|\s){name}=(?:"([^"]*)"|\'([^\']*)\'|([^\s]+))', text, re.IGNORECASE)
+        return next((group for group in match.groups() if group is not None), "") if match else ""
+    parsed_title = title_match.group(1).strip() if title_match else "LANCE DO JOGO"
+    if len(parsed_title) >= 2 and parsed_title[0] == parsed_title[-1] and parsed_title[0] in {'"', "'"}:
+        parsed_title = parsed_title[1:-1].strip()
+    effects = DEFAULT_TELEGRAM_SHORT_EFFECTS.copy()
+    if effects_match:
+        aliases = {"impact": "impact_words", "slide": "slide_text", "pulse": "pulse_text", "texto_piscante": "blink_text"}
+        effects = []
+        for raw_effect in effects_match.group(1).split(","):
+            effect = aliases.get(raw_effect.casefold(), raw_effect.casefold())
+            if effect in TELEGRAM_SHORT_EFFECTS:
+                effects.append(effect)
+    zoom_intensity = 1.25
+    zoom_mode = "smart"
+    if zoom_match:
+        zoom_value = zoom_match.group(1).casefold()
+        named_zoom = {"light": 1.10, "medium": 1.20, "strong": 1.35, "verystrong": 1.50}
+        mode_aliases = {"normal": "smart", "strong": "smart_strong", "smart": "smart", "smart_strong": "smart_strong", "center": "center"}
+        zoom_mode = mode_aliases.get(zoom_value, "smart")
+        try:
+            if zoom_value in {"normal", "smart", "center"}:
+                zoom_intensity = 1.25
+            elif zoom_value == "smart_strong":
+                zoom_intensity = 1.35
+            else:
+                zoom_intensity = named_zoom[zoom_value] if zoom_value in named_zoom else float(zoom_value)
+        except ValueError:
+            logger.warning("Invalid zoom intensity %s; using 1.25x", zoom_value)
+        zoom_intensity = min(1.50, max(1.0, zoom_intensity))
+    focus_mode = str(focus_match.group(1) if focus_match else "action").casefold()
+    focus_presets = {
+        "left": (0.30, 0.60), "center": (0.50, 0.60), "right": (0.70, 0.60),
+        "bottom": (0.50, 0.75), "player_left": (0.35, 0.70), "player_right": (0.65, 0.70),
+        "goal_left": (0.30, 0.45), "goal_right": (0.70, 0.45),
+    }
+    allowed_focus_modes = {"manual", "smart", "player", "ball", "goal", "action", *focus_presets}
+    if focus_mode not in allowed_focus_modes:
+        focus_mode = "action"
+    manual_focus_valid = True
+    focus_x = focus_y = None
+    if focus_mode in focus_presets:
+        focus_x, focus_y = focus_presets[focus_mode]
+    elif focus_mode == "manual":
+        try:
+            focus_x = float(focus_x_match.group(1)) if focus_x_match else 0.5
+            focus_y = float(focus_y_match.group(1)) if focus_y_match else 0.5
+            manual_focus_valid = 0.0 <= focus_x <= 1.0 and 0.0 <= focus_y <= 1.0
+        except (TypeError, ValueError):
+            manual_focus_valid = False
+        if not manual_focus_valid:
+            logger.warning("Invalid manual focus coordinates; falling back to center")
+            focus_x, focus_y = 0.5, 0.5
+    ticker_text = option_value("ticker") or option_value("phrase")
+    words_text = option_value("words")
+    if "impact_words" in effects and not words_text and ticker_text and "|" in ticker_text:
+        words_text = ticker_text
+    if "ticker" in effects and not ticker_text:
+        ticker_text = parsed_title or "OLHA ESSE LANCE"
+    impact_words = [word.strip() for word in words_text.split("|") if word.strip()]
+    if "impact_words" in effects and not impact_words:
+        impact_words = ["GOL!", "VAR?", "POLÊMICA!", "OLHA ISSO!"]
+    text_speed = option_value("textspeed").casefold()
+    text_position = option_value("textpos").casefold()
+    blink_text = option_value("blink_text")
+    caps_value = option_value("caps").casefold()
+    blink_position = option_value("blink_position").casefold()
+    blink_style = option_value("blink_style").casefold()
+    try:
+        blink_start = max(0.0, float(option_value("blink_start") or 0))
+        blink_end = max(blink_start, float(option_value("blink_end") or 5))
+    except ValueError:
+        blink_start, blink_end = 0.0, 5.0
+    request = {
+        "duration": min(60, max(1, int(duration_match.group(1)))) if duration_match else 20,
+        "effects": list(dict.fromkeys(effects)),
+        "title": parsed_title,
+        "zoom_intensity": zoom_intensity,
+        "zoom_mode": zoom_mode,
+        "focus_mode": focus_mode,
+        "focus_x": focus_x,
+        "focus_y": focus_y,
+        "manual_focus_valid": manual_focus_valid,
+        "quality": str(quality_match.group(1) if quality_match else "standard").casefold(),
+        "cta": ((option_value("cta") or cta_match.group(1)).replace("_", " ") if cta_match else "COMENTA AÍ 👇"),
+        "force": bool(force_match),
+        "ticker_text": ticker_text,
+        "impact_words": impact_words,
+        "text_speed": text_speed if text_speed in {"slow", "medium", "fast"} else "medium",
+        "text_position": text_position if text_position in {"top", "middle", "bottom"} else "bottom",
+        "blink_text": blink_text,
+        "caps": caps_value not in {"false", "0", "no", "off"},
+        "blink_position": blink_position if blink_position in {"top", "middle", "bottom"} else "middle",
+        "blink_style": blink_style if blink_style in {"blink", "pulse", "impact"} else "blink",
+        "blink_start": blink_start, "blink_end": blink_end,
+    }
+    logger.info("Parsed short request: %s", request)
+    logger.info("Requested effects: %s", request["effects"])
+    logger.info("Parsed ticker text: %s", request["ticker_text"])
+    logger.info("Parsed impact words: %s", request["impact_words"])
+    logger.info("Parsed focus mode: %s", request["focus_mode"])
+    logger.info("Parsed focus_x/focus_y: %s, %s", request["focus_x"], request["focus_y"])
+    logger.info("Parsed zoom value: %.2fx", request["zoom_intensity"])
+    return request
+
+
+def telegram_processing_key(file_unique_id: str, request: dict[str, Any]) -> str:
+    """Return a stable dedupe key for one Telegram file plus its edit options."""
+    raw_cta = str(request.get("cta") or "")
+    ascii_cta = unicodedata.normalize("NFKD", raw_cta).encode("ascii", "ignore").decode("ascii")
+    ascii_cta = re.sub(r"[^A-Za-z0-9]+", "_", ascii_cta).strip("_") or "COMENTA_AI"
+    options = {
+        "duration": request.get("duration"),
+        "effects": sorted(str(effect) for effect in request.get("effects", [])),
+        "title": str(request.get("title") or "").strip(),
+        "zoom": f"{float(request.get('zoom_intensity') or 1.25):.2f}",
+        "zoom_mode": request.get("zoom_mode") or "smart",
+        "focus_mode": request.get("focus_mode") or "action",
+        "focus_x": request.get("focus_x"), "focus_y": request.get("focus_y"),
+        "cta": ascii_cta,
+        "ticker": str(request.get("ticker_text") or "").strip(),
+        "impact_words": list(request.get("impact_words") or []),
+        "text_speed": request.get("text_speed"),
+        "text_position": request.get("text_position"),
+        "blink_text": request.get("blink_text"), "caps": request.get("caps"),
+        "blink_position": request.get("blink_position"), "blink_style": request.get("blink_style"),
+        "blink_start": request.get("blink_start"), "blink_end": request.get("blink_end"),
+    }
+    safe = lambda value: re.sub(r"\s+", " ", str(value or "").strip()).replace(":", r"\:")
+    return "telegram_short:" + ":".join([
+        safe(file_unique_id), safe(options["duration"]), safe(",".join(options["effects"])),
+        safe(options["title"]), safe(options["zoom"] + "_" + str(options["zoom_mode"]) + "_" + str(options["focus_mode"]) + f"_{options['focus_x']}_{options['focus_y']}"), safe(options["cta"]), safe(options["ticker"] + "_" + str(options["blink_text"]) + "_" + str(options["caps"]) + "_" + str(options["blink_position"]) + "_" + str(options["blink_style"]) + f"_{options['blink_start']}_{options['blink_end']}"),
+    ])
+
+
+def smooth_focus_points(points: list[tuple[float, float]], max_step: float = 0.08) -> tuple[float, float] | None:
+    """Smooth normalized focus samples and clamp sudden movement."""
+    if not points:
+        return None
+    x, y = points[0]
+    smoothed = [(x, y)]
+    for target_x, target_y in points[1:]:
+        dx = max(-max_step, min(max_step, target_x - x))
+        dy = max(-max_step, min(max_step, target_y - y))
+        x += dx * 0.35
+        y += dy * 0.35
+        smoothed.append((x, y))
+    weights = range(1, len(smoothed) + 1)
+    total = sum(weights)
+    return (
+        sum(point[0] * weight for point, weight in zip(smoothed, weights)) / total,
+        sum(point[1] * weight for point, weight in zip(smoothed, weights)) / total,
+    )
+
+
+def detect_motion_focus_point(video_path: str | Path, focus_mode: str = "action") -> tuple[float, float] | None:
+    """Estimate a stable normalized motion center from tiny grayscale frames."""
+    width, height = 32, 18
+    command = [
+        "ffmpeg", "-v", "error", "-i", str(video_path), "-vf",
+        f"fps=2,scale={width}:{height},format=gray", "-frames:v", "24",
+        "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, check=True, timeout=30)
+        raw = bytes(getattr(result, "stdout", b"") or b"")
+        frame_size = width * height
+        frames = [raw[index:index + frame_size] for index in range(0, len(raw), frame_size) if len(raw[index:index + frame_size]) == frame_size]
+        logger.info("Frame samples analyzed: %s", len(frames))
+        points: list[tuple[float, float]] = []
+        ball_points: list[tuple[float, float]] = []
+        for previous, current in zip(frames, frames[1:]):
+            changes = [abs(current[index] - previous[index]) for index in range(frame_size)]
+            threshold = max(18, sum(changes) / frame_size * 1.8)
+            active = [
+                (index % width, index // width, value) for index, value in enumerate(changes)
+                if value >= threshold and index // width >= 3
+            ]
+            weight = sum(value for _, _, value in active)
+            if weight > 1000:
+                points.append((
+                    sum(x * value for x, _, value in active) / weight / (width - 1),
+                    sum(y * value for _, y, value in active) / weight / (height - 1),
+                ))
+            bright_fast = [
+                (index % width, index // width, changes[index]) for index, value in enumerate(current)
+                if value >= 210 and changes[index] >= max(35, threshold) and index // width >= 3
+            ]
+            bright_weight = sum(value for _, _, value in bright_fast)
+            if 80 < bright_weight < 1800 and bright_fast:
+                ball_points.append((
+                    sum(x * value for x, _, value in bright_fast) / bright_weight / (width - 1),
+                    sum(y * value for _, y, value in bright_fast) / bright_weight / (height - 1),
+                ))
+        if focus_mode == "ball":
+            ball_focus = smooth_focus_points(ball_points)
+            if ball_focus:
+                points = ball_points
+            else:
+                logger.info("Ball focus unavailable; falling back to action focus")
+        focus = smooth_focus_points(points)
+        if focus_mode == "goal" and focus and 0.38 < focus[0] < 0.62:
+            logger.info("Goal focus uncertain; falling back to action focus")
+        if focus:
+            logger.info("Motion focus point detected: x=%.3f, y=%.3f", focus[0], focus[1])
+            focus = (min(0.78, max(0.22, focus[0])), min(0.60, max(0.25, focus[1] - 0.05)))
+            logger.info("Smoothed focus point: x=%.3f, y=%.3f", focus[0], focus[1])
+        return focus
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        logger.warning("Smart zoom analysis failed: %s", exc)
+        return None
+
+
+def probe_video_dimensions(video_path: str | Path) -> tuple[int, int] | None:
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(video_path),
+        ], capture_output=True, text=True, check=True, timeout=15, **SUBPROCESS_TEXT_KWARGS)
+        width, height = str(getattr(result, "stdout", "") or "").strip().split("x", 1)
+        return int(width), int(height)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
 
 
 def build_short_metadata(story: dict[str, Any], vertical_path: str | Path) -> dict[str, Any]:
@@ -2269,6 +2538,21 @@ def _write_short_metadata_file(story: dict[str, Any], vertical_path: str | Path)
             f"Hashtags: {hashtags}",
             "",
             f"Pinned comment: {metadata.get('pinned_comment', '')}",
+            f"Input file: {story.get('short_input_file', '')}",
+            f"Output file: {vertical_path}",
+            f"Requested effects: {', '.join(story.get('requested_effects', []))}",
+            f"Applied effects: {', '.join(story.get('applied_effects', []))}",
+            f"Skipped effects: {', '.join(story.get('skipped_effects', []))}",
+            f"Ticker text: {story.get('ticker_text', '')}",
+            f"Duration: {story.get('short_duration', '')}",
+            f"Effect title: {story.get('effect_title', story.get('title', ''))}",
+            f"Zoom value: {float(story.get('zoom_intensity', 1.0)):.2f}x",
+            f"Zoom mode: {story.get('zoom_mode', 'center')}",
+            f"Focus mode: {story.get('focus_mode', 'center')}",
+            f"Focus point: {story.get('motion_focus_point', '')}",
+            f"Headline text: {story.get('effect_title', story.get('title', 'LANCE DO JOGO'))}",
+            f"CTA text: {story.get('cta_text', 'COMENTA AÍ 👇')}",
+            "Output size: 1080x1920",
             "",
         ]),
         encoding="utf-8",
@@ -2289,21 +2573,143 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
         shorts_dir = Path("shorts")
         shorts_dir.mkdir(parents=True, exist_ok=True)
         output_path = shorts_dir / f"{source_path.stem}_vertical.mp4"
-        duration_limit = max(1, int(max_duration_seconds or 60))
+        duration_limit = max(1, int(story.get("short_duration") or max_duration_seconds or 60))
+        explicit_effect_request = "requested_effects" in story
+        requested_effects = list(story.get("requested_effects") or (["headline", "cta"] if not explicit_effect_request else []))
+        applied_effects: list[str] = []
+        foreground_scale = "scale=1080:1920:force_original_aspect_ratio=decrease"
+        if "zoom" in requested_effects:
+            zoom_intensity = float(story.get("zoom_intensity") or 1.25)
+            zoom_mode = str(story.get("zoom_mode") or "smart")
+            logger.info("Zoom mode used: %s", zoom_mode)
+            logger.info("Zoom requested")
+            logger.info("Zoom intensity: %.2fx", zoom_intensity)
+            logger.info("Applying visible zoom effect")
+            focus = None
+            focus_mode = str(story.get("focus_mode") or "action")
+            if focus_mode == "manual" or story.get("focus_x") is not None:
+                logger.info("Manual focus override enabled")
+                focus = (float(story.get("focus_x", 0.5)), float(story.get("focus_y", 0.5)))
+            elif focus_mode in {"left", "center", "right", "bottom", "goal_left", "goal_right", "player_left", "player_right"}:
+                focus = (float(story.get("focus_x", 0.5)), float(story.get("focus_y", 0.5)))
+            elif zoom_mode in {"smart", "smart_strong"}:
+                logger.info("Smart focus enabled")
+                focus = detect_motion_focus_point(source_path, focus_mode)
+            if focus is None:
+                logger.info("Fallback to center focus")
+                focus = (0.5, 0.5)
+            story["motion_focus_point"] = focus
+            dimensions = probe_video_dimensions(source_path)
+            if dimensions and min(dimensions) < 720 and zoom_intensity >= 1.35:
+                logger.warning("Source is low resolution, strong zoom may look blurry")
+            frame_count = max(1, duration_limit * 25)
+            focus_x, focus_y = focus
+            logger.info("Final zoom crop/focus used: mode=%s x=%.3f y=%.3f zoom=%.2fx", focus_mode, focus_x, focus_y, zoom_intensity)
+            sharp = str(story.get("quality") or "standard") == "sharp"
+            scale_flags = ":flags=lanczos" if sharp else ""
+            sharpen = ",unsharp=5:5:0.45:5:5:0" if sharp else ""
+            if sharp:
+                logger.info("Foreground sharpening enabled")
+            logger.info("Background blur enabled")
+            logger.info("Output resolution: 1080x1920")
+            foreground_scale = (
+                f"scale=1080:1920:force_original_aspect_ratio=decrease{scale_flags},"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,"
+                f"zoompan=z='1+{zoom_intensity - 1:.2f}*sin(PI*on/{frame_count})':"
+                f"x='max(0,min(iw-iw/zoom,{focus_x:.4f}*iw-iw/zoom/2))':"
+                f"y='max(0,min(ih-ih/zoom,{focus_y:.4f}*ih-ih/zoom/2))':"
+                f"d=1:s=1080x1920:fps=25{sharpen}"
+            )
+            applied_effects.append(f"zoom {zoom_intensity:.2f}x")
         filter_complex = (
             "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
             "crop=1080:1920,boxblur=30:1[bg];"
-            "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+            f"[0:v]{foreground_scale}[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
         )
+        core_filter_complex = filter_complex
+        if "freeze" in requested_effects:
+            logger.info("Applying freeze effect")
+            filter_complex = filter_complex[:-3] + ",tpad=stop_mode=clone:stop_duration=0.7[v]"
+            applied_effects.append("freeze")
+        if "replay" in requested_effects:
+            logger.info("Applying replay effect")
+            filter_complex = (
+                filter_complex[:-3]
+                + "[main];[main]split=2[whole][copy];"
+                  "[copy]trim=start=0:end=2,setpts=PTS-STARTPTS[rep];"
+                  "[whole][rep]concat=n=2:v=1:a=0[v]"
+            )
+            applied_effects.append("replay")
+        base_filter_complex = filter_complex
+        animated_effects: list[str] = []
+        static_text_filters: list[str] = []
+        animated_text_filters: list[str] = []
         font_path = find_short_font_path()
         if font_path:
-            headline = _shorten_short_text(story.get("title") or story.get("shorts_title") or source_path.stem)
-            text_filters = ",".join([
-                _drawtext_filter(headline, "(w-text_w)/2", "120", 58, font_path),
-                _drawtext_filter("COMENTA AI", "(w-text_w)/2", "h-text_h-210", 64, font_path),
-                _drawtext_filter("Futeba & Juninho", "w-text_w-42", "h-text_h-48", 28, font_path, "black@0.35"),
-            ])
+            if "headline" in requested_effects:
+                logger.info("Applying headline text")
+                headline = _shorten_short_text(story.get("effect_title") or story.get("title") or "LANCE DO JOGO")
+                static_text_filters.append(_drawtext_filter(headline, "(w-text_w)/2", "80", 82, font_path, "black@0.88", "between(t,0,5)"))
+                applied_effects.append("headline")
+            if "player_tag" in requested_effects and story.get("player_name"):
+                logger.info("Applying player tag")
+                static_text_filters.append(_drawtext_filter(str(story["player_name"]), "(w-text_w)/2", "250", 72, font_path, "black@0.85", "between(t,0,5)"))
+                applied_effects.append("player_tag")
+            if "cta" in requested_effects:
+                logger.info("Applying CTA text")
+                cta_text = str(story.get("cta_text") or ("COMENTA AÍ 👇" if explicit_effect_request else "COMENTA AI"))
+                story["cta_text"] = cta_text
+                static_text_filters.append(_drawtext_filter(cta_text, "(w-text_w)/2", "h-text_h-170", 76, font_path, "black@0.88", f"gte(t,{max(0, duration_limit - 4)})"))
+                applied_effects.append("cta")
+            if "freeze" in requested_effects:
+                static_text_filters.append(_drawtext_filter("OLHA ISSO!", "(w-text_w)/2", "(h-text_h)/2", 82, font_path, "black@0.8", f"between(t,{max(0, duration_limit / 2 - .35):.2f},{duration_limit / 2 + .35:.2f})"))
+            if "replay" in requested_effects:
+                static_text_filters.append(_drawtext_filter("REPLAY", "(w-text_w)/2", "260", 76, font_path, "black@0.8", f"gte(t,{max(0, duration_limit - 2)})"))
+            ticker_text = str(story.get("ticker_text") or story.get("effect_title") or "OLHA ESSE LANCE")
+            text_position = str(story.get("text_position") or "bottom")
+            ticker_y = {"top": "300", "middle": "(h-text_h)/2", "bottom": "h-text_h-330"}.get(text_position, "h-text_h-330")
+            speed = {"slow": 90, "medium": 150, "fast": 230}.get(str(story.get("text_speed") or "medium"), 150)
+            if "ticker" in requested_effects:
+                logger.info("Applying ticker effect")
+                animated_text_filters.append(_drawtext_filter(ticker_text, f"w-mod(t*{speed},w+text_w)", ticker_y, 66, font_path, "black@0.78"))
+                animated_effects.append("ticker")
+            if "slide_text" in requested_effects:
+                logger.info("Applying slide text effect")
+                slide_x = "if(lt(t,1),w-(w-(w-text_w)/2)*t,if(lt(t,4),(w-text_w)/2,(w-text_w)/2-(t-4)*(w+text_w)))"
+                animated_text_filters.append(_drawtext_filter(ticker_text, slide_x, ticker_y, 70, font_path, "black@0.8", "between(t,0,5)"))
+                animated_effects.append("slide_text")
+            if "impact_words" in requested_effects:
+                logger.info("Applying impact words")
+                for index, word in enumerate(story.get("impact_words") or ["GOL!", "VAR?", "POLÊMICA!", "OLHA ISSO!"]):
+                    animated_text_filters.append(_drawtext_filter(str(word), "(w-text_w)/2", "(h-text_h)/2", 100, font_path, "black@0.82", f"between(t,{index},{index + 1})"))
+                animated_effects.append("impact_words")
+            if "pulse_text" in requested_effects:
+                logger.info("Applying pulse text")
+                middle = duration_limit / 2
+                animated_text_filters.append(_drawtext_filter(ticker_text, "(w-text_w)/2", "(h-text_h)/2", "86+10*sin(12*t)", font_path, "black@0.82", f"between(t,{max(0, middle - 1):.1f},{middle + 1:.1f})"))
+                animated_effects.append("pulse_text")
+            if "blink_text" in requested_effects:
+                logger.info("Applying blinking text")
+                blink_value = str(story.get("blink_text") or story.get("effect_title") or "OLHA ESSE LANCE")
+                if story.get("caps", True):
+                    blink_value = blink_value.upper()
+                blink_y = {"top": "300", "middle": "(h-text_h)/2", "bottom": "h-text_h-330"}.get(str(story.get("blink_position") or "middle"), "(h-text_h)/2")
+                blink_start = float(story.get("blink_start", 0) or 0)
+                blink_end = float(story.get("blink_end", 5) or 5)
+                blink_style = str(story.get("blink_style") or "blink")
+                if blink_style == "pulse":
+                    fontsize, enable = "88+12*sin(10*t)", f"between(t,{blink_start:g},{blink_end:g})"
+                elif blink_style == "impact":
+                    fontsize, enable = 108, f"between(t,{blink_start:g},{min(blink_end, blink_start + 1.5):g})"
+                else:
+                    fontsize, enable = 94, f"between(t,{blink_start:g},{blink_end:g})*lt(mod(t,1),0.55)"
+                animated_text_filters.append(_drawtext_filter(blink_value, "(w-text_w)/2", blink_y, fontsize, font_path, "black@0.85", enable))
+                animated_effects.append("blink_text")
+            static_text_filters.append(_drawtext_filter("Futeba & Juninho", "w-text_w-38", "42", 36, font_path, "black@0.68"))
+            applied_effects.append("watermark")
+            applied_effects.extend(animated_effects)
+            text_filters = ",".join(static_text_filters + animated_text_filters)
             filter_complex = filter_complex[:-3] + f",{text_filters}[v]"
         else:
             logger.warning("No Shorts font found. Creating vertical video without text overlay.")
@@ -2326,21 +2732,36 @@ def create_vertical_short(video_path: str | Path, story: dict[str, Any] | None =
             str(output_path),
         ]
         command = command_base + ["-filter_complex", filter_complex] + command_tail
+        story["short_input_file"] = str(source_path)
+        story["short_duration"] = duration_limit
+        story["applied_effects"] = applied_effects
+        logger.info("Final ffmpeg filter: %s", filter_complex)
         logger.info("Creating vertical short for Telegram: %s", source_path)
         try:
             result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180, **SUBPROCESS_TEXT_KWARGS)
         except subprocess.CalledProcessError as exc:
-            if not font_path:
-                raise
-            logger.warning("ffmpeg text overlay failed. Retrying vertical short without text: %s", str(exc.stderr or exc).strip())
-            filter_complex = (
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920,boxblur=30:1[bg];"
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
-                "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
-            )
+            if animated_text_filters and font_path:
+                logger.warning("Text animation failed, retrying without animated text: %s", str(exc.stderr or exc).strip())
+                story["skipped_effects"] = animated_effects
+                story["applied_effects"] = [effect for effect in applied_effects if effect not in animated_effects]
+                filter_complex = base_filter_complex[:-3] + f",{','.join(static_text_filters)}[v]"
+            else:
+                logger.warning("ffmpeg text overlay failed. Retrying vertical short without text: %s", str(exc.stderr or exc).strip())
+                filter_complex = base_filter_complex
             command = command_base + ["-filter_complex", filter_complex] + command_tail
-            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180, **SUBPROCESS_TEXT_KWARGS)
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180, **SUBPROCESS_TEXT_KWARGS)
+            except subprocess.CalledProcessError as structural_exc:
+                structural_effects = [effect for effect in ("freeze", "replay") if effect in requested_effects]
+                if not structural_effects:
+                    raise
+                logger.warning("Structural effects failed; skipping %s and continuing: %s", structural_effects, str(structural_exc.stderr or structural_exc).strip())
+                story.setdefault("skipped_effects", []).extend(structural_effects)
+                story["applied_effects"] = [effect for effect in story.get("applied_effects", []) if effect not in structural_effects]
+                fallback_text = f",{','.join(static_text_filters)}" if static_text_filters and font_path else ""
+                filter_complex = core_filter_complex[:-3] + fallback_text + "[v]"
+                command = command_base + ["-filter_complex", filter_complex] + command_tail
+                result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=180, **SUBPROCESS_TEXT_KWARGS)
         if result.stderr:
             logger.debug("ffmpeg stderr: %s", result.stderr)
         if output_path.exists() and output_path.is_file():
@@ -2661,6 +3082,8 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
     source = str(story.get("source") or next(iter(story.get("sources") or []), "Unknown"))
     media_url = str(story.get("video_url") or story.get("link") or Path(file_path).resolve())
     media_id = str(story.get("dedupe_id") or normalize_media_id(media_url))
+    state_category = str(story.get("delivery_state_category") or "sent_video_ids")
+    state_item_id = str(story.get("processing_state_id") or media_id)
     if not token or not chat_id:
         logger.warning("Telegram credentials are not configured. Skipping downloaded video delivery for %s", title)
         return False
@@ -2675,6 +3098,13 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
             return False
         file_size = path.stat().st_size
         story["final_video_file_size_bytes"] = file_size
+        absolute_path = path.resolve()
+        caption = build_downloaded_video_caption(story).replace(token, "[REDACTED]")
+        safe_caption = caption.encode("utf-8", errors="replace").decode("utf-8")[:1024]
+        logger.info("Telegram output path: %s", absolute_path)
+        logger.info("Telegram output size: %.2f MB", file_size / (1024 * 1024))
+        logger.info("Telegram video caption: %s", safe_caption)
+        logger.info("Telegram destination chat id: %s", chat_id)
         if file_size > TELEGRAM_VIDEO_FILE_LIMIT_BYTES:
             message = (
                 "Vídeo baixado no PC, mas muito grande para enviar pelo Telegram.\n"
@@ -2689,22 +3119,36 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
                 logger.error("Telegram %s\nResponse:\n%s", response.status_code, str(response.text or "").replace(token, "[REDACTED]"))
                 release_send_reservation(dedupe_config, media_id)
                 return False
-            mark_as_sent(dedupe_config, "sent_video_ids", media_id, source, title, media_url)
+            story["delivery_failed_after_creation"] = True
+            release_send_reservation(dedupe_config, media_id)
             return True
 
-        caption = build_downloaded_video_caption(story).replace(token, "[REDACTED]")
         for method, field_name in (("sendVideo", "video"), ("sendDocument", "document")):
-            with path.open("rb") as video_file:
-                response = requests.post(
-                    f"https://api.telegram.org/bot{token}/{method}",
-                    data={"chat_id": chat_id, "caption": caption},
-                    files={field_name: video_file},
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-            if response.status_code == 200:
+            try:
+                with path.open("rb") as video_file:
+                    response = requests.post(
+                        f"https://api.telegram.org/bot{token}/{method}",
+                        data={"chat_id": chat_id, "caption": safe_caption},
+                        files={field_name: video_file},
+                        timeout=max(REQUEST_TIMEOUT_SECONDS, 120),
+                    )
+            except requests.RequestException as exc:
+                logger.error("Telegram %s request failed: %s", method, exc)
+                if method == "sendVideo":
+                    logger.info("Telegram sendVideo failed. Retrying with sendDocument.")
+                    continue
+                break
+            try:
+                json_method = getattr(response, "json", None)
+                response_body = json_method() if callable(json_method) else {"ok": response.status_code == 200}
+            except (ValueError, TypeError):
+                response_body = {"ok": False, "raw": str(response.text or "")}
+            logger.info("Telegram %s HTTP status: %s", method, response.status_code)
+            logger.info("Telegram %s response: %s", method, str(response_body).replace(token, "[REDACTED]"))
+            if response.status_code == 200 and response_body.get("ok") is True:
                 logger.info("Downloaded video sent to Telegram with %s for %s", method, title)
                 mark_as_sent(
-                    dedupe_config, "sent_video_ids", media_id,
+                    dedupe_config, state_category, state_item_id,
                     source, title, media_url,
                 )
                 return True
@@ -2712,14 +3156,25 @@ def send_downloaded_video_to_telegram(file_path: str | Path, story: dict[str, An
             if method == "sendVideo":
                 logger.info("Telegram sendVideo failed. Retrying with sendDocument.")
         release_send_reservation(dedupe_config, media_id)
+        story["delivery_failed_after_creation"] = True
+        _send_telegram_text(
+            token, chat_id,
+            f"Short foi criado, mas não consegui enviar pelo Telegram. Arquivo local: {absolute_path}",
+        )
         return False
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as exc:
         release_send_reservation(dedupe_config, media_id)
-        logger.error("Telegram downloaded video delivery failed for %s", title)
+        story["delivery_failed_after_creation"] = True
+        logger.error("Telegram downloaded video delivery failed for %s: %s", title, exc)
+        _send_telegram_text(
+            token, chat_id,
+            f"Short foi criado, mas não consegui enviar pelo Telegram. Arquivo local: {path.resolve()}",
+        )
         return False
-    except Exception:
+    except Exception as exc:
         release_send_reservation(dedupe_config, media_id)
-        logger.error("Unexpected Telegram downloaded video delivery failure for %s", title)
+        story["delivery_failed_after_creation"] = True
+        logger.error("Unexpected Telegram downloaded video delivery failure for %s: %s", title, exc)
         return False
 
 
@@ -3016,8 +3471,8 @@ def process_local_video_file(
 ) -> bool:
     """Process an existing MP4 through moments, vertical editing, and Telegram."""
     source_path = Path(file_path)
-    if not source_path.exists() or not source_path.is_file() or source_path.suffix.casefold() != ".mp4":
-        logger.error("Local MP4 does not exist or is unsupported: %s", source_path)
+    if not source_path.exists() or not source_path.is_file() or source_path.suffix.casefold() not in {".mp4", ".mov", ".mkv"}:
+        logger.error("Local video does not exist or is unsupported: %s", source_path)
         return False
     video_story = dict(story or {})
     video_story.setdefault("title", source_path.stem.replace("_", " ").replace("-", " ").strip() or "Football video")
@@ -3123,6 +3578,508 @@ def process_telegram_commands(config: dict[str, Any]) -> None:
             requests.get(endpoint, params={"offset": max_update_id + 1, "timeout": 0}, timeout=10)
     except (requests.RequestException, ValueError, TypeError):
         logger.warning("Telegram command polling failed; monitoring will continue.")
+
+
+TELEGRAM_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv"}
+TELEGRAM_UPDATE_OFFSET_FILE = "telegram_update_offset.json"
+
+
+def load_telegram_update_offset(config: dict[str, Any]) -> int:
+    """Load the next Telegram update id without coupling it to dedupe state."""
+    state_dir = _state_dir(config)
+    if state_dir is None:
+        return 0
+    try:
+        payload = json.loads((state_dir / TELEGRAM_UPDATE_OFFSET_FILE).read_text(encoding="utf-8"))
+        return max(0, int(payload.get("offset", 0)))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return 0
+
+
+def save_telegram_update_offset(config: dict[str, Any], offset: int) -> None:
+    state_dir = _state_dir(config)
+    if state_dir is None:
+        return
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / TELEGRAM_UPDATE_OFFSET_FILE).write_text(
+        json.dumps({"offset": max(0, int(offset))}, indent=2), encoding="utf-8"
+    )
+    logger.info("Telegram offset saved: %s", offset)
+
+
+def _editor_session_key(chat_id: Any, user_id: Any) -> str:
+    return f"{chat_id}:{user_id}"
+
+
+def build_editor_menu_payload(session: dict[str, Any]) -> dict[str, Any]:
+    effects = ", ".join(sorted(session.get("effects", []))) or "none"
+    text = (
+        "🎬 Editor de Short\nEscolha as opções abaixo:\n\n"
+        "Current settings:\n"
+        f"Duration: {session.get('duration', 10)}s\n"
+        f"Zoom: {float(session.get('zoom', 1.35)):.2f}x\n"
+        f"Focus: {session.get('focus', 'center')}\n"
+        f"Player name: {session.get('player_name') or '-'}\n"
+        f"Ticker: {session.get('ticker_text') or '-'}\n"
+        f"Effects: {effects}"
+    )
+    keyboard = [
+        [{"text": "🔍 Zoom", "callback_data": "editor:zoom"}, {"text": "🎯 Foco", "callback_data": "editor:focus"}],
+        [{"text": "🏷 Nome do jogador", "callback_data": "editor:player"}, {"text": "📝 Texto passando", "callback_data": "editor:ticker"}],
+        [{"text": "✨ Texto piscante", "callback_data": "editor:blink"}],
+        [{"text": "🧊 Freeze", "callback_data": "editor:toggle:freeze"}, {"text": "🔁 Replay", "callback_data": "editor:toggle:replay"}],
+        [{"text": "⏱ Duração", "callback_data": "editor:duration"}],
+        [{"text": "✅ Gerar short", "callback_data": "editor:generate"}, {"text": "❌ Cancelar", "callback_data": "editor:cancel"}],
+    ]
+    return {"text": text, "reply_markup": {"inline_keyboard": keyboard}}
+
+
+def _send_editor_menu(config: dict[str, Any], chat_id: Any, session: dict[str, Any], message_id: Any = None) -> bool:
+    token = str(config.get("telegram_bot_token") or "")
+    payload = {"chat_id": chat_id, **build_editor_menu_payload(session)}
+    method = "sendMessage"
+    if message_id is not None:
+        method = "editMessageText"
+        payload["message_id"] = message_id
+    try:
+        response = requests.post(f"https://api.telegram.org/bot{token}/{method}", json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _editor_choice_keyboard(kind: str) -> list[list[dict[str, str]]]:
+    choices = {
+        "zoom": [("Sem zoom", "none"), ("Médio 1.20x", "1.20"), ("Forte 1.35x", "1.35"), ("Muito forte 1.50x", "1.50")],
+        "focus": [("Centro", "center"), ("Esquerda", "left"), ("Direita", "right"), ("Jogador esquerda", "player_left"), ("Jogador direita", "player_right"), ("Gol esquerda", "goal_left"), ("Gol direita", "goal_right"), ("Manual", "manual")],
+        "duration": [("8s", "8"), ("10s", "10"), ("15s", "15"), ("20s", "20"), ("30s", "30")],
+    }[kind]
+    return [[{"text": label, "callback_data": f"editor:set:{kind}:{value}"}] for label, value in choices]
+
+
+def handle_editor_text_message(message: dict[str, Any], config: dict[str, Any]) -> bool:
+    chat_id = message.get("chat", {}).get("id")
+    user_id = message.get("from", {}).get("id")
+    session = TELEGRAM_EDITOR_SESSIONS.get(_editor_session_key(chat_id, user_id))
+    if not session or not session.get("waiting_for"):
+        return False
+    value = str(message.get("text") or "").strip()
+    waiting = session.pop("waiting_for")
+    if waiting == "player_name":
+        session["player_name"] = value
+        session["effects"].add("player_tag")
+        logger.info("Player name saved: %s", value)
+    elif waiting == "ticker_text":
+        session["ticker_text"] = value
+        session["effects"].add("ticker")
+        logger.info("Ticker text saved: %s", value)
+    elif waiting == "blink_text":
+        session["blink_text"] = value
+        session["effects"].add("blink_text")
+        logger.info("Blink text saved: %s", value)
+        keyboard = [
+            [{"text": "CAIXA ALTA: ON/OFF", "callback_data": "editor:blink_caps"}],
+            [{"text": "Topo", "callback_data": "editor:set:blink_position:top"}, {"text": "Meio", "callback_data": "editor:set:blink_position:middle"}, {"text": "Baixo", "callback_data": "editor:set:blink_position:bottom"}],
+            [{"text": "Piscar", "callback_data": "editor:set:blink_style:blink"}, {"text": "Pulsar", "callback_data": "editor:set:blink_style:pulse"}, {"text": "Impacto", "callback_data": "editor:set:blink_style:impact"}],
+        ]
+        requests.post(f"https://api.telegram.org/bot{config.get('telegram_bot_token')}/sendMessage", json={"chat_id": chat_id, "text": "Configure o texto piscante:", "reply_markup": {"inline_keyboard": keyboard}}, timeout=REQUEST_TIMEOUT_SECONDS)
+    elif waiting == "manual_focus":
+        try:
+            x_text, y_text = value.split(None, 1)
+            x, y = float(x_text), float(y_text)
+            if not (0 <= x <= 1 and 0 <= y <= 1):
+                raise ValueError
+            session.update({"focus": "manual", "focus_x": x, "focus_y": y})
+            logger.info("Focus saved: %.2f %.2f", x, y)
+        except ValueError:
+            _send_telegram_text(str(config.get("telegram_bot_token") or ""), chat_id, "Valores inválidos. Exemplo: 0.35 0.70")
+            session["waiting_for"] = "manual_focus"
+            return True
+    _send_editor_menu(config, chat_id, session)
+    return True
+
+
+def handle_editor_callback(callback: dict[str, Any], config: dict[str, Any]) -> bool:
+    data = str(callback.get("data") or "")
+    if not data.startswith("editor:"):
+        return False
+    message = callback.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    user_id = callback.get("from", {}).get("id")
+    key = _editor_session_key(chat_id, user_id)
+    session = TELEGRAM_EDITOR_SESSIONS.get(key)
+    token = str(config.get("telegram_bot_token") or "")
+    logger.info("Button clicked: %s", data)
+    if callback.get("id"):
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", json={"callback_query_id": callback["id"]}, timeout=10)
+        except requests.RequestException:
+            pass
+    if not session:
+        _send_telegram_text(token, chat_id, "Sessão do editor expirada. Envie o vídeo novamente.")
+        return True
+    parts = data.split(":")
+    action = parts[1]
+    if action in {"zoom", "focus", "duration"}:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": f"Escolha {action}:", "reply_markup": {"inline_keyboard": _editor_choice_keyboard(action)}},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        return True
+    if action == "set" and len(parts) >= 4:
+        kind, value = parts[2], parts[3]
+        if kind == "zoom":
+            if value == "none":
+                session["effects"].discard("zoom")
+                session["zoom"] = 1.0
+            else:
+                session["effects"].add("zoom")
+                session["zoom"] = float(value)
+        elif kind == "duration":
+            session["duration"] = int(value)
+        elif kind == "focus":
+            presets = {
+                "center": (0.50, 0.60), "left": (0.30, 0.60), "right": (0.70, 0.60),
+                "player_left": (0.35, 0.70), "player_right": (0.65, 0.70),
+                "goal_left": (0.30, 0.45), "goal_right": (0.70, 0.45),
+            }
+            if value == "manual":
+                session["waiting_for"] = "manual_focus"
+                logger.info("Waiting for text input: manual_focus")
+                _send_telegram_text(token, chat_id, "Digite focus_x e focus_y. Exemplo: 0.35 0.70")
+                return True
+            session["focus"] = value
+            session["focus_x"], session["focus_y"] = presets[value]
+            logger.info("Focus saved: %s", value)
+        elif kind == "blink_position":
+            session["blink_position"] = value
+        elif kind == "blink_style":
+            session["blink_style"] = value
+        _send_editor_menu(config, chat_id, session)
+        return True
+    if action in {"player", "ticker", "blink"}:
+        waiting = {"player": "player_name", "ticker": "ticker_text", "blink": "blink_text"}[action]
+        prompt = {"player": "Digite o nome do jogador:", "ticker": "Digite a frase que vai passar no vídeo:", "blink": "Digite o texto piscante que você quer colocar no vídeo:"}[action]
+        session["waiting_for"] = waiting
+        logger.info("Waiting for text input: %s", waiting)
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": prompt, "reply_markup": {"force_reply": True}}, timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        return True
+    if action == "blink_caps":
+        session["caps"] = not session.get("caps", True)
+        _send_editor_menu(config, chat_id, session)
+        return True
+    if action == "toggle" and len(parts) >= 3:
+        effect = parts[2]
+        session["effects"].remove(effect) if effect in session["effects"] else session["effects"].add(effect)
+        _send_editor_menu(config, chat_id, session)
+        return True
+    if action == "cancel":
+        TELEGRAM_EDITOR_SESSIONS.pop(key, None)
+        logger.info("Session cleared: %s", key)
+        _send_telegram_text(token, chat_id, "Editor cancelado.")
+        return True
+    if action == "generate":
+        logger.info("Generate short clicked")
+        _send_telegram_text(token, chat_id, "✅ Vou gerar o short agora...")
+        focus = session.get("focus", "center")
+        story = {
+            "title": session.get("title") or session.get("player_name") or "LANCE DO JOGO",
+            "source": "Telegram", "sources": ["Telegram"],
+            "dedupe_id": f"telegram_editor:{session['file_unique_id']}:{time.time_ns()}",
+            "video_url": f"telegram_editor:{session['file_unique_id']}",
+            "short_duration": session["duration"], "requested_effects": sorted(session["effects"]),
+            "zoom_intensity": session["zoom"], "zoom_mode": "center",
+            "focus_mode": focus, "focus_x": session.get("focus_x"), "focus_y": session.get("focus_y"),
+            "effect_title": session.get("title") or session.get("player_name") or "LANCE DO JOGO",
+            "player_name": session.get("player_name"), "ticker_text": session.get("ticker_text"),
+            "blink_text": session.get("blink_text"), "caps": session.get("caps", True),
+            "blink_position": session.get("blink_position", "middle"), "blink_style": session.get("blink_style", "blink"),
+            "blink_start": session.get("blink_start", 0), "blink_end": session.get("blink_end", 5),
+            "cta_text": session.get("cta", "COMENTA AÍ 👇"),
+            "telegram_caption": "✅ Short pronto", "_telegram_config": {**config, "telegram_chat_id": chat_id},
+        }
+        success = process_local_video_file(session["downloaded_file_path"], story["_telegram_config"], story)
+        if success:
+            TELEGRAM_EDITOR_SESSIONS.pop(key, None)
+            logger.info("Session cleared: %s", key)
+        return True
+    return True
+
+
+def telegram_video_attachment(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a supported Telegram video/document attachment."""
+    video = message.get("video")
+    if isinstance(video, dict) and video.get("file_id"):
+        return video
+    document = message.get("document")
+    if not isinstance(document, dict) or not document.get("file_id"):
+        return None
+    filename = str(document.get("file_name") or "")
+    mime_type = str(document.get("mime_type") or "").casefold()
+    if mime_type == "video/mp4" or Path(filename).suffix.casefold() in TELEGRAM_VIDEO_EXTENSIONS:
+        return document
+    return None
+
+
+def _send_telegram_text(token: str, chat_id: Any, text: str) -> bool:
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text}, timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def process_telegram_video_message(message: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Download and edit one supported video received by the Telegram bot."""
+    attachment = telegram_video_attachment(message)
+    if not attachment:
+        return False
+    token = str(config.get("telegram_bot_token") or "")
+    chat_id = message.get("chat", {}).get("id")
+    if not token or chat_id is None:
+        return False
+    unique_id = str(attachment.get("file_unique_id") or attachment.get("file_id") or "")
+    raw_caption = str(message.get("caption") or "")
+    preview_mode = raw_caption.strip().casefold().startswith("/preview")
+    direct_short_mode = raw_caption.strip().casefold().startswith("/short")
+    interactive_mode = not preview_mode and not direct_short_mode
+    logger.info("Raw Telegram caption: %s", raw_caption)
+    short_request = parse_telegram_short_request(raw_caption)
+    logger.info("Parsed title: %s", short_request["title"])
+    logger.info("Parsed ticker: %s", short_request["ticker_text"])
+    logger.info("Parsed force: %s", short_request["force"])
+    processing_key = telegram_processing_key(unique_id, short_request)
+    logger.info("Telegram processing key: %s", processing_key)
+    force_reprocess = bool(short_request.get("force"))
+    if force_reprocess:
+        logger.info("Force reprocess enabled")
+    media_id = processing_key
+    title = str(short_request["title"] or attachment.get("file_name") or "Telegram video")
+    if not interactive_mode and not preview_mode and not force_reprocess and persistent_state_contains(config, "processed_telegram_shorts", processing_key):
+        logger.info("Same options duplicate skipped: %s", processing_key)
+        _send_telegram_text(token, chat_id, "Esse vídeo já foi processado com essas mesmas opções.")
+        return False
+    state = load_persistent_state(config) or {}
+    same_video_prefix = f"telegram_short:{unique_id}:"
+    if not interactive_mode and not preview_mode and not force_reprocess and any(
+        str(key).startswith(same_video_prefix) for key in state.get("processed_telegram_shorts", {})
+    ):
+        logger.info("Different options detected, processing again")
+    if force_reprocess:
+        media_id = f"{processing_key}:force:{time.time_ns()}"
+    max_bytes = int(float(config.get("telegram_max_download_mb", 100) or 100) * 1024 * 1024)
+    if int(attachment.get("file_size") or 0) > max_bytes:
+        _send_telegram_text(token, chat_id, "❌ Não consegui cortar esse vídeo. Tente enviar em MP4 menor.")
+        return False
+    logger.info("Telegram video received: %s", media_id)
+    if not interactive_mode:
+        _send_telegram_text(token, chat_id, "✅ Vídeo recebido. Vou cortar os melhores momentos agora.")
+    try:
+        metadata = requests.get(
+            f"https://api.telegram.org/bot{token}/getFile",
+            params={"file_id": attachment["file_id"]}, timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        metadata.raise_for_status()
+        remote_path = str(metadata.json()["result"]["file_path"])
+        suffix = Path(remote_path).suffix.casefold()
+        if suffix not in TELEGRAM_VIDEO_EXTENSIONS:
+            suffix = Path(str(attachment.get("file_name") or "video.mp4")).suffix.casefold() or ".mp4"
+        target_dir = Path(config.get("downloads_dir", DOWNLOADS_DIR)) / "telegram"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{unique_id}{suffix}"
+        download = requests.get(
+            f"https://api.telegram.org/file/bot{token}/{remote_path}",
+            timeout=max(REQUEST_TIMEOUT_SECONDS, 120),
+        )
+        download.raise_for_status()
+        target.write_bytes(download.content)
+        logger.info("Telegram file downloaded: %s", target)
+        if interactive_mode:
+            user_id = message.get("from", {}).get("id")
+            session_key = _editor_session_key(chat_id, user_id)
+            TELEGRAM_EDITOR_SESSIONS[session_key] = {
+                "file_id": attachment["file_id"], "file_unique_id": unique_id,
+                "downloaded_file_path": str(target), "duration": 10,
+                "effects": {"zoom", "headline", "watermark"}, "zoom": 1.35,
+                "focus": "center", "focus_x": 0.50, "focus_y": 0.60,
+                "player_name": "", "ticker_text": "", "title": "", "cta": "COMENTA AÍ 👇",
+                "blink_text": "", "caps": True, "blink_position": "middle", "blink_style": "blink", "blink_start": 0, "blink_end": 5,
+                "force": False,
+            }
+            logger.info("Editor session created: %s", session_key)
+            return _send_editor_menu(config, chat_id, TELEGRAM_EDITOR_SESSIONS[session_key])
+        if preview_mode:
+            preview_path = target_dir / f"{unique_id}_focus_preview.jpg"
+            font_path = find_short_font_path()
+            filters = (
+                "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,"
+                "drawgrid=width=360:height=640:thickness=5:color=white@0.85"
+            )
+            if font_path:
+                labels = [
+                    ("left", "80", "260"), ("center", "450", "260"), ("right", "820", "260"),
+                    ("player_left", "35", "900"), ("bottom", "455", "900"), ("player_right", "745", "900"),
+                ]
+                filters += "," + ",".join(_drawtext_filter(label, x, y, 44, font_path, "black@0.75") for label, x, y in labels)
+            result = subprocess.run([
+                "ffmpeg", "-y", "-i", str(target), "-frames:v", "1", "-vf", filters, str(preview_path),
+            ], capture_output=True, text=True, check=True, timeout=60, **SUBPROCESS_TEXT_KWARGS)
+            if preview_path.exists():
+                with preview_path.open("rb") as preview_file:
+                    response = requests.post(
+                        f"https://api.telegram.org/bot{token}/sendPhoto",
+                        data={"chat_id": chat_id, "caption": "Escolha a zona de foco ou use focus_x/focus_y."},
+                        files={"photo": preview_file}, timeout=120,
+                    )
+                return response.status_code == 200
+            return False
+        delivery_config = {**config, "telegram_chat_id": chat_id}
+        story = {
+            "title": title, "source": "Telegram", "sources": ["Telegram"],
+            "dedupe_id": media_id, "video_url": media_id,
+            "processing_state_id": processing_key,
+            "delivery_state_category": "processed_telegram_shorts",
+            "short_duration": short_request["duration"],
+            "requested_effects": short_request["effects"],
+            "zoom_intensity": short_request["zoom_intensity"],
+            "zoom_mode": short_request["zoom_mode"],
+            "focus_mode": short_request["focus_mode"],
+            "focus_x": short_request["focus_x"], "focus_y": short_request["focus_y"],
+            "quality": short_request["quality"],
+            "effect_title": short_request["title"],
+            "cta_text": short_request["cta"],
+            "ticker_text": short_request["ticker_text"],
+            "impact_words": short_request["impact_words"],
+            "text_speed": short_request["text_speed"],
+            "text_position": short_request["text_position"],
+            "blink_text": short_request["blink_text"], "caps": short_request["caps"],
+            "blink_position": short_request["blink_position"], "blink_style": short_request["blink_style"],
+            "blink_start": short_request["blink_start"], "blink_end": short_request["blink_end"],
+            "telegram_caption": "✅ Short pronto\nEffects applied: " + ", ".join(
+                f"zoom {short_request['zoom_intensity']:.2f}x" if effect == "zoom" else effect
+                for effect in short_request["effects"]
+            ) + (
+                f", focus manual x={short_request['focus_x']:.2f} y={short_request['focus_y']:.2f}"
+                if short_request["focus_mode"] == "manual" else f", focus {short_request['focus_mode']}"
+            ) + ", watermark\nEffects skipped: none",
+            "_telegram_config": delivery_config,
+        }
+        if process_local_video_file(target, delivery_config, story):
+            logger.info("Short created: %s", title)
+            logger.info("Telegram short sent: %s", title)
+            return True
+        if story.get("delivery_failed_after_creation"):
+            return False
+    except (requests.RequestException, KeyError, ValueError, OSError) as exc:
+        logger.warning("Telegram video processing failed: %s", exc)
+    _send_telegram_text(token, chat_id, "❌ Não consegui cortar esse vídeo. Tente enviar em MP4 menor.")
+    return False
+
+
+def telegram_poll(config: dict[str, Any]) -> None:
+    """Long-poll Telegram updates and process commands and incoming videos."""
+    token = str(config.get("telegram_bot_token") or "")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN is required for --telegram-poll")
+        return
+    endpoint = f"https://api.telegram.org/bot{token}/getUpdates"
+    offset = 0
+    while True:
+        try:
+            response = requests.get(endpoint, params={"offset": offset, "timeout": 30}, timeout=40)
+            response.raise_for_status()
+            for update in response.json().get("result", []):
+                offset = max(offset, int(update.get("update_id") or 0) + 1)
+                callback = update.get("callback_query")
+                if isinstance(callback, dict):
+                    handle_editor_callback(callback, config)
+                    continue
+                message = update.get("message") or {}
+                configured_chat = str(config.get("telegram_chat_id") or "")
+                if configured_chat and str(message.get("chat", {}).get("id", "")) != configured_chat:
+                    continue
+                if handle_editor_text_message(message, config):
+                    continue
+                if not process_telegram_video_message(message, config):
+                    handle_telegram_command(str(message.get("text") or ""), {**config, "telegram_chat_id": message.get("chat", {}).get("id")})
+        except (requests.RequestException, ValueError, TypeError):
+            logger.warning("Telegram polling failed; retrying shortly.")
+            time.sleep(5)
+
+
+def telegram_poll_once(config: dict[str, Any]) -> None:
+    """Fetch and handle the currently pending Telegram updates, then exit."""
+    logger.info("Telegram poll once started")
+    token = str(config.get("telegram_bot_token") or "")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN is required for --telegram-poll-once")
+        return
+    load_persistent_state(config)
+    api = f"https://api.telegram.org/bot{token}"
+    try:
+        webhook = requests.get(f"{api}/getWebhookInfo", timeout=10)
+        webhook_url = str((webhook.json().get("result") or {}).get("url") or "") if webhook.status_code == 200 else ""
+        if webhook_url:
+            logger.warning("Telegram webhook is set; getUpdates cannot be used while it is active.")
+            if config.get("telegram_delete_webhook_on_poll", False):
+                deleted = requests.post(f"{api}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10)
+                deleted.raise_for_status()
+                logger.info("Telegram webhook deleted for polling")
+        offset = load_telegram_update_offset(config)
+        logger.info("Telegram getUpdates called")
+        response = requests.get(f"{api}/getUpdates", params={"offset": offset, "timeout": 0}, timeout=20)
+        response.raise_for_status()
+        updates = response.json().get("result", [])
+        logger.info("Updates found: %s", len(updates))
+        if not updates:
+            logger.info("No updates found")
+            logger.info("No Telegram videos to process")
+            save_persistent_state(config)
+            logger.info("Telegram poll once finished")
+            return
+        videos = 0
+        for update in sorted(updates, key=lambda item: int(item.get("update_id") or 0)):
+            update_id = int(update.get("update_id") or 0)
+            try:
+                callback = update.get("callback_query")
+                if isinstance(callback, dict):
+                    handle_editor_callback(callback, config)
+                else:
+                    message = update.get("message") or {}
+                    configured_chat = str(config.get("telegram_chat_id") or "")
+                    if configured_chat and str(message.get("chat", {}).get("id", "")) != configured_chat:
+                        logger.info("Telegram update intentionally skipped for unconfigured chat: %s", update_id)
+                    elif handle_editor_text_message(message, config):
+                        pass
+                    elif telegram_video_attachment(message):
+                        videos += 1
+                        logger.info("Processing Telegram video update: %s", update_id)
+                        process_telegram_video_message(message, config)
+                    else:
+                        handle_telegram_command(
+                            str(message.get("text") or ""),
+                            {**config, "telegram_chat_id": message.get("chat", {}).get("id")},
+                        )
+                offset = max(offset, update_id + 1)
+                save_telegram_update_offset(config, offset)
+            except Exception as exc:  # keep a failed update available for the next run
+                logger.exception("Unexpected failure processing Telegram update %s: %s", update_id, exc)
+                _send_telegram_text(token, config.get("telegram_chat_id"), "❌ Falha ao processar o vídeo. Vou tentar novamente.")
+                break
+        if not videos:
+            logger.info("No Telegram videos to process")
+        save_persistent_state(config)
+    except Exception as exc:
+        logger.exception("Telegram poll once failed: %s", exc)
+    logger.info("Telegram poll once finished")
 
 
 def _parse_positive_int(value: Any, default: int) -> int:
@@ -4368,6 +5325,22 @@ def main() -> int:
     if "--debug" in args:
         debug_mode = True
         config["debug_mode"] = True
+
+    if "--telegram-poll-once" in args:
+        telegram_poll_once(config)
+        return 0
+
+    if "--telegram-poll" in args:
+        telegram_poll(config)
+        return 0
+
+    if "--clear-telegram-short-state" in args:
+        state = load_persistent_state(config)
+        if state is not None:
+            state["processed_telegram_shorts"] = {}
+            save_persistent_state(config)
+        logger.info("Telegram short state cleared")
+        return 0
 
     if "--reset-seen" in args:
         state_file = Path(config.get("state_file", STATE_FILE))

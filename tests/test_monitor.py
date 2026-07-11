@@ -12,6 +12,7 @@ from unittest.mock import ANY, patch
 
 from monitor import (
     GeoRestrictedVideoError,
+    TELEGRAM_EDITOR_SESSIONS,
     VideoDownloadBlockedError,
     _format_drawtext_font_path,
     attach_article_to_match,
@@ -35,6 +36,7 @@ from monitor import (
     create_best_moments_clip,
     create_vertical_short,
     detect_audio_peak_timestamps,
+    detect_motion_focus_point,
     detect_runner_country,
     discover_official_fallback_video,
     discover_tvnz_sport_videos,
@@ -45,6 +47,8 @@ from monitor import (
     find_short_font_path,
     group_articles,
     handle_manual_only_video_source,
+    handle_editor_callback,
+    handle_editor_text_message,
     handle_telegram_command,
     is_cazetv_discussion_content,
     is_download_eligible_title,
@@ -60,9 +64,11 @@ from monitor import (
     normalize_media_id,
     parse_tvnz_max_downloads_per_run,
     parse_tvnz_rss_entries,
+    parse_telegram_short_request,
     process_cycle,
     process_instagram_video_source,
     process_local_video_file,
+    process_telegram_video_message,
     reset_persistent_state_runtime,
     prepare_telegram_message,
     search_and_download_youtube_video,
@@ -72,6 +78,10 @@ from monitor import (
     send_manual_open_alert,
     send_controversy_alert,
     send_telegram_notification,
+    smooth_focus_points,
+    telegram_poll_once,
+    telegram_video_attachment,
+    telegram_processing_key,
     should_send_notification,
     select_best_moment_segments,
     validate_highlight_candidate,
@@ -82,6 +92,416 @@ from monitor import save_seen_articles
 
 
 class MonitorTests(unittest.TestCase):
+    def test_telegram_poll_once_saves_offset_and_exits(self):
+        webhook = type("Response", (), {
+            "status_code": 200, "json": lambda self: {"result": {"url": ""}},
+        })()
+        updates = type("Response", (), {
+            "status_code": 200,
+            "raise_for_status": lambda self: None,
+            "json": lambda self: {"result": [{"update_id": 41, "message": {"chat": {"id": 7}, "text": "/sources"}}]},
+        })()
+        with TemporaryDirectory() as temp_dir, \
+             patch("monitor.requests.get", side_effect=[webhook, updates]), \
+             patch("monitor.handle_telegram_command", return_value=True):
+            config = {"telegram_bot_token": "TOKEN", "telegram_chat_id": "7", "monitor_state_dir": Path(temp_dir)}
+            telegram_poll_once(config)
+            offset = json.loads((Path(temp_dir) / "telegram_update_offset.json").read_text(encoding="utf-8"))
+        self.assertEqual(offset["offset"], 42)
+
+    def test_telegram_poll_once_does_not_process_saved_update_twice(self):
+        webhook = type("Response", (), {"status_code": 200, "json": lambda self: {"result": {"url": ""}}})()
+        updates = type("Response", (), {
+            "status_code": 200, "raise_for_status": lambda self: None,
+            "json": lambda self: {"result": []},
+        })()
+        with TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            (state_dir / "telegram_update_offset.json").write_text('{"offset": 42}', encoding="utf-8")
+            with patch("monitor.requests.get", side_effect=[webhook, updates]) as get_mock:
+                telegram_poll_once({"telegram_bot_token": "TOKEN", "telegram_chat_id": "7", "monitor_state_dir": state_dir})
+            self.assertEqual(get_mock.call_args_list[1].kwargs["params"]["offset"], 42)
+
+    def test_telegram_bot_workflow_calls_poll_once(self):
+        workflow = Path(".github/workflows/telegram-bot.yml").read_text(encoding="utf-8")
+        self.assertIn("python monitor.py --telegram-poll-once", workflow)
+        self.assertIn("TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}", workflow)
+        self.assertIn("path: .monitor_state", workflow)
+
+    def test_telegram_video_message_is_detected(self):
+        attachment = {"file_id": "f1", "file_unique_id": "u1"}
+        self.assertEqual(telegram_video_attachment({"video": attachment}), attachment)
+
+    def test_editor_callbacks_update_settings_and_cancel(self):
+        key = "7:9"
+        TELEGRAM_EDITOR_SESSIONS[key] = {
+            "effects": {"zoom", "headline", "watermark"}, "zoom": 1.35, "duration": 10,
+            "focus": "center", "focus_x": .5, "focus_y": .6, "player_name": "", "ticker_text": "",
+            "file_unique_id": "u", "downloaded_file_path": "video.mp4",
+        }
+        config = {"telegram_bot_token": "TOKEN"}
+        callback = lambda data: {"id": "cb", "data": data, "from": {"id": 9}, "message": {"chat": {"id": 7}}}
+        response = type("Response", (), {"status_code": 200})()
+        with patch("monitor.requests.post", return_value=response):
+            handle_editor_callback(callback("editor:set:zoom:1.20"), config)
+            handle_editor_callback(callback("editor:set:duration:15"), config)
+            handle_editor_callback(callback("editor:set:focus:player_left"), config)
+        self.assertEqual(TELEGRAM_EDITOR_SESSIONS[key]["zoom"], 1.20)
+        self.assertEqual(TELEGRAM_EDITOR_SESSIONS[key]["duration"], 15)
+        self.assertEqual(TELEGRAM_EDITOR_SESSIONS[key]["focus"], "player_left")
+        with patch("monitor.requests.post", return_value=response):
+            handle_editor_callback(callback("editor:cancel"), config)
+        self.assertNotIn(key, TELEGRAM_EDITOR_SESSIONS)
+
+    def test_editor_text_prompts_save_player_and_ticker(self):
+        key = "7:9"
+        session = {"effects": set(), "waiting_for": "player_name", "duration": 10, "zoom": 1.35, "focus": "center"}
+        TELEGRAM_EDITOR_SESSIONS[key] = session
+        response = type("Response", (), {"status_code": 200})()
+        with patch("monitor.requests.post", return_value=response):
+            self.assertTrue(handle_editor_text_message({"chat": {"id": 7}, "from": {"id": 9}, "text": "LEAO"}, {"telegram_bot_token": "TOKEN"}))
+            session["waiting_for"] = "ticker_text"
+            handle_editor_text_message({"chat": {"id": 7}, "from": {"id": 9}, "text": "OLHA ESSE PASSE"}, {"telegram_bot_token": "TOKEN"})
+        self.assertEqual(session["player_name"], "LEAO")
+        self.assertEqual(session["ticker_text"], "OLHA ESSE PASSE")
+        self.assertIn("player_tag", session["effects"])
+        self.assertIn("ticker", session["effects"])
+        TELEGRAM_EDITOR_SESSIONS.pop(key, None)
+
+    def test_editor_generate_calls_processing_pipeline(self):
+        key = "7:9"
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "video.mp4"
+            video_path.write_bytes(b"mp4")
+            TELEGRAM_EDITOR_SESSIONS[key] = {
+                "effects": {"zoom", "headline", "watermark"}, "zoom": 1.35, "duration": 10,
+                "focus": "center", "focus_x": .5, "focus_y": .6, "player_name": "", "ticker_text": "",
+                "title": "", "cta": "COMENTA AÍ 👇", "file_unique_id": "u", "downloaded_file_path": str(video_path),
+            }
+            callback = {"id": "cb", "data": "editor:generate", "from": {"id": 9}, "message": {"chat": {"id": 7}}}
+            response = type("Response", (), {"status_code": 200})()
+            with patch("monitor.requests.post", return_value=response), \
+                 patch("monitor.process_local_video_file", return_value=True) as pipeline_mock:
+                self.assertTrue(handle_editor_callback(callback, {"telegram_bot_token": "TOKEN"}))
+            pipeline_mock.assert_called_once()
+            self.assertNotIn(key, TELEGRAM_EDITOR_SESSIONS)
+
+    def test_telegram_short_effects_are_parsed_from_caption(self):
+        request = parse_telegram_short_request(
+            "/short duration=20 effects=zoom,headline,cta,freeze,replay title=TESTE EFEITOS"
+        )
+        self.assertEqual(request["duration"], 20)
+        self.assertEqual(request["title"], "TESTE EFEITOS")
+        self.assertEqual(request["effects"], ["zoom", "headline", "cta", "freeze", "replay"])
+
+    def test_blink_text_options_parse_with_uppercase_defaults(self):
+        request = parse_telegram_short_request('/short effects=zoom,blink_text blink_text="VAR POLÊMICO" blink_position=middle')
+        self.assertEqual(request["blink_text"], "VAR POLÊMICO")
+        self.assertTrue(request["caps"])
+        self.assertEqual(request["blink_style"], "blink")
+        self.assertIn("blink_text", request["effects"])
+
+    def test_blink_text_filter_uses_timed_visibility(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "blink.mp4"
+            video_path.write_bytes(b"mp4")
+            output_path = Path("shorts") / "blink_vertical.mp4"
+            def fake_run(command, **kwargs):
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(b"short")
+                return type("Completed", (), {"stderr": "", "stdout": "1920x1080"})()
+            story = {"requested_effects": ["blink_text"], "blink_text": "olha esse lance", "caps": True, "blink_start": 0, "blink_end": 5}
+            with patch("monitor.find_short_font_path", return_value=Path("/font.ttf")), patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                self.assertTrue(create_vertical_short(video_path, story))
+            command = run_mock.call_args.args[0]
+            filter_text = command[command.index("-filter_complex") + 1]
+            self.assertIn("OLHA ESSE LANCE", filter_text)
+            self.assertIn("lt(mod(t,1),0.55)", filter_text)
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".txt").unlink(missing_ok=True)
+
+    def test_telegram_short_default_effects_are_used(self):
+        request = parse_telegram_short_request("")
+        self.assertEqual(request["effects"], ["zoom", "headline", "cta"])
+        self.assertEqual(request["zoom_intensity"], 1.25)
+
+    def test_telegram_named_zoom_intensities_are_parsed(self):
+        self.assertEqual(parse_telegram_short_request("/short effects=zoom zoom=strong")["zoom_intensity"], 1.35)
+        self.assertEqual(parse_telegram_short_request("/short effects=zoom zoom=medium")["zoom_intensity"], 1.20)
+        self.assertEqual(parse_telegram_short_request("/short effects=zoom zoom=strong")["zoom_mode"], "smart_strong")
+        self.assertEqual(parse_telegram_short_request("/short effects=zoom zoom=center")["zoom_mode"], "center")
+        self.assertEqual(parse_telegram_short_request("/short effects=zoom zoom=verystrong")["zoom_intensity"], 1.50)
+
+    def test_telegram_focus_modes_are_parsed(self):
+        self.assertEqual(parse_telegram_short_request("/short effects=zoom focus=action")["focus_mode"], "action")
+        self.assertEqual(parse_telegram_short_request("/short effects=zoom focus=player")["focus_mode"], "player")
+        self.assertEqual(parse_telegram_short_request('/short effects=zoom title="Olha esse lance" focus=action')["title"], "Olha esse lance")
+
+    def test_manual_and_preset_focus_coordinates_parse(self):
+        manual = parse_telegram_short_request("/short effects=zoom focus=manual focus_x=0.35 focus_y=0.70")
+        self.assertEqual((manual["focus_x"], manual["focus_y"]), (0.35, 0.70))
+        left = parse_telegram_short_request("/short effects=zoom focus=left")
+        player_left = parse_telegram_short_request("/short effects=zoom focus=player_left")
+        self.assertEqual((left["focus_x"], left["focus_y"]), (0.30, 0.60))
+        self.assertEqual((player_left["focus_x"], player_left["focus_y"]), (0.35, 0.70))
+
+    def test_invalid_manual_focus_falls_back_to_center(self):
+        request = parse_telegram_short_request("/short effects=zoom focus=manual focus_x=9 focus_y=bad")
+        self.assertEqual((request["focus_x"], request["focus_y"]), (0.5, 0.5))
+
+    def test_manual_focus_overrides_smart_analysis_and_foreground_stays_sharp(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "manual.mp4"
+            video_path.write_bytes(b"mp4")
+            output_path = Path("shorts") / "manual_vertical.mp4"
+            def fake_run(command, **kwargs):
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(b"short")
+                return type("Completed", (), {"stderr": "", "stdout": "1920x1080"})()
+            story = {
+                "requested_effects": ["zoom"], "zoom_mode": "smart", "focus_mode": "manual",
+                "focus_x": 0.35, "focus_y": 0.70, "quality": "sharp", "short_duration": 10,
+            }
+            with patch("monitor.detect_motion_focus_point") as focus_mock, \
+                 patch("monitor.find_short_font_path", return_value=None), \
+                 patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                self.assertTrue(create_vertical_short(video_path, story))
+            focus_mock.assert_not_called()
+            render_call = next(call for call in reversed(run_mock.call_args_list) if "-filter_complex" in call.args[0])
+            filter_text = render_call.args[0][render_call.args[0].index("-filter_complex") + 1]
+            self.assertIn("0.3500*iw", filter_text)
+            self.assertIn("unsharp", filter_text)
+            self.assertEqual(filter_text.count("boxblur"), 1)
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".txt").unlink(missing_ok=True)
+
+    def test_ball_focus_without_detection_falls_back_to_center_safely(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "ball.mp4"
+            video_path.write_bytes(b"mp4")
+            output_path = Path("shorts") / "ball_vertical.mp4"
+            def fake_run(command, **kwargs):
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(b"short")
+                return type("Completed", (), {"stderr": ""})()
+            story = {"requested_effects": ["zoom"], "focus_mode": "ball", "zoom_mode": "smart", "short_duration": 10}
+            with patch("monitor.detect_motion_focus_point", return_value=None), \
+                 patch("monitor.find_short_font_path", return_value=None), \
+                 patch("monitor.subprocess.run", side_effect=fake_run):
+                self.assertTrue(create_vertical_short(video_path, story))
+            self.assertEqual(story["motion_focus_point"], (0.5, 0.5))
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".txt").unlink(missing_ok=True)
+
+    def test_smart_focus_point_smoothing_clamps_large_jumps(self):
+        focus = smooth_focus_points([(0.2, 0.4), (0.9, 0.8), (0.1, 0.2)])
+        self.assertIsNotNone(focus)
+        self.assertLess(abs(focus[0] - 0.2), 0.1)
+
+    def test_smart_zoom_falls_back_to_center_when_no_motion_focus(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "smart.mp4"
+            video_path.write_bytes(b"mp4")
+            output_path = Path("shorts") / "smart_vertical.mp4"
+            def fake_run(command, **kwargs):
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(b"short")
+                return type("Completed", (), {"stderr": ""})()
+            story = {"requested_effects": ["zoom"], "zoom_mode": "smart", "zoom_intensity": 1.25, "short_duration": 10}
+            with patch("monitor.detect_motion_focus_point", return_value=None), \
+                 patch("monitor.find_short_font_path", return_value=None), \
+                 patch("monitor.subprocess.run", side_effect=fake_run), \
+                 self.assertLogs("football-monitor", level="INFO") as logs:
+                self.assertTrue(create_vertical_short(video_path, story))
+            self.assertEqual(story["motion_focus_point"], (0.5, 0.5))
+            self.assertIn("Fallback to center focus", "\n".join(logs.output))
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".txt").unlink(missing_ok=True)
+
+    def test_telegram_processing_key_changes_with_edit_options(self):
+        base = parse_telegram_short_request("/short duration=15 effects=zoom,headline zoom=medium title=TEST")
+        same = parse_telegram_short_request("/short duration=15 effects=headline,zoom zoom=medium title=TEST")
+        different_effects = parse_telegram_short_request("/short duration=15 effects=zoom zoom=medium title=TEST")
+        different_title = parse_telegram_short_request("/short duration=15 effects=zoom,headline zoom=medium title=OTHER")
+        different_zoom = parse_telegram_short_request("/short duration=15 effects=zoom,headline zoom=strong title=TEST")
+        key = telegram_processing_key("file1", base)
+        self.assertEqual(key, telegram_processing_key("file1", same))
+        self.assertNotEqual(key, telegram_processing_key("file1", different_effects))
+        self.assertNotEqual(key, telegram_processing_key("file1", different_title))
+        self.assertNotEqual(key, telegram_processing_key("file1", different_zoom))
+        self.assertTrue(key.isascii())
+        self.assertIn("COMENTA_AI", key)
+
+    def test_telegram_force_and_reprocess_options_are_parsed(self):
+        forced = parse_telegram_short_request("/short title=FRANCA_SEMI_FINAL force=true")
+        reprocessed = parse_telegram_short_request("/short reprocess=true effects=zoom zoom=strong")
+        self.assertTrue(forced["force"])
+        self.assertEqual(forced["title"], "FRANCA_SEMI_FINAL")
+        self.assertTrue(reprocessed["force"])
+
+    def test_telegram_animated_text_options_are_parsed_safely(self):
+        request = parse_telegram_short_request(
+            '/short effects=ticker,impact ticker="FRANÇA NA SEMI FINAL" words="GOL!|OLHA O VAR|POLÊMICA!"'
+        )
+        self.assertEqual(request["ticker_text"], "FRANÇA NA SEMI FINAL")
+        self.assertEqual(request["impact_words"], ["GOL!", "OLHA O VAR", "POLÊMICA!"])
+        self.assertIn("impact_words", request["effects"])
+
+    def test_telegram_ticker_defaults_to_title(self):
+        request = parse_telegram_short_request("/short effects=ticker title=FRANCA_SEMI_FINAL")
+        self.assertEqual(request["ticker_text"], "FRANCA_SEMI_FINAL")
+
+    def test_telegram_ticker_filter_moves_right_to_left(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "ticker.mp4"
+            video_path.write_bytes(b"mp4")
+            output_path = Path("shorts") / "ticker_vertical.mp4"
+            def fake_run(command, **kwargs):
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(b"short")
+                return type("Completed", (), {"stderr": ""})()
+            story = {"requested_effects": ["ticker"], "ticker_text": "OLHA ESSE LANCE", "short_duration": 15}
+            with patch("monitor.find_short_font_path", return_value=Path("/font.ttf")), \
+                 patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                create_vertical_short(video_path, story)
+            filter_text = run_mock.call_args.args[0][run_mock.call_args.args[0].index("-filter_complex") + 1]
+            self.assertIn("w-mod(t*150,w+text_w)", filter_text)
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".txt").unlink(missing_ok=True)
+
+    def test_animated_text_failure_retries_with_static_overlays(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "animation.mp4"
+            video_path.write_bytes(b"mp4")
+            output_path = Path("shorts") / "animation_vertical.mp4"
+            calls = []
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 1:
+                    raise subprocess.CalledProcessError(1, command, stderr="animated text failed")
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(b"short")
+                return type("Completed", (), {"stderr": ""})()
+            story = {"requested_effects": ["ticker", "headline", "cta"], "ticker_text": "AÇÃO", "short_duration": 15}
+            with patch("monitor.find_short_font_path", return_value=Path("/font.ttf")), \
+                 patch("monitor.subprocess.run", side_effect=fake_run), \
+                 self.assertLogs("football-monitor", level="WARNING") as logs:
+                self.assertTrue(create_vertical_short(video_path, story))
+            self.assertIn("Text animation failed", "\n".join(logs.output))
+            self.assertIn("ticker", story["skipped_effects"])
+            self.assertIn("drawtext", " ".join(calls[1]))
+            self.assertNotIn("w-mod", " ".join(calls[1]))
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".txt").unlink(missing_ok=True)
+
+    def test_telegram_effect_filter_has_headline_cta_and_zoom(self):
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "clip.mp4"
+            video_path.write_bytes(b"mp4")
+            output_path = Path("shorts") / "clip_vertical.mp4"
+            def fake_run(command, **kwargs):
+                output_path.parent.mkdir(exist_ok=True)
+                output_path.write_bytes(b"short")
+                return type("Completed", (), {"stderr": ""})()
+            story = {
+                "effect_title": "TESTE EFEITOS", "requested_effects": ["zoom", "headline", "cta"],
+                "short_duration": 20, "zoom_intensity": 1.35,
+            }
+            with patch("monitor.find_short_font_path", return_value=Path("/font.ttf")), \
+                 patch("monitor.subprocess.run", side_effect=fake_run) as run_mock:
+                create_vertical_short(video_path, story)
+            filter_text = run_mock.call_args.args[0][run_mock.call_args.args[0].index("-filter_complex") + 1]
+            self.assertIn("TESTE EFEITOS", filter_text)
+            self.assertIn("between(t,0,5)", filter_text)
+            self.assertIn("COMENTA AÍ", filter_text)
+            self.assertIn("Futeba & Juninho", filter_text)
+            self.assertIn("zoompan", filter_text)
+            self.assertIn("1+0.35*sin", filter_text)
+            self.assertIn("s=1080x1920", filter_text)
+            output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".txt").unlink(missing_ok=True)
+
+    def test_telegram_mp4_document_is_detected(self):
+        attachment = {"file_id": "f1", "file_name": "clip.mp4", "mime_type": "video/mp4"}
+        self.assertEqual(telegram_video_attachment({"document": attachment}), attachment)
+
+    def test_telegram_duplicate_unique_id_is_skipped(self):
+        with TemporaryDirectory() as temp_dir:
+            config = {"monitor_state_dir": Path(temp_dir), "telegram_bot_token": "TOKEN"}
+            request = parse_telegram_short_request("")
+            key = telegram_processing_key("unique1", request)
+            mark_persistent_state(config, "processed_telegram_shorts", key, "Telegram", "clip", "unique1")
+            message = {"chat": {"id": 7}, "caption": "/short", "video": {"file_id": "f1", "file_unique_id": "unique1"}}
+            with patch("monitor.requests.post") as post_mock:
+                self.assertFalse(process_telegram_video_message(message, config))
+            self.assertEqual(post_mock.call_args.kwargs["json"]["text"], "Esse vídeo já foi processado com essas mesmas opções.")
+
+    def test_legacy_telegram_entries_are_removed_from_sent_video_state(self):
+        with TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir)
+            (state_dir / "sent_video_ids.json").write_text(json.dumps({
+                "telegram:AgADrAcAAulrkUY": {"timestamp": "2026-01-01T00:00:00+00:00"},
+                "youtube:keepme": {"timestamp": "2026-01-01T00:00:00+00:00"},
+            }), encoding="utf-8")
+            reset_persistent_state_runtime()
+            state = load_persistent_state({"monitor_state_dir": state_dir}, force_reload=True)
+            self.assertNotIn("telegram:AgADrAcAAulrkUY", state["sent_video_ids"])
+            self.assertIn("youtube:keepme", state["sent_video_ids"])
+            self.assertIn("processed_telegram_shorts", state)
+
+    def test_telegram_video_download_runs_pipeline_and_returns_short(self):
+        class Response:
+            status_code = 200
+            content = b"video"
+            def raise_for_status(self): return None
+            def json(self): return {"result": {"file_path": "videos/clip.mp4"}}
+
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "downloads_dir": Path(temp_dir), "monitor_state_dir": Path(temp_dir) / "state",
+                "telegram_bot_token": "TOKEN", "telegram_max_download_mb": 100,
+            }
+            message = {"chat": {"id": 7}, "caption": "/short", "video": {
+                "file_id": "f1", "file_unique_id": "unique2", "file_size": 5,
+            }}
+            with patch("monitor.requests.get", return_value=Response()), \
+                 patch("monitor.requests.post", return_value=Response()), \
+                 patch("monitor.process_local_video_file", return_value=True) as pipeline_mock:
+                self.assertTrue(process_telegram_video_message(message, config))
+            downloaded = Path(temp_dir) / "telegram" / "unique2.mp4"
+            self.assertTrue(downloaded.exists())
+            pipeline_mock.assert_called_once()
+            story = pipeline_mock.call_args.args[2]
+            self.assertIn("✅ Short pronto", story["telegram_caption"])
+            self.assertIn("Effects applied: zoom 1.25x, headline, cta", story["telegram_caption"])
+            self.assertTrue(story["dedupe_id"].startswith("telegram_short:unique2:"))
+            self.assertEqual(story["delivery_state_category"], "processed_telegram_shorts")
+            self.assertIn("focus action", story["telegram_caption"])
+
+    def test_telegram_force_reprocess_bypasses_same_options_duplicate(self):
+        class Response:
+            status_code = 200
+            content = b"video"
+            def raise_for_status(self): return None
+            def json(self): return {"result": {"file_path": "videos/clip.mp4"}}
+
+        with TemporaryDirectory() as temp_dir:
+            config = {
+                "downloads_dir": Path(temp_dir), "monitor_state_dir": Path(temp_dir) / "state",
+                "telegram_bot_token": "TOKEN", "telegram_max_download_mb": 100,
+            }
+            prior = parse_telegram_short_request("/short effects=zoom zoom=strong")
+            prior_key = telegram_processing_key("force1", prior)
+            mark_persistent_state(config, "processed_telegram_shorts", prior_key, "Telegram", "clip", "force1")
+            message = {"chat": {"id": 7}, "caption": "/short effects=zoom zoom=strong force=true", "video": {
+                "file_id": "f1", "file_unique_id": "force1", "file_size": 5,
+            }}
+            with patch("monitor.requests.get", return_value=Response()), \
+                 patch("monitor.requests.post", return_value=Response()), \
+                 patch("monitor.process_local_video_file", return_value=True) as pipeline_mock:
+                self.assertTrue(process_telegram_video_message(message, config))
+            pipeline_mock.assert_called_once()
+
     def test_classify_story_content_download_categories(self):
         cases = (
             ("Portugal vs Spain match highlights", "MATCH_HIGHLIGHT"),
